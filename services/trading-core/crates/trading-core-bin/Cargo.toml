@@ -12,9 +12,13 @@ market-core = { path = "../market-core" }
 risk-gateway = { path = "../risk-gateway" }
 execution = { path = "../execution" }
 broker = { path = "../broker" }
+optiontrader-proto = { path = "../proto" }
 tokio.workspace = true
+tokio-stream.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tonic.workspace = true
+prost.workspace = true

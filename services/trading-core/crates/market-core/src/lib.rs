@@ -8,13 +8,17 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub mod features;
+pub mod health;
 pub mod model;
+pub mod replay;
 
 pub use features::{
     assess_bar_health, atm_straddle, bid_ask_spread, historical_volatility, hv20_hv60,
     opening_range, quote_age_ms, session_vwap, FeatureValue, OpeningRange, StraddleMark,
 };
+pub use health::{DataHealthMachine, DataHealthStateRecord, HealthConfig};
 pub use model::{normalize_bars, MarketBar, OptionQuote, OptionRight, SESSION_OPEN_MINUTE_ET};
+pub use replay::{LiveThetaSource, ReplayBar, ReplayConfig, ReplaySnapshotSource, SnapshotSource};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeatureError {
