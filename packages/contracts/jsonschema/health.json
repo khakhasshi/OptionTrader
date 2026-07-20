@@ -31,6 +31,25 @@
       },
       "required": ["schema_version", "occurred_at_utc", "broker_id", "status", "reconciled"],
       "additionalProperties": false
+    },
+    "ServiceHealth": {
+      "type": "object",
+      "description": "Runtime /health payload served by trading-core and proxied by the Application BFF to the Cockpit. Single source of truth for the fail-closed trading gate. new_position_allowed MUST equal (data_health==HEALTHY AND broker_health==HEALTHY AND reconciled).",
+      "properties": {
+        "schema_version": { "type": "string", "const": "1.0" },
+        "status": { "type": "string", "enum": ["ok", "unreachable"] },
+        "service": { "type": "string" },
+        "environment": { "type": "string" },
+        "data_health": { "$ref": "common.json#/$defs/dataHealth" },
+        "broker_health": { "$ref": "common.json#/$defs/brokerHealth" },
+        "reconciled": { "type": "boolean" },
+        "new_position_allowed": { "type": "boolean" }
+      },
+      "required": [
+        "schema_version", "status", "service",
+        "data_health", "broker_health", "reconciled", "new_position_allowed"
+      ],
+      "additionalProperties": false
     }
   }
 }

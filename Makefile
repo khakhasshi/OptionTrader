@@ -47,8 +47,9 @@ test: test-contracts test-web test-api test-core ## 运行契约 + 三端单元�
 test-contracts: ## 校验 JSON Schema 契约与 fixtures
 	cd $(API_DIR) && uv run --with jsonschema pytest ../../tests/contract -q
 
-test-web: ## 前端测试 (Phase 0: typecheck + build)
+test-web: ## 前端测试 (vitest 单元测试 + typecheck + build)
 	npm --workspace $(WEB_DIR) run test --if-present
+	npm --workspace $(WEB_DIR) run lint
 	npm --workspace $(WEB_DIR) run build
 
 test-api: ## Python 测试

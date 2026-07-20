@@ -46,3 +46,32 @@ def test_market_snapshot_rejects_invalid():
     }
     v = Draft202012Validator(res["market_snapshot.json"].contents, registry=reg)
     assert len(list(v.iter_errors(bad))) >= 3
+
+
+def _service_health_validator():
+    reg, res = _registry()
+    schema = {"$ref": "health.json#/$defs/ServiceHealth"}
+    return Draft202012Validator(schema, registry=reg)
+
+
+@pytest.mark.parametrize(
+    "fixture", ["service_health.healthy.json", "service_health.unreachable.json"]
+)
+def test_service_health_fixture_validates(fixture):
+    v = _service_health_validator()
+    fx = json.load(open(os.path.join(FIXTURE_DIR, fixture)))
+    assert list(v.iter_errors(fx)) == []
+
+
+@pytest.mark.parametrize(
+    "fixture", ["service_health.healthy.json", "service_health.unreachable.json"]
+)
+def test_service_health_gate_invariant(fixture):
+    """new_position_allowed must equal the fail-closed conjunction across all tiers."""
+    fx = json.load(open(os.path.join(FIXTURE_DIR, fixture)))
+    expected = (
+        fx["data_health"] == "HEALTHY"
+        and fx["broker_health"] == "HEALTHY"
+        and fx["reconciled"] is True
+    )
+    assert fx["new_position_allowed"] is expected
