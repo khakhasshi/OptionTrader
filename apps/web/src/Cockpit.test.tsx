@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, act } from "@testing-library/react";
 import { Cockpit } from "./Cockpit";
 import { canOpenNewPosition, parseServiceHealth, type ServiceHealth } from "./health";
 import { parseMarketSnapshot } from "./snapshot";
@@ -26,25 +26,92 @@ const SNAPSHOT = {
   data_health: "HEALTHY",
 };
 
-/**
- * Route the two Cockpit fetches by URL. `health` may be a body object, or
- * "fail" to reject the request. `snapshot` likewise.
- */
-function mockFetch(opts: { health?: unknown | "fail"; snapshot?: unknown | "fail" }) {
+// A LIVE cockpit frame (data/decision dimension) mirroring cockpit_state.json.
+function frame(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema_version: "1.0",
+    seq: 1,
+    session_id: "live",
+    server_time_utc: "2026-07-20T13:45:00Z",
+    connection: "LIVE",
+    new_position_allowed: true,
+    snapshot: SNAPSHOT,
+    regime: { regime: "Trend", trend_score: 3, range_score: 0, components: {}, unavailable: [] },
+    vol: { iv_hv_state: "IV Fair", interpretation: "Long Vol", realized_move: 0.009 },
+    signal: {
+      schema_version: "1.0",
+      signal_id: "sig_x",
+      session_id: "live",
+      occurred_at_utc: "2026-07-20T13:45:00Z",
+      regime: "Trend",
+      strategy: "LongGamma",
+      initial_risk_status: "PASSED",
+      reason: ["Trend + IV cheap/fair + breakout in allowed window"],
+      rule_version: "phase1-test",
+    },
+    risk_flags: [],
+    ...overrides,
+  };
+}
+
+// --- Mock WebSocket (jsdom has none) ---------------------------------------
+class MockWebSocket {
+  static instances: MockWebSocket[] = [];
+  static last(): MockWebSocket {
+    return MockWebSocket.instances[MockWebSocket.instances.length - 1];
+  }
+  onopen: (() => void) | null = null;
+  onmessage: ((e: { data: string }) => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  readyState = 0;
+  constructor(public url: string) {
+    MockWebSocket.instances.push(this);
+    setTimeout(() => {
+      this.readyState = 1;
+      this.onopen?.();
+    }, 0);
+  }
+  emit(f: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(f) });
+  }
+  close(): void {
+    this.readyState = 3;
+    this.onclose?.();
+  }
+}
+
+/** Route fetches by URL: `/core/health` and `/cockpit/state` recovery. */
+function mockFetch(opts: { health?: unknown | "fail"; recovery?: unknown | "fail" }) {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string) => {
-      const which = url.includes("/health") ? opts.health : opts.snapshot;
+      const which = url.includes("/core/health") ? opts.health : opts.recovery;
       if (which === "fail" || which === undefined) throw new Error("network");
       return { ok: true, json: async () => which } as Response;
     }),
   );
 }
 
+function installWebSocket() {
+  MockWebSocket.instances = [];
+  vi.stubGlobal("WebSocket", MockWebSocket as unknown as typeof WebSocket);
+}
+
+/** Wait for the WS to open, then push one frame. */
+async function pushFrame(f: Record<string, unknown>): Promise<void> {
+  await waitFor(() => expect(MockWebSocket.last()).toBeDefined());
+  await act(async () => {
+    MockWebSocket.last().onopen?.();
+    MockWebSocket.last().emit(f);
+  });
+}
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  MockWebSocket.instances = [];
 });
 
 // --- Pure gate: the fail-closed conjunction --------------------------------
@@ -61,17 +128,14 @@ describe("canOpenNewPosition", () => {
 
   it("broker disconnected -> No Trade", () => {
     expect(
-      canOpenNewPosition({
-        reachable: true,
-        health: { ...HEALTHY, broker_health: "DISCONNECTED" },
-      }),
+      canOpenNewPosition({ reachable: true, health: { ...HEALTHY, broker_health: "DISCONNECTED" } }),
     ).toBe(false);
   });
 
   it("not reconciled -> No Trade", () => {
-    expect(
-      canOpenNewPosition({ reachable: true, health: { ...HEALTHY, reconciled: false } }),
-    ).toBe(false);
+    expect(canOpenNewPosition({ reachable: true, health: { ...HEALTHY, reconciled: false } })).toBe(
+      false,
+    );
   });
 
   it("data STALE -> No Trade", () => {
@@ -165,124 +229,134 @@ async function tradingText(): Promise<string> {
 }
 
 describe("Cockpit trading badge", () => {
-  it("shows ALLOWED when all healthy, reconciled, and gateway allows", async () => {
-    mockFetch({ health: HEALTHY, snapshot: SNAPSHOT });
+  it("shows ALLOWED when broker healthy AND stream frame LIVE + tradable", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
     render(<Cockpit />);
+    await pushFrame(frame());
     await waitFor(async () => expect(await tradingText()).toBe("Trading: ALLOWED"));
   });
 
-  it("shows No Trade when the gateway vetoes (new_position_allowed=false)", async () => {
-    mockFetch({ health: { ...HEALTHY, new_position_allowed: false }, snapshot: SNAPSHOT });
+  it("shows No Trade when the broker gateway vetoes even if the frame is LIVE", async () => {
+    mockFetch({ health: { ...HEALTHY, new_position_allowed: false } });
+    installWebSocket();
     render(<Cockpit />);
-    await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
-  });
-
-  it("shows No Trade when new_position_allowed field is missing", async () => {
-    const { new_position_allowed: _omit, ...partial } = HEALTHY;
-    mockFetch({ health: partial, snapshot: SNAPSHOT });
-    render(<Cockpit />);
+    await pushFrame(frame());
     await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
   });
 
   it("shows No Trade when broker disconnected", async () => {
-    mockFetch({ health: { ...HEALTHY, broker_health: "DISCONNECTED" }, snapshot: SNAPSHOT });
+    mockFetch({ health: { ...HEALTHY, broker_health: "DISCONNECTED" } });
+    installWebSocket();
     render(<Cockpit />);
+    await pushFrame(frame());
     await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
   });
 
-  it("shows No Trade when not reconciled", async () => {
-    mockFetch({ health: { ...HEALTHY, reconciled: false }, snapshot: SNAPSHOT });
+  it("shows No Trade when the frame is not tradable (new_position_allowed=false)", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
     render(<Cockpit />);
+    await pushFrame(frame({ new_position_allowed: false, connection: "STALE" }));
     await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
   });
 
-  it("shows No Trade when data is STALE", async () => {
-    mockFetch({ health: { ...HEALTHY, data_health: "STALE" }, snapshot: SNAPSHOT });
+  it("shows No Trade when the frame snapshot data_health is not HEALTHY", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
     render(<Cockpit />);
+    await pushFrame(frame({ snapshot: { ...SNAPSHOT, data_health: "STALE" } }));
     await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
   });
 
-  it("shows No Trade + OFFLINE when the core request fails", async () => {
-    mockFetch({ health: "fail", snapshot: "fail" });
+  it("shows No Trade + OFFLINE when the core health request fails", async () => {
+    mockFetch({ health: "fail" });
+    installWebSocket();
     render(<Cockpit />);
+    await pushFrame(frame());
     await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
     expect(
       await screen.findByRole("status", { name: "Connection: OFFLINE (read-only)" }),
     ).toBeInTheDocument();
   });
 
-  it("shows No Trade when health is all-green but the snapshot fetch fails", async () => {
-    // P1: no trustworthy price -> No Trade even though Connection is ONLINE.
-    mockFetch({ health: HEALTHY, snapshot: "fail" });
+  it("shows No Trade when broker healthy but no frame has arrived yet", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
     render(<Cockpit />);
     await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
-    expect(
-      await screen.findByRole("status", { name: "Connection: ONLINE" }),
-    ).toBeInTheDocument();
-  });
-
-  it("shows No Trade when health is all-green but the snapshot is STALE", async () => {
-    mockFetch({ health: HEALTHY, snapshot: { ...SNAPSHOT, data_health: "STALE" } });
-    render(<Cockpit />);
-    await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
-  });
-
-  it("shows OFFLINE when BFF reports status=unreachable even if body parses", async () => {
-    mockFetch({
-      health: {
-        schema_version: "1.0",
-        status: "unreachable",
-        service: "trading-core",
-        data_health: "STALE",
-        broker_health: "DISCONNECTED",
-        reconciled: false,
-        new_position_allowed: false,
-      },
-      snapshot: "fail",
-    });
-    render(<Cockpit />);
-    await waitFor(async () =>
-      expect(
-        await screen.findByRole("status", { name: "Connection: OFFLINE (read-only)" }),
-      ).toBeInTheDocument(),
-    );
-    expect(await tradingText()).toBe("Trading: No Trade");
   });
 });
 
-// --- Rendered Cockpit: snapshot comes from the BFF, not a local fixture ----
-describe("Cockpit market snapshot", () => {
-  it("renders snapshot_id, symbol, price, data_health from the BFF response", async () => {
-    mockFetch({ health: HEALTHY, snapshot: SNAPSHOT });
+// --- Rendered Cockpit: decision + snapshot come from the stream frame ------
+describe("Cockpit stream frame rendering", () => {
+  it("renders regime, strategy, and snapshot fields from the frame", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
     render(<Cockpit />);
-    // The rendered values must equal what the mocked BFF returned.
-    expect(
-      await screen.findByLabelText(`Snapshot ID: ${SNAPSHOT.snapshot_id}`),
-    ).toBeInTheDocument();
-    expect(await screen.findByLabelText(`Symbol: ${SNAPSHOT.symbol}`)).toBeInTheDocument();
+    await pushFrame(frame());
+    expect(await screen.findByLabelText("Regime: Trend")).toBeInTheDocument();
+    expect(await screen.findByLabelText("Strategy: LongGamma")).toBeInTheDocument();
     expect(await screen.findByLabelText(`Price: ${SNAPSHOT.price}`)).toBeInTheDocument();
     expect(await screen.findByLabelText("Snapshot Data Health: HEALTHY")).toBeInTheDocument();
   });
 
-  it("proves the value is data-driven: a different BFF price renders that price", async () => {
-    mockFetch({ health: HEALTHY, snapshot: { ...SNAPSHOT, price: "512.34" } });
+  it("proves values are data-driven: a different frame price renders that price", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
     render(<Cockpit />);
+    await pushFrame(frame({ snapshot: { ...SNAPSHOT, price: "512.34" } }));
     expect(await screen.findByLabelText("Price: 512.34")).toBeInTheDocument();
   });
 
-  it("shows STALE/unavailable when snapshot fetch fails", async () => {
-    mockFetch({ health: HEALTHY, snapshot: "fail" });
+  it("shows STALE/unavailable snapshot when the stream is not live", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
     render(<Cockpit />);
+    await pushFrame(frame({ connection: "DISCONNECTED", new_position_allowed: false, snapshot: null }));
     expect(
       await screen.findByRole("status", { name: "Market Snapshot: unavailable" }),
     ).toBeInTheDocument();
   });
 
-  it("shows STALE/unavailable when snapshot data_health is not HEALTHY", async () => {
-    mockFetch({ health: HEALTHY, snapshot: { ...SNAPSHOT, data_health: "STALE" } });
+  it("surfaces risk flags from the frame", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
     render(<Cockpit />);
+    await pushFrame(
+      frame({
+        connection: "STALE",
+        new_position_allowed: false,
+        risk_flags: ["new positions blocked: data_health=STALE"],
+      }),
+    );
     expect(
-      await screen.findByRole("status", { name: "Market Snapshot: unavailable" }),
+      await screen.findByText("new positions blocked: data_health=STALE"),
     ).toBeInTheDocument();
+  });
+
+  it("appends signals to the signal log", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
+    render(<Cockpit />);
+    await pushFrame(frame({ seq: 1 }));
+    await act(async () => {
+      MockWebSocket.last().emit(frame({ seq: 2, signal: { ...(frame().signal as object), strategy: "NoTrade", regime: "Range" } }));
+    });
+    const log = await screen.findByRole("list", { name: "Signal Log" });
+    expect(log.querySelectorAll("li").length).toBe(2);
+  });
+
+  it("drops to DISCONNECTED and No Trade when the socket closes", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
+    render(<Cockpit />);
+    await pushFrame(frame());
+    await waitFor(async () => expect(await tradingText()).toBe("Trading: ALLOWED"));
+    await act(async () => {
+      MockWebSocket.last().close();
+    });
+    await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
+    expect(await screen.findByLabelText("Link: DISCONNECTED")).toBeInTheDocument();
   });
 });

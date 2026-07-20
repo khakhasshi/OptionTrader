@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   canOpenNewPosition,
   parseServiceHealth,
@@ -6,60 +6,55 @@ import {
   type DataHealth,
   type ServiceHealth,
 } from "./health";
-import { isSnapshotLive, parseMarketSnapshot, type MarketSnapshot } from "./snapshot";
+import {
+  cockpitCanTrade,
+  frameDataHealth,
+  type CockpitState,
+  type SignalView,
+} from "./cockpitState";
+import { useCockpitStream } from "./useCockpitStream";
 
 /**
- * Phase 0 Cockpit skeleton. Polls trading-core health AND the latest
- * MarketSnapshot via the Application BFF proxy.
+ * Phase 2 real-time Cockpit. Two independent channels feed the fail-closed
+ * trading gate:
+ *   - WebSocket cockpit stream (data/decision dimension): the Rust-authoritative
+ *     snapshot plus Python-derived Regime/Vol/Strategy/Signal, per MarketTick.
+ *   - /core/health poll (broker dimension): BrokerHealth + reconciliation +
+ *     the Rust gateway's new_position_allowed.
  *
- * A new position is only permitted when the core reports status "ok" AND data
- * is HEALTHY AND broker is HEALTHY AND the book is reconciled AND the Rust
- * gateway set new_position_allowed=true (see canOpenNewPosition). Anything
- * else — a degraded broker, an unreconciled book, stale data, a gateway veto,
- * a malformed payload, or a failed fetch — shows No Trade. Fail closed.
- *
- * The snapshot fields shown here come entirely from the BFF response; there is
- * no local fixture. A missing/invalid snapshot or non-HEALTHY data_health is
- * shown as STALE / unavailable.
+ * A new position is permitted ONLY when the stream frame is LIVE, its snapshot
+ * data_health is HEALTHY, the frame's new_position_allowed is true, AND the
+ * broker-dimension gate (canOpenNewPosition) passes. Anything else — a degraded
+ * broker, unreconciled book, stale data, a disconnected stream, a malformed
+ * frame, or a failed health fetch — shows No Trade. Fail closed.
  */
+const SESSION_ID = "live";
+const MAX_SIGNAL_LOG = 12;
+
 export function Cockpit() {
   const [health, setHealth] = useState<ServiceHealth | null>(null);
   const [reachable, setReachable] = useState(false);
-  const [snapshot, setSnapshot] = useState<MarketSnapshot | null>(null);
+  const { frame, link, reconnects } = useCockpitStream(SESSION_ID);
+  const signalLog = useSignalLog(frame);
 
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
-      // Health
       try {
         const r = await fetch("/api/v1/core/health");
         if (!r.ok) throw new Error(String(r.status));
         const parsed = parseServiceHealth(await r.json());
-        // status "unreachable" or an unparseable body is NOT a live connection.
         if (!cancelled) {
-          if (parsed && parsed.status === "ok") {
-            setHealth(parsed);
-            setReachable(true);
-          } else {
-            setHealth(parsed);
-            setReachable(false);
-          }
+          setHealth(parsed);
+          setReachable(Boolean(parsed && parsed.status === "ok"));
         }
       } catch {
         // Fail closed: drop reachable AND clear the last body so no stale
-        // HEALTHY snapshot lingers behind an OFFLINE connection.
+        // HEALTHY health lingers behind an OFFLINE connection.
         if (!cancelled) {
           setReachable(false);
           setHealth(null);
         }
-      }
-      // Snapshot (independent: a bad snapshot must not mark the whole UI offline)
-      try {
-        const r = await fetch("/api/v1/market/snapshot");
-        if (!r.ok) throw new Error(String(r.status));
-        if (!cancelled) setSnapshot(parseMarketSnapshot(await r.json()));
-      } catch {
-        if (!cancelled) setSnapshot(null);
       }
     };
     poll();
@@ -71,24 +66,27 @@ export function Cockpit() {
   }, []);
 
   const online = reachable && health?.status === "ok";
-  const dataHealth: DataHealth = online && health ? health.data_health : "STALE";
+  const brokerAllowed = canOpenNewPosition({ reachable, health });
   const brokerHealth: BrokerHealth = online && health ? health.broker_health : "DISCONNECTED";
   const reconciled = online && health ? health.reconciled === true : false;
-  const snapLive = isSnapshotLive(snapshot);
-  // A tradable decision needs a live market snapshot too: if the snapshot fetch
-  // failed or data_health != HEALTHY, we have no trustworthy price -> No Trade,
-  // even when every health field is green. Fail closed.
-  const canTrade = canOpenNewPosition({ reachable, health }) && snapLive;
+  // Data health comes from the stream frame's snapshot; STALE when absent.
+  const dataHealth: DataHealth = link === "OPEN" ? frameDataHealth(frame) : "STALE";
+  const streamLive = link === "OPEN" && frame?.connection === "LIVE";
+  const canTrade = cockpitCanTrade({ frame, brokerAllowed });
+
+  const snapshot = frame?.snapshot ?? null;
 
   return (
     <main style={{ fontFamily: "system-ui", padding: 24 }}>
       <h1>OptionTrader Cockpit</h1>
-      <p style={{ color: "#5d6677" }}>Phase 0 skeleton — QQQ intraday volatility trading</p>
+      <p style={{ color: "#5d6677" }}>Phase 2 — QQQ intraday volatility, real-time</p>
+
       <section style={{ display: "flex", gap: 16, marginTop: 16, flexWrap: "wrap" }}>
+        <Badge label="Connection" value={online ? "ONLINE" : "OFFLINE (read-only)"} ok={Boolean(online)} />
         <Badge
-          label="Connection"
-          value={online ? "ONLINE" : "OFFLINE (read-only)"}
-          ok={Boolean(online)}
+          label="Stream"
+          value={link === "OPEN" ? (streamLive ? "LIVE" : "OPEN (not live)") : link}
+          ok={Boolean(streamLive)}
         />
         <Badge label="Data Health" value={dataHealth} ok={dataHealth === "HEALTHY"} />
         <Badge label="Broker Health" value={brokerHealth} ok={brokerHealth === "HEALTHY"} />
@@ -100,8 +98,20 @@ export function Cockpit() {
         <Badge label="Trading" value={canTrade ? "ALLOWED" : "No Trade"} ok={canTrade} />
       </section>
 
+      <h2 style={{ marginTop: 28, fontSize: 18 }}>Decision</h2>
+      <section style={{ display: "flex", gap: 16, marginTop: 12, flexWrap: "wrap" }}>
+        <Field label="Regime" value={frame?.regime?.regime ?? "—"} />
+        <Field label="Strategy" value={frame?.signal?.strategy ?? "—"} />
+        <Field label="Vol State" value={frame?.vol?.iv_hv_state ?? "—"} />
+        <Field label="Vol Read" value={frame?.vol?.interpretation ?? "—"} />
+        <Field
+          label="Initial Risk"
+          value={frame?.signal?.initial_risk_status ?? "NOT_EVALUATED"}
+        />
+      </section>
+
       <h2 style={{ marginTop: 28, fontSize: 18 }}>Market Snapshot</h2>
-      {snapLive && snapshot ? (
+      {streamLive && snapshot ? (
         <section
           role="group"
           aria-label="Market Snapshot"
@@ -110,14 +120,98 @@ export function Cockpit() {
           <Field label="Snapshot ID" value={snapshot.snapshot_id} />
           <Field label="Symbol" value={snapshot.symbol} />
           <Field label="Price" value={snapshot.price} />
+          <Field label="VWAP" value={snapshot.vwap} />
           <Field label="Snapshot Data Health" value={snapshot.data_health} />
         </section>
       ) : (
-        <p role="status" aria-label="Market Snapshot: unavailable" style={{ color: "#b23", marginTop: 12 }}>
+        <p
+          role="status"
+          aria-label="Market Snapshot: unavailable"
+          style={{ color: "#b23", marginTop: 12 }}
+        >
           Snapshot STALE / unavailable
         </p>
       )}
+
+      <h2 style={{ marginTop: 28, fontSize: 18 }}>Risk Flags</h2>
+      {frame && frame.risk_flags.length > 0 ? (
+        <ul role="list" aria-label="Risk Flags" style={{ marginTop: 8, color: "#8a5a00" }}>
+          {frame.risk_flags.map((flag, i) => (
+            <li key={i}>{flag}</li>
+          ))}
+        </ul>
+      ) : (
+        <p role="status" aria-label="Risk Flags: none" style={{ color: "#5d6677", marginTop: 8 }}>
+          None
+        </p>
+      )}
+
+      <h2 style={{ marginTop: 28, fontSize: 18 }}>Signal Log</h2>
+      <SignalLog entries={signalLog} />
+
+      <h2 style={{ marginTop: 28, fontSize: 18 }}>System Health</h2>
+      <section style={{ display: "flex", gap: 16, marginTop: 12, flexWrap: "wrap" }}>
+        <Field label="Link" value={link} />
+        <Field label="Reconnects" value={String(reconnects)} />
+        <Field label="Frame Seq" value={frame ? String(frame.seq) : "—"} />
+        <Field label="Rule Version" value={frame?.signal?.rule_version ?? "—"} />
+      </section>
     </main>
+  );
+}
+
+interface SignalLogEntry {
+  seq: number;
+  time: string;
+  strategy: string;
+  regime: string;
+  risk: string;
+}
+
+/** Accumulate the most recent distinct signals for the operator's audit trail. */
+function useSignalLog(frame: CockpitState | null): SignalLogEntry[] {
+  const [log, setLog] = useState<SignalLogEntry[]>([]);
+  const lastSeq = useRef<number>(-1);
+  useEffect(() => {
+    if (!frame || !frame.signal || frame.seq === lastSeq.current) return;
+    lastSeq.current = frame.seq;
+    const signal: SignalView = frame.signal;
+    setLog((prev) =>
+      [
+        {
+          seq: frame.seq,
+          time: frame.server_time_utc,
+          strategy: signal.strategy,
+          regime: signal.regime,
+          risk: signal.initial_risk_status,
+        },
+        ...prev,
+      ].slice(0, MAX_SIGNAL_LOG),
+    );
+  }, [frame]);
+  return log;
+}
+
+function SignalLog({ entries }: { entries: SignalLogEntry[] }) {
+  if (entries.length === 0) {
+    return (
+      <p role="status" aria-label="Signal Log: empty" style={{ color: "#5d6677", marginTop: 8 }}>
+        No signals yet
+      </p>
+    );
+  }
+  return (
+    <ul role="list" aria-label="Signal Log" style={{ marginTop: 8, listStyle: "none", padding: 0 }}>
+      {entries.map((e) => (
+        <li
+          key={e.seq}
+          style={{ borderBottom: "1px solid #eef0f4", padding: "6px 0", fontVariantNumeric: "tabular-nums" }}
+        >
+          <span style={{ color: "#5d6677" }}>#{e.seq}</span> {e.strategy} · {e.regime} ·{" "}
+          <span style={{ color: e.risk === "PASSED" ? "#2a7" : "#b23" }}>{e.risk}</span>
+        </li>
+      ))}
+    </ul>
   );
 }
 
