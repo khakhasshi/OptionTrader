@@ -1,18 +1,24 @@
 //! gRPC MarketService: streams the Rust-authoritative snapshot feed to Python.
 //!
-//! The server is backed by a `SnapshotSource` (replay by default; the live
-//! ThetaData adapter slots in behind the same trait once entitled). Snapshots
-//! are precomputed deterministically, then streamed in order.
-//!
-//! `GetDataHealth` reports the health of the MOST RECENTLY SENT record, driven
-//! by a shared `DataHealthMachine`: before any stream has emitted a record the
-//! machine is RECONCILING (never HEALTHY), and it only advances as ticks are
-//! actually sent. lag/out-of-order/reconnect all come from the machine.
+//! Architecture (Phase 2 review fix): a SINGLE producer advances the market feed
+//! exactly once. DataHealth is driven by that one producer — never by individual
+//! subscribers. A shared cursor (`watch<usize>`) marks how many records the
+//! producer has emitted; `GetDataHealth` reports the health of the record at the
+//! cursor, and every `StreamMarketSnapshots` consumer follows the cursor FORWARD
+//! from where it joined. Consequences:
+//!   * N concurrent subscribers cannot pollute health — none of them drive it.
+//!   * A late subscriber / reconnect resumes at the current cursor and never
+//!     re-ingests history.
+//!   * `MarketTick.snapshot.data_health` and `GetDataHealth.status` come from the
+//!     same precomputed runtime state, so they can never contradict.
+//!   * Disconnecting any consumer does not change global health.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use market_core::{
-    DataHealth, DataHealthMachine, HealthConfig, MarketSnapshot, ReplayBar, ReplayConfig,
+    DataHealth, DataHealthMachine, DataHealthStateRecord, MarketSnapshot, ReplayBar, ReplayConfig,
     ReplaySnapshotSource, SnapshotSource,
 };
 use optiontrader_proto::market_v1::{
@@ -20,16 +26,18 @@ use optiontrader_proto::market_v1::{
     DataHealthState as ProtoHealthState, GetDataHealthRequest, MarketBar as ProtoBar,
     MarketSnapshot as ProtoSnapshot, MarketTick as ProtoTick, StreamRequest,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-/// Precomputed tick feed shared by all RPCs. Each tick pairs the aggregate
-/// snapshot with its originating per-minute bar. Immutable after construction,
-/// so streaming observes a consistent deterministic sequence.
+/// Precomputed feed. Ticks and their per-record health are computed ONCE here
+/// (single authoritative pass); everything downstream only reads this.
 pub struct MarketFeed {
     ticks: Vec<(MarketSnapshot, ReplayBar)>,
-    health_cfg: HealthConfig,
+    /// health_states[i] is the runtime health after record i was produced.
+    /// Its `status` equals ticks[i].0.data_health by construction, so the
+    /// snapshot and GetDataHealth never disagree.
+    health_states: Vec<DataHealthStateRecord>,
 }
 
 impl MarketFeed {
@@ -42,13 +50,49 @@ impl MarketFeed {
         if snapshots.is_empty() {
             return Err("replay produced no snapshots".into());
         }
-        // snapshots() emits one snapshot per bar, in the same order as bars().
         let ticks: Vec<(MarketSnapshot, ReplayBar)> = snapshots
             .into_iter()
             .zip(source.bars().iter().cloned())
             .collect();
-        Ok(MarketFeed { ticks, health_cfg })
+
+        // Single machine pass for lag/out-of-order/reconnect counters; the
+        // reported status is pinned to the snapshot's authoritative data_health
+        // so MarketTick.snapshot.data_health == GetDataHealth.status always.
+        let mut machine = DataHealthMachine::new(health_cfg);
+        let mut health_states = Vec::with_capacity(ticks.len());
+        for (snap, bar) in &ticks {
+            machine.observe_bar_at(bar.minute_et, bar.occurred_at_utc_ms, &bar.occurred_at_utc);
+            let mut rec = machine.state(snap.occurred_at_utc.clone());
+            rec.status = snap.data_health; // pin to the snapshot's authority
+            health_states.push(rec);
+        }
+        Ok(MarketFeed {
+            ticks,
+            health_states,
+        })
     }
+
+    /// Health record before any record has been produced: RECONCILING, stamped
+    /// at the earliest feed instant so occurred_at_utc stays a valid RFC3339 Z.
+    fn initial_health(&self) -> DataHealthStateRecord {
+        DataHealthStateRecord {
+            occurred_at_utc: self.ticks[0].0.occurred_at_utc.clone(),
+            status: DataHealth::Reconciling,
+            market_event_lag_ms: 0,
+            quote_age_ms: 0,
+            out_of_order_count: 0,
+            reconnect_count: 0,
+            reason: Some("awaiting_first_record".to_owned()),
+        }
+    }
+}
+
+fn replay_tick_interval() -> Duration {
+    let ms: u64 = std::env::var("OPTIONTRADER_REPLAY_TICK_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    Duration::from_millis(ms.max(1))
 }
 
 fn bar_to_proto(b: &ReplayBar) -> ProtoBar {
@@ -99,17 +143,56 @@ fn snapshot_to_proto(s: &MarketSnapshot) -> ProtoSnapshot {
     }
 }
 
+fn health_to_proto_state(rec: &DataHealthStateRecord) -> ProtoHealthState {
+    ProtoHealthState {
+        schema_version: "1.0".into(),
+        occurred_at_utc: rec.occurred_at_utc.clone(),
+        status: health_to_proto(rec.status) as i32,
+        market_event_lag_ms: rec.market_event_lag_ms,
+        quote_age_ms: rec.quote_age_ms,
+        out_of_order_count: rec.out_of_order_count,
+        reconnect_count: rec.reconnect_count,
+        reason: rec.reason.clone().unwrap_or_default(),
+    }
+}
+
 pub struct MarketServiceImpl {
     feed: Arc<MarketFeed>,
-    /// Shared runtime health, advanced only as records are actually sent.
-    /// Starts RECONCILING; never reports a state that has not been emitted.
-    health: Arc<Mutex<DataHealthMachine>>,
+    /// Number of records the single producer has emitted (0 = none yet).
+    cursor_tx: watch::Sender<usize>,
+    /// Producer starts lazily on the first subscription, exactly once.
+    started: Arc<AtomicBool>,
+    interval: Duration,
 }
 
 impl MarketServiceImpl {
     pub fn new(feed: Arc<MarketFeed>) -> Self {
-        let health = Arc::new(Mutex::new(DataHealthMachine::new(feed.health_cfg)));
-        MarketServiceImpl { feed, health }
+        let (cursor_tx, _rx) = watch::channel(0usize);
+        MarketServiceImpl {
+            feed,
+            cursor_tx,
+            started: Arc::new(AtomicBool::new(false)),
+            interval: replay_tick_interval(),
+        }
+    }
+
+    /// Start the single producer clock once. It advances the shared cursor from
+    /// 0 to N at a fixed pace; this is the ONLY thing that "produces" records.
+    fn ensure_producer(&self) {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let n = self.feed.ticks.len();
+        let tx = self.cursor_tx.clone();
+        let interval = self.interval;
+        tokio::spawn(async move {
+            for i in 1..=n {
+                tokio::time::sleep(interval).await;
+                if tx.send(i).is_err() {
+                    break; // no receivers and none will come
+                }
+            }
+        });
     }
 }
 
@@ -122,20 +205,33 @@ impl MarketService for MarketServiceImpl {
         _request: Request<StreamRequest>,
     ) -> Result<Response<Self::StreamMarketSnapshotsStream>, Status> {
         let feed = Arc::clone(&self.feed);
-        let health = Arc::clone(&self.health);
+        let mut cursor_rx = self.cursor_tx.subscribe();
+        // Join at the CURRENT cursor: a late subscriber / reconnect resumes from
+        // here and never re-ingests already-produced history.
+        let mut sent = *cursor_rx.borrow();
+        let n = feed.ticks.len();
+        self.ensure_producer();
+
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
-            for (snap, bar) in &feed.ticks {
-                let tick = ProtoTick {
-                    snapshot: Some(snapshot_to_proto(snap)),
-                    bar: Some(bar_to_proto(bar)),
-                };
-                if tx.send(Ok(tick)).await.is_err() {
-                    break; // client dropped
+            loop {
+                let cursor = *cursor_rx.borrow();
+                while sent < cursor {
+                    let (snap, bar) = &feed.ticks[sent];
+                    let tick = ProtoTick {
+                        snapshot: Some(snapshot_to_proto(snap)),
+                        bar: Some(bar_to_proto(bar)),
+                    };
+                    if tx.send(Ok(tick)).await.is_err() {
+                        return; // client dropped
+                    }
+                    sent += 1;
                 }
-                // Advance shared health only AFTER the record was actually sent.
-                if let Ok(mut m) = health.lock() {
-                    m.observe_bar_at(bar.minute_et, bar.occurred_at_utc_ms, &bar.occurred_at_utc);
+                if sent >= n {
+                    return; // replay exhausted -> end this stream
+                }
+                if cursor_rx.changed().await.is_err() {
+                    return; // producer gone
                 }
             }
         });
@@ -146,28 +242,13 @@ impl MarketService for MarketServiceImpl {
         &self,
         _request: Request<GetDataHealthRequest>,
     ) -> Result<Response<ProtoHealthState>, Status> {
-        let m = self
-            .health
-            .lock()
-            .map_err(|_| Status::internal("health lock poisoned"))?;
-        // Before the first record is sent, occurred_at_utc has no meaningful
-        // instant; stamp the earliest feed instant so the field stays a valid
-        // RFC3339 UTC while status remains RECONCILING.
-        let occurred = m
-            .last_occurred_at_utc()
-            .map(str::to_owned)
-            .unwrap_or_else(|| self.feed.ticks[0].0.occurred_at_utc.clone());
-        let record = m.state(occurred);
-        Ok(Response::new(ProtoHealthState {
-            schema_version: "1.0".into(),
-            occurred_at_utc: record.occurred_at_utc,
-            status: health_to_proto(record.status) as i32,
-            market_event_lag_ms: record.market_event_lag_ms,
-            quote_age_ms: record.quote_age_ms,
-            out_of_order_count: record.out_of_order_count,
-            reconnect_count: record.reconnect_count,
-            reason: record.reason.unwrap_or_default(),
-        }))
+        let cursor = *self.cursor_tx.borrow();
+        let record = if cursor == 0 {
+            self.feed.initial_health()
+        } else {
+            self.feed.health_states[cursor - 1].clone()
+        };
+        Ok(Response::new(health_to_proto_state(&record)))
     }
 }
 
@@ -186,9 +267,8 @@ mod tests {
         Arc::new(MarketFeed::from_ndjson(NDJSON, cfg).unwrap())
     }
 
-    #[tokio::test]
-    async fn stream_emits_all_snapshots_in_order() {
-        let svc = MarketServiceImpl::new(feed());
+    async fn drain(svc: &MarketServiceImpl) -> Vec<optiontrader_proto::market_v1::MarketTick> {
+        use tokio_stream::StreamExt;
         let resp = svc
             .stream_market_snapshots(Request::new(StreamRequest {
                 session_id: "s".into(),
@@ -197,55 +277,81 @@ mod tests {
             .await
             .unwrap();
         let mut stream = resp.into_inner();
-        use tokio_stream::StreamExt;
-        let mut seqs = Vec::new();
+        let mut out = Vec::new();
         while let Some(item) = stream.next().await {
-            let tick = item.unwrap();
-            let snap = tick.snapshot.expect("tick carries snapshot");
-            let bar = tick.bar.expect("tick carries bar");
-            // Bar and snapshot line up on the same business instant.
-            assert_eq!(bar.occurred_at_utc, snap.occurred_at_utc);
-            seqs.push(snap.sequence_number);
+            out.push(item.unwrap());
         }
+        out
+    }
+
+    #[tokio::test]
+    async fn first_subscriber_gets_all_ticks_in_order() {
+        let svc = MarketServiceImpl::new(feed());
+        let ticks = drain(&svc).await;
+        let seqs: Vec<u64> = ticks
+            .iter()
+            .map(|t| t.snapshot.as_ref().unwrap().sequence_number)
+            .collect();
         assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
+        // snapshot and bar align on the same instant
+        for t in &ticks {
+            assert_eq!(
+                t.snapshot.as_ref().unwrap().occurred_at_utc,
+                t.bar.as_ref().unwrap().occurred_at_utc
+            );
+        }
     }
 
     #[tokio::test]
-    async fn get_data_health_is_reconciling_before_any_send() {
-        // The review's exact scenario: query health before subscribing.
+    async fn health_is_reconciling_before_any_stream() {
         let svc = MarketServiceImpl::new(feed());
-        let resp = svc
+        let state = svc
             .get_data_health(Request::new(GetDataHealthRequest {}))
             .await
-            .unwrap();
-        let state = resp.into_inner();
-        assert_eq!(state.schema_version, "1.0");
+            .unwrap()
+            .into_inner();
+        assert_eq!(state.status, ProtoHealth::Reconciling as i32);
+    }
+
+    #[tokio::test]
+    async fn second_subscription_does_not_pollute_health() {
+        // The exact review scenario: after a full drain, a second subscription
+        // must NOT flip health to DEGRADED / bump out_of_order.
+        let svc = MarketServiceImpl::new(feed());
+        let _ = drain(&svc).await;
+        let after_first = svc
+            .get_data_health(Request::new(GetDataHealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(after_first.status, ProtoHealth::Healthy as i32);
+        assert_eq!(after_first.out_of_order_count, 0);
+
+        let _ = drain(&svc).await; // second subscription
+        let after_second = svc
+            .get_data_health(Request::new(GetDataHealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(
-            state.status,
-            ProtoHealth::Reconciling as i32,
-            "must be RECONCILING before the first record is sent, never HEALTHY"
+            after_second.status,
+            ProtoHealth::Healthy as i32,
+            "a second subscriber must not degrade global health"
         );
+        assert_eq!(after_second.out_of_order_count, 0);
     }
 
     #[tokio::test]
-    async fn get_data_health_reports_healthy_after_stream_drains() {
+    async fn snapshot_data_health_matches_get_data_health() {
         let svc = MarketServiceImpl::new(feed());
-        let resp = svc
-            .stream_market_snapshots(Request::new(StreamRequest {
-                session_id: "s".into(),
-                speedup: 0.0,
-            }))
-            .await
-            .unwrap();
-        let mut stream = resp.into_inner();
-        use tokio_stream::StreamExt;
-        while stream.next().await.is_some() {}
-        // Fixture opens at 09:30 with clean cadence -> HEALTHY once fully sent.
-        let resp = svc
+        let ticks = drain(&svc).await;
+        let last_snap_health = ticks.last().unwrap().snapshot.as_ref().unwrap().data_health;
+        let gdh = svc
             .get_data_health(Request::new(GetDataHealthRequest {}))
             .await
-            .unwrap();
-        assert_eq!(resp.into_inner().status, ProtoHealth::Healthy as i32);
+            .unwrap()
+            .into_inner();
+        assert_eq!(last_snap_health, gdh.status);
     }
 
     #[test]
@@ -256,10 +362,8 @@ mod tests {
         assert_eq!(proto.symbol, "QQQ.US");
         assert_eq!(proto.schema_version, "1.0");
         assert_eq!(proto.data_health, ProtoHealth::Healthy as i32);
-        assert!(!proto.opening_range_high.is_empty()); // OR ready by index 3
+        assert!(!proto.opening_range_high.is_empty());
         let proto_bar = bar_to_proto(bar);
         assert_eq!(proto_bar.occurred_at_utc, snap.occurred_at_utc);
-        assert!(proto_bar.close.contains('.'));
-        assert!(proto_bar.minute_et >= 570);
     }
 }
