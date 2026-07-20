@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import (
     AfterValidator,
@@ -30,12 +30,16 @@ from pydantic import (
     ValidationError,
 )
 
+from app.realtime.projector import ProjectorConfig
+from app.realtime.session import cockpit_frames, latest_frame
+
 __all__ = ["app", "httpx"]
 
 app = FastAPI(title="OptionTrader Application API", version="0.0.0")
 
 TRADING_CORE_URL = os.getenv("TRADING_CORE_URL", "http://localhost:8080")
 _TIMEOUT = 1.5
+_RULE_VERSION = os.getenv("OPTIONTRADER_RULE_VERSION", "phase1-2026-07-21")
 
 DataHealth = Literal["HEALTHY", "DEGRADED", "STALE", "DISCONNECTED", "RECONCILING"]
 BrokerHealth = Literal["HEALTHY", "DEGRADED", "DISCONNECTED", "RECONCILING"]
@@ -198,3 +202,46 @@ async def market_snapshot() -> JSONResponse:
         return unavailable(f"contract_violation: {exc.error_count()} errors")
 
     return JSONResponse(status_code=200, content=snapshot.model_dump(exclude_none=True))
+
+
+@app.get("/api/v1/cockpit/state")
+def cockpit_state(session_id: str) -> JSONResponse:
+    """Snapshot-recovery endpoint: the latest CockpitState frame for a session.
+
+    A reconnecting Cockpit calls this to recover current state before resuming
+    the WebSocket. Returns a fail-closed DISCONNECTED frame (never a stale
+    tradable one) when the session has no frame yet."""
+    frame = latest_frame(session_id)
+    if frame is None:
+        frame = {
+            "schema_version": "1.0",
+            "seq": 0,
+            "session_id": session_id,
+            "server_time_utc": datetime.now().astimezone().isoformat(),
+            "connection": "DISCONNECTED",
+            "new_position_allowed": False,
+            "snapshot": None,
+            "regime": None,
+            "vol": None,
+            "signal": None,
+            "risk_flags": ["no frames yet for session"],
+        }
+    return JSONResponse(status_code=200, content=frame)
+
+
+@app.websocket("/api/v1/stream/cockpit")
+async def stream_cockpit(websocket: WebSocket) -> None:
+    """Push CockpitState frames for one session over WebSocket.
+
+    The session_id query param ties the stream to one trading session. Each
+    frame is a cockpit_state.json object derived from the Rust snapshot/bar
+    stream. On stream end or client disconnect the socket closes; the client
+    reconnects and recovers via GET /api/v1/cockpit/state."""
+    await websocket.accept()
+    session_id = websocket.query_params.get("session_id", "default")
+    config = ProjectorConfig(session_id=session_id, rule_version=_RULE_VERSION)
+    try:
+        async for frame in cockpit_frames(config):
+            await websocket.send_json(frame)
+    except WebSocketDisconnect:
+        return

@@ -7,20 +7,23 @@
 
 use std::sync::Arc;
 
-use market_core::{DataHealth, MarketSnapshot, ReplayConfig, ReplaySnapshotSource, SnapshotSource};
+use market_core::{
+    DataHealth, MarketSnapshot, ReplayBar, ReplayConfig, ReplaySnapshotSource, SnapshotSource,
+};
 use optiontrader_proto::market_v1::{
     market_service_server::MarketService, DataHealth as ProtoHealth,
-    DataHealthState as ProtoHealthState, GetDataHealthRequest, MarketSnapshot as ProtoSnapshot,
-    StreamRequest,
+    DataHealthState as ProtoHealthState, GetDataHealthRequest, MarketBar as ProtoBar,
+    MarketSnapshot as ProtoSnapshot, MarketTick as ProtoTick, StreamRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-/// Precomputed snapshot feed shared by all RPCs. Immutable after construction,
+/// Precomputed tick feed shared by all RPCs. Each tick pairs the aggregate
+/// snapshot with its originating per-minute bar. Immutable after construction,
 /// so streaming and health queries observe a consistent deterministic sequence.
 pub struct MarketFeed {
-    snapshots: Vec<MarketSnapshot>,
+    ticks: Vec<(MarketSnapshot, ReplayBar)>,
 }
 
 impl MarketFeed {
@@ -32,11 +35,30 @@ impl MarketFeed {
         if snapshots.is_empty() {
             return Err("replay produced no snapshots".into());
         }
-        Ok(MarketFeed { snapshots })
+        // snapshots() emits one snapshot per bar, in the same order as bars().
+        let ticks: Vec<(MarketSnapshot, ReplayBar)> = snapshots
+            .into_iter()
+            .zip(source.bars().iter().cloned())
+            .collect();
+        Ok(MarketFeed { ticks })
     }
 
     fn latest(&self) -> &MarketSnapshot {
-        self.snapshots.last().expect("feed is non-empty")
+        &self.ticks.last().expect("feed is non-empty").0
+    }
+}
+
+fn bar_to_proto(b: &ReplayBar) -> ProtoBar {
+    ProtoBar {
+        occurred_at_utc: b.occurred_at_utc.clone(),
+        timestamp_et: b.timestamp_et.clone(),
+        minute_et: u32::from(b.minute_et),
+        open: format!("{:.2}", b.open),
+        high: format!("{:.2}", b.high),
+        low: format!("{:.2}", b.low),
+        close: format!("{:.2}", b.close),
+        volume: b.volume,
+        vwap: b.vwap.map(|v| format!("{v:.2}")).unwrap_or_default(),
     }
 }
 
@@ -86,7 +108,7 @@ impl MarketServiceImpl {
 
 #[tonic::async_trait]
 impl MarketService for MarketServiceImpl {
-    type StreamMarketSnapshotsStream = ReceiverStream<Result<ProtoSnapshot, Status>>;
+    type StreamMarketSnapshotsStream = ReceiverStream<Result<ProtoTick, Status>>;
 
     async fn stream_market_snapshots(
         &self,
@@ -95,8 +117,12 @@ impl MarketService for MarketServiceImpl {
         let feed = Arc::clone(&self.feed);
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
-            for snap in &feed.snapshots {
-                if tx.send(Ok(snapshot_to_proto(snap))).await.is_err() {
+            for (snap, bar) in &feed.ticks {
+                let tick = ProtoTick {
+                    snapshot: Some(snapshot_to_proto(snap)),
+                    bar: Some(bar_to_proto(bar)),
+                };
+                if tx.send(Ok(tick)).await.is_err() {
                     break; // client dropped
                 }
             }
@@ -151,7 +177,12 @@ mod tests {
         use tokio_stream::StreamExt;
         let mut seqs = Vec::new();
         while let Some(item) = stream.next().await {
-            seqs.push(item.unwrap().sequence_number);
+            let tick = item.unwrap();
+            let snap = tick.snapshot.expect("tick carries snapshot");
+            let bar = tick.bar.expect("tick carries bar");
+            // Bar and snapshot line up on the same business instant.
+            assert_eq!(bar.occurred_at_utc, snap.occurred_at_utc);
+            seqs.push(snap.sequence_number);
         }
         assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
     }
@@ -169,12 +200,17 @@ mod tests {
     }
 
     #[test]
-    fn feed_maps_snapshot_fields_to_proto() {
+    fn feed_maps_snapshot_and_bar_fields_to_proto() {
         let f = feed();
-        let proto = snapshot_to_proto(&f.snapshots[3]);
+        let (snap, bar) = &f.ticks[3];
+        let proto = snapshot_to_proto(snap);
         assert_eq!(proto.symbol, "QQQ.US");
         assert_eq!(proto.schema_version, "1.0");
         assert_eq!(proto.data_health, ProtoHealth::Healthy as i32);
         assert!(!proto.opening_range_high.is_empty()); // OR ready by index 3
+        let proto_bar = bar_to_proto(bar);
+        assert_eq!(proto_bar.occurred_at_utc, snap.occurred_at_utc);
+        assert!(proto_bar.close.contains('.'));
+        assert!(proto_bar.minute_et >= 570);
     }
 }

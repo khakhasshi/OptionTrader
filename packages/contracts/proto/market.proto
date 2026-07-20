@@ -62,6 +62,29 @@ message DataHealthState {
   string reason = 8;              // "" when null
 }
 
+// One standardized per-minute bar (the atomic market event). Decimal strings
+// mirror the snapshot convention; vwap is "" when the provider did not supply
+// one. Python reconstructs the exact bars DataFrame the Phase 1 engines expect,
+// so realtime engine output is identical to offline replay.
+message MarketBar {
+  string occurred_at_utc = 1;   // RFC3339 UTC (Z)
+  string timestamp_et = 2;
+  uint32 minute_et = 3;
+  string open = 4;
+  string high = 5;
+  string low = 6;
+  string close = 7;
+  uint64 volume = 8;
+  string vwap = 9;              // "" when absent
+}
+
+// One tick of the stream: the Rust-authoritative aggregate snapshot (for
+// display + data_health) paired with the raw per-minute bar (for the engines).
+message MarketTick {
+  MarketSnapshot snapshot = 1;
+  MarketBar bar = 2;
+}
+
 // StreamMarketSnapshots parameters. session_id ties the stream to one trading
 // session for traceability; speedup lets replay run faster than wall clock
 // (0 or 1 = as-recorded cadence is bounded by the server, deterministic order
@@ -74,8 +97,9 @@ message StreamRequest {
 message GetDataHealthRequest {}
 
 service MarketService {
-  // Server-streaming snapshot feed in deterministic occurred_at_utc order.
-  rpc StreamMarketSnapshots(StreamRequest) returns (stream MarketSnapshot);
+  // Server-streaming tick feed in deterministic occurred_at_utc order. Each
+  // tick carries both the aggregate snapshot and its raw per-minute bar.
+  rpc StreamMarketSnapshots(StreamRequest) returns (stream MarketTick);
   // Current DataHealth as of the last processed record.
   rpc GetDataHealth(GetDataHealthRequest) returns (DataHealthState);
 }

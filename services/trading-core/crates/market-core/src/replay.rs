@@ -95,6 +95,12 @@ impl ReplaySnapshotSource {
         Ok(ReplaySnapshotSource { bars: ordered, cfg })
     }
 
+    /// The normalized bars, in the same order as `snapshots()` output. Lets a
+    /// caller pair each emitted snapshot with its originating per-minute bar.
+    pub fn bars(&self) -> &[ReplayBar] {
+        &self.bars
+    }
+
     /// Parse newline-delimited JSON `ReplayBar` records (one per line).
     pub fn from_ndjson(ndjson: &str, cfg: ReplayConfig) -> Result<Self, FeatureError> {
         let mut bars = Vec::new();
