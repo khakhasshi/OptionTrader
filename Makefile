@@ -4,7 +4,7 @@
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-web setup-api setup-core dev dev-web dev-api dev-core \
         health test test-contracts test-web test-api test-core lint lint-web lint-api lint-core \
-        contracts migrate migrate-down up down clean
+        contracts gen-py-grpc migrate migrate-down up down clean
 
 WEB_DIR  := apps/web
 API_DIR  := services/application-api
@@ -19,11 +19,15 @@ setup: setup-web setup-api setup-core ## 安装三端依赖
 setup-web: ## 安装前端依赖
 	npm install
 
-setup-api: ## 安装 Python 依赖 (uv)
+setup-api: ## 安装 Python 依赖 (uv) + 生成 gRPC 桩
 	cd $(API_DIR) && uv sync
+	$(MAKE) gen-py-grpc
 
 setup-core: ## 拉取并编译 Rust 依赖
 	cd $(CORE_DIR) && cargo fetch
+
+gen-py-grpc: ## 生成 Python gRPC 桩到 app/grpc_gen/ (git 忽略，必须可重建)
+	bash scripts/gen_python_grpc.sh
 
 dev: ## 本地并行启动 web / application-api / trading-core
 	@echo "分别在独立终端运行: make dev-web / make dev-api / make dev-core"
@@ -31,7 +35,7 @@ dev: ## 本地并行启动 web / application-api / trading-core
 dev-web: ## 启动 React 驾驶舱
 	npm --workspace $(WEB_DIR) run dev
 
-dev-api: ## 启动 Python FastAPI
+dev-api: gen-py-grpc ## 启动 Python FastAPI
 	cd $(API_DIR) && uv run uvicorn app.main:app --reload --port 8000
 
 dev-core: ## 启动 Rust trading-core (HTTP :8080 + gRPC :50051)
@@ -53,7 +57,7 @@ test-web: ## 前端测试 (vitest 单元测试 + typecheck + build)
 	npm --workspace $(WEB_DIR) run lint
 	npm --workspace $(WEB_DIR) run build
 
-test-api: ## Python 测试
+test-api: gen-py-grpc ## Python 测试
 	cd $(API_DIR) && uv run pytest
 
 test-core: ## Rust 测试
@@ -64,7 +68,7 @@ lint: lint-web lint-api lint-core ## 三端 lint + format check
 lint-web: ## 前端 lint + typecheck
 	npm --workspace $(WEB_DIR) run lint --if-present
 
-lint-api: ## Python lint + format check + typecheck
+lint-api: gen-py-grpc ## Python lint + format check + typecheck
 	cd $(API_DIR) && uv run ruff check . && uv run ruff format --check . && uv run mypy .
 
 lint-core: ## Rust fmt + clippy (all targets)

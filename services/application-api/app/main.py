@@ -15,7 +15,7 @@ SnapshotUnavailable body with HTTP 503 (never a partial fake MarketSnapshot).
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 import httpx
@@ -217,7 +217,7 @@ def cockpit_state(session_id: str) -> JSONResponse:
             "schema_version": "1.0",
             "seq": 0,
             "session_id": session_id,
-            "server_time_utc": datetime.now().astimezone().isoformat(),
+            "server_time_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "connection": "DISCONNECTED",
             "new_position_allowed": False,
             "snapshot": None,

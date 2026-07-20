@@ -57,6 +57,7 @@ function frame(overrides: Record<string, unknown> = {}): Record<string, unknown>
 // --- Mock WebSocket (jsdom has none) ---------------------------------------
 class MockWebSocket {
   static instances: MockWebSocket[] = [];
+  static autoOpen = true;
   static last(): MockWebSocket {
     return MockWebSocket.instances[MockWebSocket.instances.length - 1];
   }
@@ -67,13 +68,18 @@ class MockWebSocket {
   readyState = 0;
   constructor(public url: string) {
     MockWebSocket.instances.push(this);
-    setTimeout(() => {
-      this.readyState = 1;
-      this.onopen?.();
-    }, 0);
+    if (MockWebSocket.autoOpen) {
+      setTimeout(() => {
+        this.readyState = 1;
+        this.onopen?.();
+      }, 0);
+    }
   }
   emit(f: unknown): void {
     this.onmessage?.({ data: JSON.stringify(f) });
+  }
+  emitRaw(data: string): void {
+    this.onmessage?.({ data });
   }
   close(): void {
     this.readyState = 3;
@@ -112,6 +118,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   MockWebSocket.instances = [];
+  MockWebSocket.autoOpen = true;
 });
 
 // --- Pure gate: the fail-closed conjunction --------------------------------
@@ -358,5 +365,62 @@ describe("Cockpit stream frame rendering", () => {
     });
     await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
     expect(await screen.findByLabelText("Link: DISCONNECTED")).toBeInTheDocument();
+  });
+});
+
+// --- P0-2 fail-open window fixes -------------------------------------------
+describe("Cockpit fail-closed edges", () => {
+  it("malformed frame fails closed: No Trade + link DISCONNECTED (not a stale LIVE)", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
+    render(<Cockpit />);
+    await pushFrame(frame()); // establish a LIVE tradable frame
+    await waitFor(async () => expect(await tradingText()).toBe("Trading: ALLOWED"));
+    // A garbage frame must drop the link and clear the frame, not be ignored.
+    await act(async () => {
+      MockWebSocket.last().emitRaw("{ not json");
+    });
+    await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
+    expect(await screen.findByLabelText("Link: DISCONNECTED")).toBeInTheDocument();
+  });
+
+  it("schema-invalid frame also fails closed", async () => {
+    mockFetch({ health: HEALTHY });
+    installWebSocket();
+    render(<Cockpit />);
+    await pushFrame(frame());
+    await waitFor(async () => expect(await tradingText()).toBe("Trading: ALLOWED"));
+    await act(async () => {
+      MockWebSocket.last().emit(frame({ connection: "WOBBLY" })); // bad enum -> parse null
+    });
+    await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
+  });
+
+  it("a late recovery response cannot overwrite a newer WS frame (seq arbitration)", async () => {
+    // Recovery returns an OLD frame (seq 1); the WS has already delivered seq 5.
+    mockFetch({ health: HEALTHY, recovery: frame({ seq: 1, snapshot: { ...SNAPSHOT, price: "111.11" } }) });
+    installWebSocket();
+    render(<Cockpit />);
+    await pushFrame(frame({ seq: 5, snapshot: { ...SNAPSHOT, price: "555.55" } }));
+    // Even if the (older) recovery resolves now, the newer price must remain.
+    await waitFor(() => expect(screen.queryByLabelText("Price: 555.55")).toBeInTheDocument());
+    expect(screen.queryByLabelText("Price: 111.11")).not.toBeInTheDocument();
+  });
+
+  it("does not show ALLOWED while link is CONNECTING even with a tradable frame", async () => {
+    // Recovery delivers a tradable frame BEFORE the socket opens. With auto-open
+    // suppressed the link stays CONNECTING, so the gate must still be No Trade.
+    MockWebSocket.autoOpen = false;
+    mockFetch({ health: HEALTHY, recovery: frame() });
+    installWebSocket();
+    MockWebSocket.autoOpen = false; // installWebSocket resets instances only
+    render(<Cockpit />);
+    await waitFor(() => expect(MockWebSocket.last()).toBeDefined());
+    // Give the recovery fetch a chance to resolve and set the frame.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // link is CONNECTING (onopen never fired) -> gate must be No Trade.
+    await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
   });
 });

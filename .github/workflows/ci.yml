@@ -58,6 +58,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: make setup-api
+      - name: clean-checkout boot smoke (grpc_gen must be regenerated, not committed)
+        run: cd services/application-api && uv run python -c "import app.main; print('app.main boots')"
       - run: make lint-api
       - run: make migrate
       - run: make test-api

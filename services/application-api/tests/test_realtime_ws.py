@@ -2,12 +2,33 @@
 
 from __future__ import annotations
 
+import glob
+import json
+import os
 from typing import Any
 
 from fastapi.testclient import TestClient
+from jsonschema import Draft202012Validator
+from referencing import Registry, Resource
 
 from app import main
 from app.realtime import session
+
+_SCHEMA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    "packages",
+    "contracts",
+    "jsonschema",
+)
+
+
+def _cockpit_validator() -> Draft202012Validator:
+    res = {
+        os.path.basename(f): Resource.from_contents(json.load(open(f)))
+        for f in glob.glob(os.path.join(_SCHEMA_DIR, "*.json"))
+    }
+    reg = Registry().with_resources(list(res.items()))
+    return Draft202012Validator(res["cockpit_state.json"].contents, registry=reg)
 
 
 def _tick(minute_et: int, seq: int, health: str = "HEALTHY") -> dict[str, Any]:
@@ -81,8 +102,12 @@ def test_rest_recovery_returns_latest_then_fail_closed_default(monkeypatch: Any)
     # Unknown session: fail-closed default frame.
     resp = client.get("/api/v1/cockpit/state", params={"session_id": "never-seen"})
     assert resp.status_code == 200
-    assert resp.json()["new_position_allowed"] is False
-    assert resp.json()["connection"] == "DISCONNECTED"
+    default_frame = resp.json()
+    assert default_frame["new_position_allowed"] is False
+    assert default_frame["connection"] == "DISCONNECTED"
+    # The never-received default frame must be schema-valid, incl. Z-suffixed time.
+    assert list(_cockpit_validator().iter_errors(default_frame)) == []
+    assert str(default_frame["server_time_utc"]).endswith("Z")
     # After a stream runs, recovery returns the cached latest frame.
     with client.websocket_connect("/api/v1/stream/cockpit?session_id=ws3") as ws:
         for _ in range(3):

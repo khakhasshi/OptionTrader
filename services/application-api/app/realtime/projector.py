@@ -14,7 +14,7 @@ fabricated tradable state.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from typing import Any
 
 import pandas as pd
@@ -168,7 +168,8 @@ class CockpitProjector:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now().astimezone().astimezone(tz=None).isoformat()
+    """UTC RFC3339 ending in Z (contract utcTimestamp), never a local offset."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _parse_et_time(timestamp_et: str) -> time:

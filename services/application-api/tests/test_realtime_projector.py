@@ -129,6 +129,9 @@ def test_missing_snapshot_or_bar_fails_closed() -> None:
     assert frame["new_position_allowed"] is False
     assert frame["connection"] == "DISCONNECTED"
     assert frame["snapshot"] is None
+    # The fail-closed frame must itself be schema-valid, incl. Z-suffixed time.
+    assert list(_validator().iter_errors(frame)) == []
+    assert str(frame["server_time_utc"]).endswith("Z")
 
 
 def test_bad_bar_values_fail_closed_with_reason() -> None:

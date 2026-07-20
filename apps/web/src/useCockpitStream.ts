@@ -38,18 +38,36 @@ export function useCockpitStream(sessionId: string): CockpitStream {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const closedRef = useRef(false);
+  // Generation bumps on every (re)connect; a recovery response from an older
+  // generation is discarded so it cannot resurrect stale state.
+  const genRef = useRef(0);
+  // Highest frame seq applied so far. An older/equal-or-lower seq (from a late
+  // recovery response) must never overwrite newer WS state.
+  const lastSeqRef = useRef(-1);
 
   useEffect(() => {
     closedRef.current = false;
 
+    // Arbiter: apply a frame only if it is at least as new as what we've shown.
+    // A stale response (recovery landing after a newer WS frame) is dropped.
+    const applyFrame = (parsed: CockpitState | null) => {
+      if (closedRef.current || !parsed) return;
+      if (parsed.seq < lastSeqRef.current) return; // never overwrite newer state
+      lastSeqRef.current = parsed.seq;
+      setFrame(parsed);
+    };
+
     // Recover the latest server-side frame before (re)connecting, so a
     // reconnecting client shows current state instead of a blank/stale one.
-    const recover = async () => {
+    // Tagged with the connect generation; a response for a superseded
+    // generation is ignored (seq arbitration is the second line of defence).
+    const recover = async (gen: number) => {
       try {
         const r = await fetch(`/api/v1/cockpit/state?session_id=${encodeURIComponent(sessionId)}`);
         if (!r.ok) return;
         const parsed = parseCockpitState(await r.json());
-        if (parsed && !closedRef.current) setFrame(parsed);
+        if (closedRef.current || gen !== genRef.current) return; // superseded
+        applyFrame(parsed);
       } catch {
         // ignore — the WS frames will populate state shortly
       }
@@ -62,14 +80,15 @@ export function useCockpitStream(sessionId: string): CockpitStream {
       attemptRef.current = attempt + 1;
       timerRef.current = setTimeout(() => {
         setReconnects((n) => n + 1);
-        void recover();
         connect();
       }, backoff);
     };
 
     const connect = () => {
       if (closedRef.current) return;
+      const gen = (genRef.current += 1);
       setLink("CONNECTING");
+      void recover(gen);
       let socket: WebSocket;
       try {
         socket = new WebSocket(wsUrl(sessionId));
@@ -86,14 +105,22 @@ export function useCockpitStream(sessionId: string): CockpitStream {
       };
       socket.onmessage = (event) => {
         if (closedRef.current) return;
+        let parsed: CockpitState | null = null;
         try {
-          const parsed = parseCockpitState(JSON.parse(event.data as string));
-          // A bad frame must not overwrite good state with garbage, but it also
-          // must not be treated as tradable — keep last frame, drop link.
-          if (parsed) setFrame(parsed);
+          parsed = parseCockpitState(JSON.parse(event.data as string));
         } catch {
-          // ignore malformed frame
+          parsed = null;
         }
+        if (!parsed) {
+          // Malformed/unparseable frame: fail closed. Drop the link, clear the
+          // frame, and force a reconnect — never keep showing a prior LIVE frame
+          // as tradable behind a broken stream.
+          setLink("DISCONNECTED");
+          setFrame(null);
+          socket.close();
+          return;
+        }
+        applyFrame(parsed);
       };
       socket.onerror = () => {
         // onclose will follow; nothing to do here.
@@ -102,14 +129,13 @@ export function useCockpitStream(sessionId: string): CockpitStream {
         if (closedRef.current) return;
         setLink("DISCONNECTED");
         // Fail closed: a dropped stream invalidates the last frame's tradability.
-        // We clear it so a stale pre-drop LIVE frame can never be treated as
-        // current during the reconnect window; recovery/live frames repopulate.
+        // Clear it so a stale pre-drop LIVE frame can never be treated as current
+        // during the reconnect window; recovery/live frames repopulate.
         setFrame(null);
         scheduleReconnect();
       };
     };
 
-    void recover();
     connect();
 
     return () => {

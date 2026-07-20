@@ -72,7 +72,10 @@ export function Cockpit() {
   // Data health comes from the stream frame's snapshot; STALE when absent.
   const dataHealth: DataHealth = link === "OPEN" ? frameDataHealth(frame) : "STALE";
   const streamLive = link === "OPEN" && frame?.connection === "LIVE";
-  const canTrade = cockpitCanTrade({ frame, brokerAllowed });
+  // Final fail-closed gate: the socket must be OPEN now (not CONNECTING/
+  // DISCONNECTED) AND the frame+broker gates pass. Without the link check a
+  // stale frame could show ALLOWED during a reconnect/malformed-frame window.
+  const canTrade = link === "OPEN" && cockpitCanTrade({ frame, brokerAllowed });
 
   const snapshot = frame?.snapshot ?? null;
 
