@@ -63,11 +63,11 @@ lint: lint-web lint-api lint-core ## 三端 lint + format check
 lint-web: ## 前端 lint + typecheck
 	npm --workspace $(WEB_DIR) run lint --if-present
 
-lint-api: ## Python lint + typecheck
-	cd $(API_DIR) && uv run ruff check . && uv run mypy .
+lint-api: ## Python lint + format check + typecheck
+	cd $(API_DIR) && uv run ruff check . && uv run ruff format --check . && uv run mypy .
 
-lint-core: ## Rust fmt + clippy
-	cd $(CORE_DIR) && cargo fmt --check && cargo clippy -- -D warnings
+lint-core: ## Rust fmt + clippy (all targets)
+	cd $(CORE_DIR) && cargo fmt --check && cargo clippy --all-targets -- -D warnings
 
 contracts: ## 生成 Protobuf / JSON Schema / OpenAPI 客户端
 	bash scripts/gen_contracts.sh

@@ -24,11 +24,7 @@ impl BrokerHealth {
 
 /// New positions require HEALTHY data, HEALTHY broker, and completed
 /// reconciliation. Fail closed on anything else (CLAUDE.md §2, §5).
-pub fn new_position_allowed(
-    data_healthy: bool,
-    broker: BrokerHealth,
-    reconciled: bool,
-) -> bool {
+pub fn new_position_allowed(data_healthy: bool, broker: BrokerHealth, reconciled: bool) -> bool {
     data_healthy && broker.allows_new_position() && reconciled
 }
 

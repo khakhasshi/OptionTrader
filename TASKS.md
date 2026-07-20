@@ -16,11 +16,11 @@
 
 ## 进行中
 
-- （无）Phase 0 全部完成，Phase 1 待细化后开始。
+- 🔄 Phase 0：工程与契约任务（P0-1..P0-8）均已实现并通过本地测试/lint，等待正式 Gate Review 复测通过后方可标记完成。与 `PROJECT_PLAN.md` 第 11 节保持一致（Phase 0 进行中）。
 
 ---
 
-## Phase 0：工程基础与契约 ✅ 全部完成
+## Phase 0：工程基础与契约 🔄 待 Gate 复测
 
 > 目标：三服务可本地启动并 health check；fixture 快照 Rust→Python→React 贯通；迁移可升级/回滚。
 
