@@ -34,13 +34,14 @@ dev-web: ## 启动 React 驾驶舱
 dev-api: ## 启动 Python FastAPI
 	cd $(API_DIR) && uv run uvicorn app.main:app --reload --port 8000
 
-dev-core: ## 启动 Rust trading-core
+dev-core: ## 启动 Rust trading-core (HTTP :8080 + gRPC :50051)
 	cd $(CORE_DIR) && cargo run
 
 health: ## 检查三个服务 health endpoint
 	@echo "web:  http://localhost:5173"
 	@curl -sf http://localhost:8000/api/v1/health && echo " <- application-api OK" || echo "application-api DOWN"
-	@curl -sf http://localhost:8080/health && echo " <- trading-core OK" || echo "trading-core DOWN"
+	@curl -sf http://localhost:8080/health && echo " <- trading-core HTTP OK" || echo "trading-core HTTP DOWN"
+	@echo "trading-core gRPC: localhost:50051 (StreamMarketSnapshots / GetDataHealth)"
 
 test: test-contracts test-web test-api test-core ## 运行契约 + 三端单元测试
 

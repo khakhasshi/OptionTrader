@@ -7,13 +7,14 @@ import json
 import os
 from typing import Any
 
-import pytest
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
 from app.realtime.projector import CockpitProjector, ProjectorConfig
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 _SCHEMA_DIR = os.path.join(_ROOT, "packages", "contracts", "jsonschema")
 
 
@@ -67,14 +68,17 @@ def _snapshot(minute_et: int, close: float, seq: int, health: str = "HEALTHY") -
 
 
 def _tick(minute_et: int, close: float, seq: int, health: str = "HEALTHY") -> dict[str, Any]:
-    return {"snapshot": _snapshot(minute_et, close, seq, health), "bar": _bar(minute_et, close, 1000 + seq)}
+    return {
+        "snapshot": _snapshot(minute_et, close, seq, health),
+        "bar": _bar(minute_et, close, 1000 + seq),
+    }
 
 
 def _config() -> ProjectorConfig:
     return ProjectorConfig(session_id="sess_test", rule_version="test-1", opening_range_minutes=3)
 
 
-def test_frames_are_schema_valid_and_seq_monotonic():
+def test_frames_are_schema_valid_and_seq_monotonic() -> None:
     proj = CockpitProjector(config=_config())
     validator = _validator()
     frames = [proj.apply(_tick(570 + i, 500.0 + i * 0.1, i + 1)) for i in range(6)]
@@ -83,7 +87,7 @@ def test_frames_are_schema_valid_and_seq_monotonic():
     assert [f["seq"] for f in frames] == [0, 1, 2, 3, 4, 5]
 
 
-def test_healthy_tick_produces_signal_and_derivations():
+def test_healthy_tick_produces_signal_and_derivations() -> None:
     proj = CockpitProjector(config=_config())
     for i in range(4):
         frame = proj.apply(_tick(570 + i, 500.0 + i * 0.1, i + 1))
@@ -97,7 +101,7 @@ def test_healthy_tick_produces_signal_and_derivations():
     assert frame["signal"]["strategy"] in {"LongGamma", "ShortPremium", "EventVolCrush", "NoTrade"}
 
 
-def test_stale_health_blocks_new_positions():
+def test_stale_health_blocks_new_positions() -> None:
     proj = CockpitProjector(config=_config())
     frame = proj.apply(_tick(570, 500.0, 1, health="STALE"))
     assert frame["connection"] == "STALE"
@@ -105,21 +109,21 @@ def test_stale_health_blocks_new_positions():
     assert any("data_health=STALE" in flag for flag in frame["risk_flags"])
 
 
-def test_disconnected_health_blocks_and_reports():
+def test_disconnected_health_blocks_and_reports() -> None:
     proj = CockpitProjector(config=_config())
     frame = proj.apply(_tick(570, 500.0, 1, health="DISCONNECTED"))
     assert frame["connection"] == "DISCONNECTED"
     assert frame["new_position_allowed"] is False
 
 
-def test_degraded_is_live_but_not_tradable():
+def test_degraded_is_live_but_not_tradable() -> None:
     proj = CockpitProjector(config=_config())
     frame = proj.apply(_tick(570, 500.0, 1, health="DEGRADED"))
     assert frame["connection"] == "LIVE"
     assert frame["new_position_allowed"] is False
 
 
-def test_missing_snapshot_or_bar_fails_closed():
+def test_missing_snapshot_or_bar_fails_closed() -> None:
     proj = CockpitProjector(config=_config())
     frame = proj.apply({"snapshot": None, "bar": None})
     assert frame["new_position_allowed"] is False
@@ -127,7 +131,7 @@ def test_missing_snapshot_or_bar_fails_closed():
     assert frame["snapshot"] is None
 
 
-def test_bad_bar_values_fail_closed_with_reason():
+def test_bad_bar_values_fail_closed_with_reason() -> None:
     proj = CockpitProjector(config=_config())
     bad = _tick(570, 500.0, 1)
     bad["bar"]["close"] = "not-a-number"
@@ -136,7 +140,7 @@ def test_bad_bar_values_fail_closed_with_reason():
     assert any("projection error" in flag for flag in frame["risk_flags"])
 
 
-def test_disconnected_frame_is_schema_valid():
+def test_disconnected_frame_is_schema_valid() -> None:
     proj = CockpitProjector(config=_config())
     frame = proj.disconnected_frame("2026-07-20T13:45:00Z", "stream ended")
     assert list(_validator().iter_errors(frame)) == []

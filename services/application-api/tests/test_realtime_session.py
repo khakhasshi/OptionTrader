@@ -6,7 +6,6 @@ import asyncio
 from typing import Any
 
 import grpc
-import pytest
 
 from app.realtime import session
 from app.realtime.projector import ProjectorConfig
