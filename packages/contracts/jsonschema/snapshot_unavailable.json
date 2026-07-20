@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/snapshot_unavailable.json",
+  "title": "SnapshotUnavailable",
+  "description": "Canonical fail-closed body returned (with HTTP 503) by the Application BFF when a valid MarketSnapshot cannot be obtained from Rust Market Core (transport error, invalid JSON, or contract violation). Deliberately distinct from MarketSnapshot — it has no price/snapshot_id — so no consumer can mistake it for a live quote.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "error": { "type": "string", "const": "snapshot_unavailable" },
+    "reason": { "type": "string" },
+    "data_health": { "type": "string", "const": "STALE" }
+  },
+  "required": ["schema_version", "error", "reason", "data_health"],
+  "additionalProperties": false
+}

@@ -74,8 +74,11 @@ export function Cockpit() {
   const dataHealth: DataHealth = online && health ? health.data_health : "STALE";
   const brokerHealth: BrokerHealth = online && health ? health.broker_health : "DISCONNECTED";
   const reconciled = online && health ? health.reconciled === true : false;
-  const canTrade = canOpenNewPosition({ reachable, health });
   const snapLive = isSnapshotLive(snapshot);
+  // A tradable decision needs a live market snapshot too: if the snapshot fetch
+  // failed or data_health != HEALTHY, we have no trustworthy price -> No Trade,
+  // even when every health field is green. Fail closed.
+  const canTrade = canOpenNewPosition({ reachable, health }) && snapLive;
 
   return (
     <main style={{ fontFamily: "system-ui", padding: 24 }}>

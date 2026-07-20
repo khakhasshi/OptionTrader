@@ -17,6 +17,17 @@ const DATA_HEALTH: readonly DataHealth[] = [
   "RECONCILING",
 ];
 
+// common.json#/$defs/decimal — fixed-point string. Rejects "nan", "inf", "".
+const DECIMAL_RE = /^-?[0-9]+(\.[0-9]+)?$/;
+
+function isDecimalString(v: unknown): v is string {
+  return typeof v === "string" && DECIMAL_RE.test(v);
+}
+
+function isUtcTimestamp(v: unknown): v is string {
+  return typeof v === "string" && v.endsWith("Z") && !Number.isNaN(Date.parse(v));
+}
+
 export interface MarketSnapshot {
   schema_version: string;
   snapshot_id: string;
@@ -53,17 +64,22 @@ export function parseMarketSnapshot(raw: unknown): MarketSnapshot | null {
     sequence_number,
     data_health,
   } = raw;
+  // schema_version required and pinned to "1.0"; missing/other -> fail closed.
+  if (raw.schema_version !== "1.0") return null;
   if (typeof snapshot_id !== "string") return null;
-  if (typeof occurred_at_utc !== "string") return null;
+  if (!isUtcTimestamp(occurred_at_utc)) return null;
   if (typeof symbol !== "string") return null;
-  if (typeof price !== "string") return null;
-  if (typeof open !== "string") return null;
-  if (typeof vwap !== "string") return null;
-  if (typeof sequence_number !== "number" || !Number.isFinite(sequence_number)) return null;
+  // Decimals must match the fixed-point contract: "nan"/"inf"/"" are rejected.
+  if (!isDecimalString(price)) return null;
+  if (!isDecimalString(open)) return null;
+  if (!isDecimalString(vwap)) return null;
+  // sequence_number: non-negative integer per market_snapshot.json.
+  if (typeof sequence_number !== "number" || !Number.isInteger(sequence_number)) return null;
+  if (sequence_number < 0) return null;
   if (typeof data_health !== "string" || !DATA_HEALTH.includes(data_health as DataHealth))
     return null;
   return {
-    schema_version: typeof raw.schema_version === "string" ? raw.schema_version : "1.0",
+    schema_version: "1.0",
     snapshot_id,
     occurred_at_utc,
     symbol,

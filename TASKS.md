@@ -16,11 +16,14 @@
 
 ## 进行中
 
-- 🔄 Phase 0：工程与契约任务（P0-1..P0-8）均已实现并通过本地测试/lint，等待正式 Gate Review 复测通过后方可标记完成。与 `PROJECT_PLAN.md` 第 11 节保持一致（Phase 0 进行中）。
+- ⬜ Phase 1：历史数据与离线回放（待细化）。Phase 0 已通过 Gate Review，可正式开始。
 
 ---
 
-## Phase 0：工程基础与契约 🔄 待 Gate 复测
+## Phase 0：工程基础与契约 ✅ Gate 已通过（2026-07-20）
+
+> Gate Review 结论：技术验收通过，未发现阻塞问题。验证：`make test`（16 契约 / 34 React / 27 Python / 3 Rust）、`make lint`（tsc/Ruff/format/Mypy/cargo fmt/Clippy）、`make contracts`、`git diff --check`、Gitleaks 全部通过；非法上游响应（字符串布尔、字符串整数、非法时间、`nan` 价格、缺失 `schema_version`）严格拒绝并降级为 unreachable / HTTP 503 / No Trade；核心健康但快照失效时 Cockpit 保持 No Trade；PostgreSQL 升级/回滚/再升级 16 表正常。
+> 非阻塞跟进：FastAPI 测试使用的 Starlette TestClient 提示未来迁移到 httpx2，不影响 Phase 1。
 
 > 目标：三服务可本地启动并 health check；fixture 快照 Rust→Python→React 贯通；迁移可升级/回滚。
 

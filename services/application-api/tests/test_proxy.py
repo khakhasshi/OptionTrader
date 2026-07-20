@@ -113,6 +113,35 @@ def test_core_health_fail_closed_on_bad_enum(monkeypatch: pytest.MonkeyPatch) ->
     assert body["new_position_allowed"] is False
 
 
+def test_core_health_fail_closed_on_missing_schema_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partial = {k: v for k, v in HEALTHY_CORE.items() if k != "schema_version"}
+    _patch_core(monkeypatch, lambda req: httpx.Response(200, json=partial))
+    body = client.get("/api/v1/core/health").json()
+    assert body["status"] == "unreachable"
+    assert body["new_position_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("reconciled", "true"),  # string boolean, not coerced
+        ("new_position_allowed", "true"),  # string boolean, not coerced
+        ("schema_version", "2.0"),  # wrong pinned version
+    ],
+)
+def test_core_health_fail_closed_on_wrong_type_no_coercion(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: object
+) -> None:
+    bad = {**HEALTHY_CORE, field: value}
+    _patch_core(monkeypatch, lambda req: httpx.Response(200, json=bad))
+    body = client.get("/api/v1/core/health").json()
+    # strict=True: "true" is NOT accepted as True -> fail closed.
+    assert body["status"] == "unreachable"
+    assert body["new_position_allowed"] is False
+
+
 # --- /market/snapshot ------------------------------------------------------
 def test_market_snapshot_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_core(monkeypatch, lambda req: httpx.Response(200, json=SNAPSHOT_CORE))
@@ -161,6 +190,43 @@ def test_market_snapshot_fail_closed_on_missing_field(monkeypatch: pytest.Monkey
 def test_market_snapshot_fail_closed_on_bad_enum(monkeypatch: pytest.MonkeyPatch) -> None:
     bad = {**SNAPSHOT_CORE, "data_health": "SUPER"}
     _patch_core(monkeypatch, lambda req: httpx.Response(200, json=bad))
+    resp = client.get("/api/v1/market/snapshot")
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "snapshot_unavailable"
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("price", "nan"),  # invalid decimal
+        ("price", "inf"),  # invalid decimal
+        ("price", 500.0),  # float, not a decimal string; strict -> reject
+        ("sequence_number", "123"),  # string integer, not coerced
+        ("sequence_number", -1),  # negative integer violates minimum
+        ("sequence_number", 1.5),  # non-integer
+        ("occurred_at_utc", "not-a-time"),  # invalid timestamp
+        ("occurred_at_utc", "2026-07-20T13:45:00"),  # missing Z
+        ("schema_version", "2.0"),  # wrong pinned version
+    ],
+)
+def test_market_snapshot_fail_closed_on_invalid_scalars(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: object
+) -> None:
+    bad = {**SNAPSHOT_CORE, field: value}
+    _patch_core(monkeypatch, lambda req: httpx.Response(200, json=bad))
+    resp = client.get("/api/v1/market/snapshot")
+    # No coercion, no fake price: any invalid scalar -> canonical 503.
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"] == "snapshot_unavailable"
+    assert "price" not in body
+
+
+def test_market_snapshot_fail_closed_on_missing_schema_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partial = {k: v for k, v in SNAPSHOT_CORE.items() if k != "schema_version"}
+    _patch_core(monkeypatch, lambda req: httpx.Response(200, json=partial))
     resp = client.get("/api/v1/market/snapshot")
     assert resp.status_code == 503
     assert resp.json()["error"] == "snapshot_unavailable"

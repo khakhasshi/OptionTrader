@@ -1,0 +1,6 @@
+{
+  "schema_version": "1.0",
+  "error": "snapshot_unavailable",
+  "reason": "transport: ConnectError",
+  "data_health": "STALE"
+}

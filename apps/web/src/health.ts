@@ -52,6 +52,9 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 export function parseServiceHealth(raw: unknown): ServiceHealth | null {
   if (!isRecord(raw)) return null;
   const { status, service, data_health, broker_health, reconciled, new_position_allowed } = raw;
+  // schema_version is required and pinned to "1.0" — a missing/other version is
+  // contract drift and must fail closed, not default silently.
+  if (raw.schema_version !== "1.0") return null;
   if (typeof status !== "string" || !SERVICE_STATUS.includes(status as ServiceStatus)) return null;
   if (typeof service !== "string") return null;
   if (typeof data_health !== "string" || !DATA_HEALTH.includes(data_health as DataHealth))
@@ -61,7 +64,7 @@ export function parseServiceHealth(raw: unknown): ServiceHealth | null {
   if (typeof reconciled !== "boolean") return null;
   if (typeof new_position_allowed !== "boolean") return null;
   return {
-    schema_version: typeof raw.schema_version === "string" ? raw.schema_version : "1.0",
+    schema_version: "1.0",
     status: status as ServiceStatus,
     service,
     environment: typeof raw.environment === "string" ? raw.environment : undefined,

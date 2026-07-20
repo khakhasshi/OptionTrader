@@ -15,12 +15,20 @@ SnapshotUnavailable body with HTTP 503 (never a partial fake MarketSnapshot).
 from __future__ import annotations
 
 import os
-from typing import Literal
+from datetime import datetime
+from typing import Annotated, Literal
 
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+)
 
 __all__ = ["app", "httpx"]
 
@@ -33,6 +41,28 @@ DataHealth = Literal["HEALTHY", "DEGRADED", "STALE", "DISCONNECTED", "RECONCILIN
 BrokerHealth = Literal["HEALTHY", "DEGRADED", "DISCONNECTED", "RECONCILING"]
 
 
+def _check_utc(v: str) -> str:
+    """common.json#/$defs/utcTimestamp: RFC3339 date-time ending in Z."""
+    if not v.endswith("Z"):
+        raise ValueError("utcTimestamp must end in Z")
+    datetime.fromisoformat(v.replace("Z", "+00:00"))
+    return v
+
+
+def _check_et(v: str) -> str:
+    """common.json#/$defs/etTimestamp: parseable RFC3339 date-time (display only)."""
+    datetime.fromisoformat(v.replace("Z", "+00:00"))
+    return v
+
+
+# common.json#/$defs/decimal — fixed-point string; rejects "nan"/"inf"/"".
+Decimal = Annotated[str, StringConstraints(pattern=r"^-?[0-9]+(\.[0-9]+)?$")]
+UtcTimestamp = Annotated[str, AfterValidator(_check_utc)]
+EtTimestamp = Annotated[str, AfterValidator(_check_et)]
+NonNegInt = Annotated[int, Field(ge=0)]
+SchemaVersion = Literal["1.0"]
+
+
 class HealthResponse(BaseModel):
     status: str
     service: str
@@ -40,12 +70,14 @@ class HealthResponse(BaseModel):
 
 
 class ServiceHealth(BaseModel):
-    """Mirrors health.json#/$defs/ServiceHealth. Extra upstream fields are
-    rejected so a contract drift fails closed rather than passing through."""
+    """Mirrors health.json#/$defs/ServiceHealth. strict=True so no coercion
+    (e.g. "true" -> True) happens; extra upstream fields are rejected. Contract
+    drift or a wrong-typed field fails closed rather than passing through.
+    schema_version is required with no default — a missing version is invalid."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: SchemaVersion
     status: Literal["ok", "unreachable"]
     service: str
     environment: str | None = None
@@ -56,28 +88,30 @@ class ServiceHealth(BaseModel):
 
 
 class MarketSnapshot(BaseModel):
-    """Mirrors market_snapshot.json (required fields + strict extras)."""
+    """Mirrors market_snapshot.json (required fields, strict extras, JSON Schema
+    scalar constraints: decimal pattern, UTC/ET timestamps, non-negative ints).
+    strict=True blocks type coercion; schema_version is required (no default)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: SchemaVersion
     snapshot_id: str
-    occurred_at_utc: str
-    timestamp_et: str | None = None
+    occurred_at_utc: UtcTimestamp
+    timestamp_et: EtTimestamp | None = None
     symbol: Literal["QQQ.US"]
-    price: str
-    open: str
-    high: str | None = None
-    low: str | None = None
-    previous_close: str | None = None
-    vwap: str
-    volume: int | None = None
-    opening_range_high: str | None = None
-    opening_range_low: str | None = None
-    premarket_high: str | None = None
-    premarket_low: str | None = None
-    sequence_number: int
-    quote_age_ms: int | None = None
+    price: Decimal
+    open: Decimal
+    high: Decimal | None = None
+    low: Decimal | None = None
+    previous_close: Decimal | None = None
+    vwap: Decimal
+    volume: NonNegInt | None = None
+    opening_range_high: Decimal | None = None
+    opening_range_low: Decimal | None = None
+    premarket_high: Decimal | None = None
+    premarket_low: Decimal | None = None
+    sequence_number: NonNegInt
+    quote_age_ms: NonNegInt | None = None
     data_health: DataHealth
 
 
@@ -94,6 +128,7 @@ class SnapshotUnavailable(BaseModel):
 
 def _unreachable_health(reason: str) -> ServiceHealth:
     return ServiceHealth(
+        schema_version="1.0",
         status="unreachable",
         service="trading-core",
         environment=os.getenv("OPTIONTRADER_ENV", "local"),

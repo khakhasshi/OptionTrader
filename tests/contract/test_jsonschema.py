@@ -48,6 +48,29 @@ def test_market_snapshot_rejects_invalid():
     assert len(list(v.iter_errors(bad))) >= 3
 
 
+def test_snapshot_unavailable_fixture_validates():
+    reg, res = _registry()
+    fx = json.load(open(os.path.join(FIXTURE_DIR, "snapshot_unavailable.sample.json")))
+    v = Draft202012Validator(res["snapshot_unavailable.json"].contents, registry=reg)
+    assert list(v.iter_errors(fx)) == []
+
+
+def test_snapshot_unavailable_rejects_fake_marketsnapshot():
+    """A partial MarketSnapshot (has price/snapshot_id) must NOT validate as
+    SnapshotUnavailable — the two contracts are deliberately disjoint."""
+    reg, res = _registry()
+    fake = {
+        "schema_version": "1.0",
+        "error": "snapshot_unavailable",
+        "reason": "x",
+        "data_health": "STALE",
+        "price": "500.0",
+        "snapshot_id": "sneaky",
+    }
+    v = Draft202012Validator(res["snapshot_unavailable.json"].contents, registry=reg)
+    assert len(list(v.iter_errors(fake))) >= 1
+
+
 def _service_health_validator():
     reg, res = _registry()
     schema = {"$ref": "health.json#/$defs/ServiceHealth"}

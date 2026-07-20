@@ -131,6 +131,31 @@ describe("parseMarketSnapshot", () => {
   it("returns null when sequence_number is the wrong type", () => {
     expect(parseMarketSnapshot({ ...SNAPSHOT, sequence_number: "123" })).toBeNull();
   });
+
+  it("returns null when schema_version is missing", () => {
+    const { schema_version: _omit, ...partial } = SNAPSHOT;
+    expect(parseMarketSnapshot(partial)).toBeNull();
+  });
+
+  it("returns null when schema_version is not 1.0", () => {
+    expect(parseMarketSnapshot({ ...SNAPSHOT, schema_version: "2.0" })).toBeNull();
+  });
+
+  it("returns null on a non-numeric decimal (nan/inf)", () => {
+    expect(parseMarketSnapshot({ ...SNAPSHOT, price: "nan" })).toBeNull();
+    expect(parseMarketSnapshot({ ...SNAPSHOT, price: "inf" })).toBeNull();
+    expect(parseMarketSnapshot({ ...SNAPSHOT, vwap: "1.2.3" })).toBeNull();
+  });
+
+  it("returns null when sequence_number is negative or non-integer", () => {
+    expect(parseMarketSnapshot({ ...SNAPSHOT, sequence_number: -1 })).toBeNull();
+    expect(parseMarketSnapshot({ ...SNAPSHOT, sequence_number: 1.5 })).toBeNull();
+  });
+
+  it("returns null on an invalid occurred_at_utc", () => {
+    expect(parseMarketSnapshot({ ...SNAPSHOT, occurred_at_utc: "not-a-time" })).toBeNull();
+    expect(parseMarketSnapshot({ ...SNAPSHOT, occurred_at_utc: "2026-07-20T13:45:00" })).toBeNull();
+  });
 });
 
 // --- Rendered Cockpit: trading gate end to end -----------------------------
@@ -184,6 +209,22 @@ describe("Cockpit trading badge", () => {
     expect(
       await screen.findByRole("status", { name: "Connection: OFFLINE (read-only)" }),
     ).toBeInTheDocument();
+  });
+
+  it("shows No Trade when health is all-green but the snapshot fetch fails", async () => {
+    // P1: no trustworthy price -> No Trade even though Connection is ONLINE.
+    mockFetch({ health: HEALTHY, snapshot: "fail" });
+    render(<Cockpit />);
+    await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
+    expect(
+      await screen.findByRole("status", { name: "Connection: ONLINE" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows No Trade when health is all-green but the snapshot is STALE", async () => {
+    mockFetch({ health: HEALTHY, snapshot: { ...SNAPSHOT, data_health: "STALE" } });
+    render(<Cockpit />);
+    await waitFor(async () => expect(await tradingText()).toBe("Trading: No Trade"));
   });
 
   it("shows OFFLINE when BFF reports status=unreachable even if body parses", async () => {
