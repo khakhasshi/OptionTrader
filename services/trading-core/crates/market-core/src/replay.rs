@@ -128,7 +128,7 @@ impl SnapshotSource for ReplaySnapshotSource {
         let session_open = self.bars[0].open;
 
         for (index, bar) in self.bars.iter().enumerate() {
-            machine.observe_bar(bar.occurred_at_utc_ms);
+            machine.observe_bar(bar.minute_et, bar.occurred_at_utc_ms);
 
             let prefix: Vec<MarketBar> = self.bars[..=index]
                 .iter()

@@ -2,13 +2,18 @@
 //!
 //! The server is backed by a `SnapshotSource` (replay by default; the live
 //! ThetaData adapter slots in behind the same trait once entitled). Snapshots
-//! are precomputed deterministically, then streamed in order; `GetDataHealth`
-//! reports the health of the most recently emitted snapshot.
+//! are precomputed deterministically, then streamed in order.
+//!
+//! `GetDataHealth` reports the health of the MOST RECENTLY SENT record, driven
+//! by a shared `DataHealthMachine`: before any stream has emitted a record the
+//! machine is RECONCILING (never HEALTHY), and it only advances as ticks are
+//! actually sent. lag/out-of-order/reconnect all come from the machine.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use market_core::{
-    DataHealth, MarketSnapshot, ReplayBar, ReplayConfig, ReplaySnapshotSource, SnapshotSource,
+    DataHealth, DataHealthMachine, HealthConfig, MarketSnapshot, ReplayBar, ReplayConfig,
+    ReplaySnapshotSource, SnapshotSource,
 };
 use optiontrader_proto::market_v1::{
     market_service_server::MarketService, DataHealth as ProtoHealth,
@@ -21,14 +26,16 @@ use tonic::{Request, Response, Status};
 
 /// Precomputed tick feed shared by all RPCs. Each tick pairs the aggregate
 /// snapshot with its originating per-minute bar. Immutable after construction,
-/// so streaming and health queries observe a consistent deterministic sequence.
+/// so streaming observes a consistent deterministic sequence.
 pub struct MarketFeed {
     ticks: Vec<(MarketSnapshot, ReplayBar)>,
+    health_cfg: HealthConfig,
 }
 
 impl MarketFeed {
     /// Build a replay-backed feed from an NDJSON fixture.
     pub fn from_ndjson(ndjson: &str, cfg: ReplayConfig) -> Result<Self, String> {
+        let health_cfg = cfg.health;
         let source =
             ReplaySnapshotSource::from_ndjson(ndjson, cfg).map_err(|e| format!("replay: {e}"))?;
         let snapshots = source.snapshots().map_err(|e| format!("snapshots: {e}"))?;
@@ -40,11 +47,7 @@ impl MarketFeed {
             .into_iter()
             .zip(source.bars().iter().cloned())
             .collect();
-        Ok(MarketFeed { ticks })
-    }
-
-    fn latest(&self) -> &MarketSnapshot {
-        &self.ticks.last().expect("feed is non-empty").0
+        Ok(MarketFeed { ticks, health_cfg })
     }
 }
 
@@ -98,11 +101,15 @@ fn snapshot_to_proto(s: &MarketSnapshot) -> ProtoSnapshot {
 
 pub struct MarketServiceImpl {
     feed: Arc<MarketFeed>,
+    /// Shared runtime health, advanced only as records are actually sent.
+    /// Starts RECONCILING; never reports a state that has not been emitted.
+    health: Arc<Mutex<DataHealthMachine>>,
 }
 
 impl MarketServiceImpl {
     pub fn new(feed: Arc<MarketFeed>) -> Self {
-        MarketServiceImpl { feed }
+        let health = Arc::new(Mutex::new(DataHealthMachine::new(feed.health_cfg)));
+        MarketServiceImpl { feed, health }
     }
 }
 
@@ -115,6 +122,7 @@ impl MarketService for MarketServiceImpl {
         _request: Request<StreamRequest>,
     ) -> Result<Response<Self::StreamMarketSnapshotsStream>, Status> {
         let feed = Arc::clone(&self.feed);
+        let health = Arc::clone(&self.health);
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             for (snap, bar) in &feed.ticks {
@@ -125,6 +133,10 @@ impl MarketService for MarketServiceImpl {
                 if tx.send(Ok(tick)).await.is_err() {
                     break; // client dropped
                 }
+                // Advance shared health only AFTER the record was actually sent.
+                if let Ok(mut m) = health.lock() {
+                    m.observe_bar_at(bar.minute_et, bar.occurred_at_utc_ms, &bar.occurred_at_utc);
+                }
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -134,16 +146,27 @@ impl MarketService for MarketServiceImpl {
         &self,
         _request: Request<GetDataHealthRequest>,
     ) -> Result<Response<ProtoHealthState>, Status> {
-        let latest = self.feed.latest();
+        let m = self
+            .health
+            .lock()
+            .map_err(|_| Status::internal("health lock poisoned"))?;
+        // Before the first record is sent, occurred_at_utc has no meaningful
+        // instant; stamp the earliest feed instant so the field stays a valid
+        // RFC3339 UTC while status remains RECONCILING.
+        let occurred = m
+            .last_occurred_at_utc()
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.feed.ticks[0].0.occurred_at_utc.clone());
+        let record = m.state(occurred);
         Ok(Response::new(ProtoHealthState {
             schema_version: "1.0".into(),
-            occurred_at_utc: latest.occurred_at_utc.clone(),
-            status: health_to_proto(latest.data_health) as i32,
-            market_event_lag_ms: 0,
-            quote_age_ms: latest.quote_age_ms,
-            out_of_order_count: 0,
-            reconnect_count: 0,
-            reason: String::new(),
+            occurred_at_utc: record.occurred_at_utc,
+            status: health_to_proto(record.status) as i32,
+            market_event_lag_ms: record.market_event_lag_ms,
+            quote_age_ms: record.quote_age_ms,
+            out_of_order_count: record.out_of_order_count,
+            reconnect_count: record.reconnect_count,
+            reason: record.reason.unwrap_or_default(),
         }))
     }
 }
@@ -188,7 +211,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_data_health_reports_latest() {
+    async fn get_data_health_is_reconciling_before_any_send() {
+        // The review's exact scenario: query health before subscribing.
         let svc = MarketServiceImpl::new(feed());
         let resp = svc
             .get_data_health(Request::new(GetDataHealthRequest {}))
@@ -196,7 +220,32 @@ mod tests {
             .unwrap();
         let state = resp.into_inner();
         assert_eq!(state.schema_version, "1.0");
-        assert_eq!(state.status, ProtoHealth::Healthy as i32);
+        assert_eq!(
+            state.status,
+            ProtoHealth::Reconciling as i32,
+            "must be RECONCILING before the first record is sent, never HEALTHY"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_data_health_reports_healthy_after_stream_drains() {
+        let svc = MarketServiceImpl::new(feed());
+        let resp = svc
+            .stream_market_snapshots(Request::new(StreamRequest {
+                session_id: "s".into(),
+                speedup: 0.0,
+            }))
+            .await
+            .unwrap();
+        let mut stream = resp.into_inner();
+        use tokio_stream::StreamExt;
+        while stream.next().await.is_some() {}
+        // Fixture opens at 09:30 with clean cadence -> HEALTHY once fully sent.
+        let resp = svc
+            .get_data_health(Request::new(GetDataHealthRequest {}))
+            .await
+            .unwrap();
+        assert_eq!(resp.into_inner().status, ProtoHealth::Healthy as i32);
     }
 
     #[test]
