@@ -57,6 +57,19 @@
 
 Phase 2 事件上下文与实时驾驶舱 / Phase 3 候选交易与半自动闭环 / Phase 4 LLM 辅助与复盘 / Phase 5 Shadow 与 Paper 验证 / Phase 6 受控实盘。各阶段任务在前一阶段收尾时展开。
 
+### Phase 2 实时传输骨架（进行中）
+
+| 任务 | 状态 | 说明 |
+|---|---|---|
+| P2-A 契约 + codegen 骨架 | ✅ | `market.proto`（MarketService: StreamMarketSnapshots→`stream MarketTick` / GetDataHealth）、`cockpit_state.json`；Rust tonic-build（build.rs）、Python grpcio-tools（`scripts/gen_python_grpc.sh`→`app/grpc_gen/`，git 忽略、排除出 gate）。 |
+| P2-B Rust 快照流 + DataHealth | ✅ | `market-core/health.rs`（DataHealthMachine 状态机）、`replay.rs`（`SnapshotSource`/`ReplaySnapshotSource` 复用 features.rs、`LiveThetaSource` 占位）；tonic :50051 与 axum :8080 同进程。 |
+| P2-C Python 客户端 + 引擎 + WS | ✅ | `app/realtime/`（projector 纯投影 / client proto→dict / session asyncio 桥）；`WS /api/v1/stream/cockpit` + `GET /api/v1/cockpit/state`。 |
+| P2-D React 实时驾驶舱 | ✅ | `cockpitState.ts`（解析+双维闸门）、`useCockpitStream.ts`（WS 重连+恢复+断流清帧 fail-closed）、Cockpit 面板+信号日志。 |
+| P2 事件上下文导入 | ⏳ 待做 | 宏观/财报/新闻/持仓→EventContext→risk_flags 喂 Strategy（骨架之后的独立批次）。 |
+| P2 真实 ThetaData 实时流 | ⏳ 待做 | 经 `LiveThetaSource` 适配器，entitlement/字段映射验收后落地。 |
+
+> 2026-07-21 骨架验收：`make lint`（web/api/core）通过；`make test`——契约 20 / React 48 / Python 159（+1 skip）/ Rust 28 全绿。真实端到端：Rust gRPC 流→Python WS 推帧→React 严格解析。整日回放 smoke：390 根 1m 帧全部 schema 合规、无异常，STALE 窗口正确 fail-closed（不放行新开仓）。gRPC/WS 决策见 `docs/adr/0001-phase2-realtime-transport.md`（CLAUDE.md D4）。
+
 ---
 
 ## 阻塞与待确认
