@@ -31,7 +31,7 @@ from pydantic import (
 )
 
 from app.realtime.projector import ProjectorConfig
-from app.realtime.session import cockpit_frames, latest_frame
+from app.realtime.session import get_hub, latest_frame
 
 __all__ = ["app", "httpx"]
 
@@ -233,15 +233,17 @@ def cockpit_state(session_id: str) -> JSONResponse:
 async def stream_cockpit(websocket: WebSocket) -> None:
     """Push CockpitState frames for one session over WebSocket.
 
-    The session_id query param ties the stream to one trading session. Each
-    frame is a cockpit_state.json object derived from the Rust snapshot/bar
-    stream. On stream end or client disconnect the socket closes; the client
-    reconnects and recovers via GET /api/v1/cockpit/state."""
+    The session_id query param ties the stream to one trading session. All WS
+    connections for a session share ONE hub (one projector, monotonic seq, one
+    upstream consumer), so a reconnecting client resumes at a strictly higher
+    seq and the engines never re-run per client. On disconnect the socket
+    closes; the client reconnects and recovers via GET /api/v1/cockpit/state."""
     await websocket.accept()
     session_id = websocket.query_params.get("session_id", "default")
     config = ProjectorConfig(session_id=session_id, rule_version=_RULE_VERSION)
+    hub = get_hub(config)
     try:
-        async for frame in cockpit_frames(config):
+        async for frame in hub.subscribe():
             await websocket.send_json(frame)
     except WebSocketDisconnect:
         return

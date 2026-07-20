@@ -1,20 +1,29 @@
-"""Async bridge from the (blocking) gRPC tick iterator to CockpitState frames.
+"""Per-session cockpit hub: one projector + one upstream pump, fanned out to
+many WebSocket subscribers.
 
-The gRPC Python client streams synchronously, so we run the iterator in a worker
-thread and hand frames to the asyncio event loop via a queue. Each connection
-gets its own :class:`CockpitProjector`; the most recent frame per session is
-cached so a reconnecting client can recover current state over REST before
-resuming the WebSocket.
+Phase 2 review fix (blocker 2): previously every WS connection built its own
+``CockpitProjector``, so ``seq`` restarted at 0 on each reconnect and the
+frontend's monotonic-seq arbitration silently dropped every post-reconnect
+frame. Now a session has exactly ONE :class:`SessionHub`:
 
-Fail closed: transport errors and stream end both terminate the generator with a
-final DISCONNECTED frame, so the UI can never sit on a stale tradable state.
+* one persistent ``CockpitProjector`` — ``seq`` is monotonic for the whole
+  session lifetime, across any number of WS connect/disconnect cycles;
+* one upstream consumer (the Rust gRPC tick stream) — the Regime/Vol/Strategy
+  engines run once per tick per session, never once-per-client;
+* fan-out to all currently-attached subscriber queues;
+* the latest frame cached for REST recovery (same source as the WS stream).
+
+The hub keeps consuming upstream independently of how many clients are attached,
+so a client that drops and reconnects resumes at a strictly higher ``seq``.
+
+Fail closed: upstream end or error publishes a terminal DISCONNECTED frame.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -23,10 +32,15 @@ import grpc
 from app.realtime.client import stream_ticks
 from app.realtime.projector import CockpitProjector, ProjectorConfig
 
+# An upstream event: ("tick", tick_dict) or ("end", reason).
+UpstreamEvent = tuple[str, Any]
+# Async source of upstream events for a session id (injectable for tests).
+AsyncTickSource = Callable[[str], AsyncIterator[UpstreamEvent]]
+
 # session_id -> latest frame, for REST recovery on reconnect.
 _LATEST: dict[str, dict[str, Any]] = {}
-
-TickSource = Callable[[str], Iterator[dict[str, Any]]]
+# session_id -> live hub.
+_HUBS: dict[str, "SessionHub"] = {}
 
 
 def latest_frame(session_id: str) -> dict[str, Any] | None:
@@ -49,23 +63,14 @@ def _rpc_code(exc: grpc.RpcError) -> str:
     return "UNKNOWN"
 
 
-async def cockpit_frames(
-    config: ProjectorConfig,
-    tick_source: TickSource | None = None,
-) -> AsyncIterator[dict[str, Any]]:
-    """Yield CockpitState frames for one session until the stream ends.
-
-    ``tick_source`` yields tick dicts for a session id (defaults to the live
-    gRPC stream); injectable so tests can drive the projector deterministically.
-    """
-    source = tick_source or (lambda sid: stream_ticks(sid))
-    projector = CockpitProjector(config=config)
+async def _grpc_source(session_id: str) -> AsyncIterator[UpstreamEvent]:
+    """Bridge the blocking gRPC tick iterator into async upstream events."""
     loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+    queue: asyncio.Queue[UpstreamEvent] = asyncio.Queue()
 
     def pump() -> None:
         try:
-            for tick in source(config.session_id):
+            for tick in stream_ticks(session_id):
                 loop.call_soon_threadsafe(queue.put_nowait, ("tick", tick))
             loop.call_soon_threadsafe(queue.put_nowait, ("end", "stream ended"))
         except grpc.RpcError as exc:
@@ -73,16 +78,91 @@ async def cockpit_frames(
         except Exception as exc:  # noqa: BLE001 — fail closed on any pump fault
             loop.call_soon_threadsafe(queue.put_nowait, ("end", f"stream fault: {exc}"))
 
-    thread = threading.Thread(target=pump, name=f"cockpit-{config.session_id}", daemon=True)
-    thread.start()
-
+    threading.Thread(target=pump, name=f"cockpit-{session_id}", daemon=True).start()
     while True:
         kind, payload = await queue.get()
-        if kind == "tick":
-            frame = projector.apply(payload)
-        else:
-            frame = projector.disconnected_frame(_now_iso(), str(payload))
-        _LATEST[config.session_id] = frame
-        yield frame
+        yield (kind, payload)
         if kind == "end":
             return
+
+
+# PLACEHOLDER_HUB
+
+
+class SessionHub:
+    """One projector + one upstream pump for a session, fanned out to N subs."""
+
+    def __init__(self, config: ProjectorConfig, source: AsyncTickSource | None = None) -> None:
+        self._config = config
+        self._source = source or _grpc_source
+        self._projector = CockpitProjector(config=config)
+        self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._latest: dict[str, Any] | None = None
+        self._ended = False
+        self._task: asyncio.Task[None] | None = None
+
+    def _start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        """Consume upstream once; project each event; fan out to subscribers."""
+        try:
+            async for kind, payload in self._source(self._config.session_id):
+                if kind == "tick":
+                    frame = self._projector.apply(payload)
+                else:
+                    frame = self._projector.disconnected_frame(_now_iso(), str(payload))
+                self._publish(frame)
+                if kind == "end":
+                    break
+        except Exception as exc:  # noqa: BLE001 — fail closed on any hub fault
+            self._publish(self._projector.disconnected_frame(_now_iso(), f"hub fault: {exc}"))
+        finally:
+            self._ended = True
+
+    def _publish(self, frame: dict[str, Any]) -> None:
+        self._latest = frame
+        _LATEST[self._config.session_id] = frame
+        for q in list(self._subscribers):
+            q.put_nowait(frame)
+
+    async def subscribe(self) -> AsyncGenerator[dict[str, Any], None]:
+        """Attach a WS client. Replays the latest frame immediately (so a
+        reconnecting client sees current state), then streams live frames with
+        monotonic seq. Ends when upstream has ended and nothing more will come.
+        """
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._subscribers.add(queue)
+        self._start()
+        try:
+            if self._latest is not None:
+                yield self._latest
+            while True:
+                if self._ended and queue.empty():
+                    return
+                try:
+                    frame = await asyncio.wait_for(queue.get(), timeout=0.25)
+                except TimeoutError:
+                    if self._ended and queue.empty():
+                        return
+                    continue
+                yield frame
+        finally:
+            self._subscribers.discard(queue)
+
+
+def get_hub(config: ProjectorConfig, source: AsyncTickSource | None = None) -> SessionHub:
+    """Return the session's hub, creating it once. A reconnecting client reuses
+    the same hub, so its projector's seq stays monotonic across reconnects."""
+    hub = _HUBS.get(config.session_id)
+    if hub is None:
+        hub = SessionHub(config, source=source)
+        _HUBS[config.session_id] = hub
+    return hub
+
+
+def reset_hubs() -> None:
+    """Test helper: drop all hubs and cached frames for a clean slate."""
+    _HUBS.clear()
+    _LATEST.clear()

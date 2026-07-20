@@ -13,6 +13,17 @@ from referencing import Registry, Resource
 
 from app import main
 from app.realtime import session
+from app.realtime.session import reset_hubs
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _clean_hubs() -> Any:
+    reset_hubs()
+    yield
+    reset_hubs()
+
 
 _SCHEMA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
