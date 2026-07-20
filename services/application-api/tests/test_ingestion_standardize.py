@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -31,14 +32,14 @@ def _bars(times: list[str], n: int | None = None) -> pd.DataFrame:
     )
 
 
-def test_summer_bar_utc_matches_fixed_offset():
+def test_summer_bar_utc_matches_fixed_offset() -> None:
     # July: Eastern is EDT (-04:00), same as the source's fixed offset.
     df = _bars(["2026-07-09 09:30:00"])
     out, _ = standardize_bars(df, symbol="QQQ.US")
     assert out["occurred_at_utc"].iloc[0] == pd.Timestamp("2026-07-09 13:30:00", tz="UTC")
 
 
-def test_winter_bar_corrects_dst_offset():
+def test_winter_bar_corrects_dst_offset() -> None:
     # January: Eastern is EST (-05:00). The source's fixed -04:00 is wrong;
     # standardization must yield 14:30Z, not 13:30Z.
     df = _bars(["2026-01-09 09:30:00"])
@@ -47,7 +48,7 @@ def test_winter_bar_corrects_dst_offset():
     assert out["trading_date"].iloc[0] == "2026-01-09"
 
 
-def test_columns_and_dedup_and_sort():
+def test_columns_and_dedup_and_sort() -> None:
     df = _bars(["2026-07-09 09:31:00", "2026-07-09 09:30:00", "2026-07-09 09:31:00"])
     out, _ = standardize_bars(df, symbol="QQQ.US")
     assert list(out.columns) == STANDARD_COLUMNS
@@ -55,20 +56,20 @@ def test_columns_and_dedup_and_sort():
     assert out["occurred_at_utc"].is_monotonic_increasing
 
 
-def test_missing_column_rejected():
+def test_missing_column_rejected() -> None:
     df = _bars(["2026-07-09 09:30:00"]).drop(columns=["close"])
     with pytest.raises(ValueError, match="required columns"):
         standardize_bars(df, symbol="QQQ.US")
 
 
-def test_naive_timestamp_rejected():
+def test_naive_timestamp_rejected() -> None:
     df = _bars(["2026-07-09 09:30:00"])
     df["timestamp"] = df["timestamp"].dt.tz_localize(None)
     with pytest.raises(ValueError, match="timezone-aware"):
         standardize_bars(df, symbol="QQQ.US")
 
 
-def test_partitions_and_manifest_written(tmp_path):
+def test_partitions_and_manifest_written(tmp_path: Path) -> None:
     df = _bars(["2026-07-08 09:30:00", "2026-07-08 09:31:00", "2026-07-09 09:30:00"])
     src = tmp_path / "raw.parquet"
     df.to_parquet(src, index=False)
@@ -88,7 +89,7 @@ def test_partitions_and_manifest_written(tmp_path):
         assert (res.dataset_root / p["relative_path"]).exists()
 
 
-def test_checksum_reproducible(tmp_path):
+def test_checksum_reproducible(tmp_path: Path) -> None:
     df = _bars(["2026-07-08 09:30:00", "2026-07-09 09:30:00"])
     src = tmp_path / "raw.parquet"
     df.to_parquet(src, index=False)

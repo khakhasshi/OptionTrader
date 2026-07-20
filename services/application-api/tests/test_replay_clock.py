@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -57,7 +58,7 @@ def _session(minutes: int) -> pd.DataFrame:
     return _bars(times)
 
 
-def test_every_snapshot_satisfies_contract():
+def test_every_snapshot_satisfies_contract() -> None:
     v = _snapshot_validator()
     snaps = list(ReplayClock(_session(30)).snapshots())
     assert len(snaps) == 30
@@ -65,12 +66,12 @@ def test_every_snapshot_satisfies_contract():
         assert list(v.iter_errors(s)) == [], s
 
 
-def test_sequence_is_monotonic_from_zero():
+def test_sequence_is_monotonic_from_zero() -> None:
     snaps = list(ReplayClock(_session(20)).snapshots())
     assert [s["sequence_number"] for s in snaps] == list(range(20))
 
 
-def test_open_is_session_open_and_high_low_run():
+def test_open_is_session_open_and_high_low_run() -> None:
     snaps = list(ReplayClock(_session(10)).snapshots())
     assert snaps[0]["open"] == "500.00"
     assert all(s["open"] == "500.00" for s in snaps)
@@ -79,7 +80,7 @@ def test_open_is_session_open_and_high_low_run():
     assert snaps[-1]["low"] == "499.00"
 
 
-def test_opening_range_freezes_after_window():
+def test_opening_range_freezes_after_window() -> None:
     cfg = ReplayConfig(opening_range_minutes=5)
     snaps = list(ReplayClock(_session(20), cfg).snapshots())
     # OR high captured only from the first 5 bars (highs 501..505)
@@ -87,25 +88,30 @@ def test_opening_range_freezes_after_window():
     assert snaps[-1]["opening_range_low"] == "499.00"
 
 
-def test_replay_is_deterministic():
+def test_replay_is_deterministic() -> None:
     a = list(ReplayClock(_session(25)).snapshots())
     b = list(ReplayClock(_session(25)).snapshots())
     assert json.dumps(a) == json.dumps(b)
 
 
-def test_empty_bars_rejected():
+def test_empty_bars_rejected() -> None:
     with pytest.raises(ValueError, match="no bars"):
         ReplayClock(_session(0))
 
 
-def test_replay_from_standardized_partition(tmp_path):
-    # end-to-end: standardize -> replay one date off disk
+def test_replay_from_standardized_partition(tmp_path: Path) -> None:
+    # end-to-end: standardize -> replay one date off disk.
+    # The standardizer assumes the source's fixed Etc/GMT+4 wall-clock, so feed
+    # it that, not UTC — otherwise the instants would be silently shifted.
+    session = _session(5)
     raw = tmp_path / "raw.parquet"
-    src = _session(5)[
-        ["occurred_at_utc", "open", "high", "low", "close", "volume", "vwap", "count"]
-    ].rename(columns={"occurred_at_utc": "timestamp"})
+    src = session[["open", "high", "low", "close", "volume", "vwap", "count"]].copy()
+    src.insert(0, "timestamp", session["occurred_at_utc"].dt.tz_convert(SRC_TZ))
     src.to_parquet(raw, index=False)
     res = standardize_parquet(raw, tmp_path / "replay", symbol="QQQ.US")
     snaps = replay_trading_date(res.dataset_root, "2026-07-09")
     assert len(snaps) == 5
     assert snaps[0]["symbol"] == "QQQ.US"
+    # the round-trip must preserve the original UTC instant, not offset it
+    expected = session["occurred_at_utc"].iloc[0].strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert snaps[0]["occurred_at_utc"] == expected

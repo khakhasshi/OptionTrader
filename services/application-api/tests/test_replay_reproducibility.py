@@ -10,6 +10,7 @@ Synthetic data (not real market data) keeps the goldens stable and reviewable.
 
 from __future__ import annotations
 
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -49,16 +50,23 @@ GAP = _make([500.0] * 15 + [515.0] * 15)
 
 SCENARIOS = {"trend": TREND, "chop": CHOP, "gap": GAP}
 
-# Golden digests — regenerate intentionally if replay logic changes.
+# Golden digests — pinned. If replay logic changes intentionally, recompute and
+# update these; a silent-but-stable change to the snapshot stream then fails here.
 GOLDEN_HASHES = {
-    "trend": None,  # filled by test bootstrap below
-    "chop": None,
-    "gap": None,
+    "trend": "e0428b5d33758128d06d1a8d99fc6ff58e514bdaf46c1e5f061b99fd564356d3",
+    "chop": "7fc6c1b8267ed0f1519cb08f50a072940eafe9444b3acbb7510eddc401f21737",
+    "gap": "5b301e09b64fd79951d78b2de9c09525b7396ca3fc29bbb3ea6b0d3f72aa4397",
 }
 
 
 @pytest.mark.parametrize("name", list(SCENARIOS))
-def test_hash_stable_across_repeated_replay(name):
+def test_hash_matches_golden(name: str) -> None:
+    bars = SCENARIOS[name]
+    assert hash_snapshots(ReplayClock(bars).snapshots()) == GOLDEN_HASHES[name]
+
+
+@pytest.mark.parametrize("name", list(SCENARIOS))
+def test_hash_stable_across_repeated_replay(name: str) -> None:
     bars = SCENARIOS[name]
     h1 = hash_snapshots(ReplayClock(bars).snapshots())
     h2 = hash_snapshots(ReplayClock(bars).snapshots())
@@ -67,7 +75,7 @@ def test_hash_stable_across_repeated_replay(name):
 
 
 @pytest.mark.parametrize("name", list(SCENARIOS))
-def test_hash_survives_disk_roundtrip(tmp_path, name):
+def test_hash_survives_disk_roundtrip(tmp_path: Path, name: str) -> None:
     bars = SCENARIOS[name]
     in_mem = hash_snapshots(ReplayClock(bars).snapshots())
 
@@ -81,12 +89,12 @@ def test_hash_survives_disk_roundtrip(tmp_path, name):
     assert in_mem == from_disk
 
 
-def test_scenarios_have_distinct_hashes():
+def test_scenarios_have_distinct_hashes() -> None:
     digests = {name: hash_snapshots(ReplayClock(b).snapshots()) for name, b in SCENARIOS.items()}
     assert len(set(digests.values())) == 3
 
 
-def test_feature_fixtures_pinned():
+def test_feature_fixtures_pinned() -> None:
     # session VWAP: all volumes equal => simple mean of closes
     assert session_vwap(TREND) == pytest.approx(507.25)
     assert session_vwap(CHOP) == pytest.approx(500.0)
@@ -100,7 +108,7 @@ def test_feature_fixtures_pinned():
     assert tr.high == pytest.approx(500.0 + 14 * 0.5 + 0.25)
 
 
-def test_gap_reflected_in_snapshot_high():
+def test_gap_reflected_in_snapshot_high() -> None:
     snaps = list(ReplayClock(GAP).snapshots())
     # after the gap, running high jumps to the 515 plateau (+0.25 bar high)
     assert snaps[-1]["high"] == "515.25"
@@ -108,7 +116,7 @@ def test_gap_reflected_in_snapshot_high():
     assert snaps[-1]["open"] == "500.00"
 
 
-def test_hv_on_scenarios():
+def test_hv_on_scenarios() -> None:
     # a clean linear trend has near-constant tiny log returns => low HV
     trend_closes = pd.Series([500.0 + i * 0.5 for i in range(30)])
     chop_closes = pd.Series([500.0 + (1.0 if i % 2 else -1.0) for i in range(30)])
