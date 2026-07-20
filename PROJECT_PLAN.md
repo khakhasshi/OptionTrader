@@ -48,7 +48,8 @@ OptionTrader/
 
 ## 3. 核心模块
 
-- **Rust Market Core**：ThetaData 接入、MarketEvent 标准化、去重/排序/回补、分钟 bar/VWAP/opening range/ATM/straddle/spread/quote age、DataHealth、Parquet 落盘。
+- **Rust Market Core**：生产 ThetaData 流接入、MarketEvent 权威标准化、去重/排序/回补、分钟 bar/VWAP/opening range/HV20/HV60/ATM/straddle/spread/quote age、DataHealth。
+- **Python Research Jobs**：通过 ThetaData 官方 Python/gRPC SDK 下载历史 QQQ/期权/VIX，生成带 manifest/checksum 的离线 Parquet；其参考指标只用于与 Rust fixture 对拍。
 - **Rust Risk & Execution Gateway**：`risk-policy`、`initial-risk-check`、`final-risk-check`、`order-state`、`broker-longbridge`、`broker-ibkr`、`reconciliation`、`kill-switch`、`audit`。
 - **Python Application Service**：`api`、`domain`、`orchestration`（SOP 状态机）、`regime`、`volatility`、`strategy`、`events`、`review`、`replay`、`research`、`llm`、`adapters`。
 - **React Cockpit**：Live Cockpit、Positions & Orders、Replay、Daily Review、System Health。

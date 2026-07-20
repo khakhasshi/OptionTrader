@@ -44,9 +44,18 @@ class ReplayClock:
 
     def snapshots(self) -> Iterator[dict[str, object]]:
         cfg = self._cfg
-        session_open = float(self._bars["open"].iloc[0])
         first_ts = self._bars["occurred_at_utc"].iloc[0]
-        or_deadline = first_ts + pd.Timedelta(minutes=cfg.opening_range_minutes)
+        first_et = first_ts.tz_convert("America/New_York")
+        expected_open_et = first_et.normalize() + pd.Timedelta(hours=9, minutes=30)
+        expected_open_utc = expected_open_et.tz_convert("UTC")
+        open_rows = self._bars[self._bars["occurred_at_utc"] == expected_open_utc]
+        session_open = float(
+            open_rows["open"].iloc[0] if not open_rows.empty else self._bars["open"].iloc[0]
+        )
+        or_deadline = expected_open_utc + pd.Timedelta(minutes=cfg.opening_range_minutes)
+        degraded = first_ts != expected_open_utc
+        duplicate_timestamps = self._bars["occurred_at_utc"].duplicated().any()
+        degraded = degraded or bool(duplicate_timestamps)
 
         running_high = float("-inf")
         running_low = float("inf")
@@ -54,6 +63,7 @@ class ReplayClock:
         cum_pv = 0.0  # sum(price*volume) for session VWAP
         or_high = float("-inf")
         or_low = float("inf")
+        previous_ts: pd.Timestamp | None = None
 
         for seq, row in enumerate(self._bars.itertuples(index=False)):
             high = float(row.high)
@@ -63,11 +73,21 @@ class ReplayClock:
 
             running_high = max(running_high, high)
             running_low = min(running_low, low)
-            cum_vol += vol
-            cum_pv += close * vol
-
             occurred = row.occurred_at_utc
-            if occurred < or_deadline:
+            if previous_ts is not None and occurred - previous_ts != pd.Timedelta(minutes=1):
+                degraded = True
+            previous_ts = occurred
+
+            provider_vwap = getattr(row, "vwap", None)
+            if provider_vwap is None or pd.isna(provider_vwap) or float(provider_vwap) <= 0:
+                bar_price = close
+                degraded = True
+            else:
+                bar_price = float(provider_vwap)
+            cum_vol += vol
+            cum_pv += bar_price * vol
+
+            if expected_open_utc <= occurred < or_deadline:
                 or_high = max(or_high, high)
                 or_low = min(or_low, low)
 
@@ -87,7 +107,7 @@ class ReplayClock:
                 "vwap": _dec(vwap),
                 "volume": cum_vol,
                 "sequence_number": seq,
-                "data_health": "HEALTHY",
+                "data_health": "DEGRADED" if degraded else "HEALTHY",
             }
             if or_set:
                 snap["opening_range_high"] = _dec(or_high)

@@ -1,16 +1,15 @@
-"""Deterministic feature computation over standardized bars and snapshots.
+"""Offline reference features for Rust Market Core fixture comparison.
 
 Split by data dependency:
 
 * :mod:`app.features.underlying` — features derivable from QQQ/VIX bars alone
   (session VWAP, opening range, realized/historical volatility). Fully testable
   offline against the on-disk 1-minute data.
-* :mod:`app.features.options` — ATM straddle mark and bid/ask spread. These
-  require an option-quote source not yet ingested; the functions define the
-  contract and math and are unit-tested against synthetic quote frames, ready
-  to wire to real option data in a later Phase 1 step.
+* :mod:`app.features.options` — strict same-expiry/snapshot ATM straddle and
+  bid/ask spread over normalized option quotes.
 
-Everything here is a pure function of its inputs: no wall-clock, no RNG.
+Everything here is a pure function of its inputs: no wall-clock, no RNG. These
+functions are not a paper/live trading authority.
 """
 
 from app.features.underlying import (

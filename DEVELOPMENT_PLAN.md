@@ -99,7 +99,7 @@ flowchart LR
 | Risk & Execution Gateway | Rust | 硬风控、订单状态机、Broker 适配、幂等、撤改单、对账、kill switch | 不接受缺少审计上下文的自由文本指令 |
 | Research Jobs | Python | 历史导入、参数研究、walk-forward、报告生成 | 不直接修改生产规则 |
 
-选择该边界的原因：Python 适合研究、决策层指标、SOP 编排和 LLM；Rust 适合长连接、底层增量特征、低延迟状态机、并发数据处理和安全关键执行。Rust 只计算 bar、VWAP、ATM、straddle、spread、quote age 等确定性底层特征；Python 基于这些快照生成 `VolState`、`RegimeState`、`Signal` 和 `CandidateTradePlan`，避免两种语言重复实现同一决策规则。跨语言通信使用服务契约，第一版不引入 Python/Rust FFI。
+选择该边界的原因：Python 适合研究、决策层指标、SOP 编排和 LLM；Rust 适合长连接、底层增量特征、低延迟状态机、并发数据处理和安全关键执行。ThetaData v3 官方本地 Python/gRPC SDK 由 Python Research Job 用于历史下载，但进入交易许可链的标准化记录、DataHealth、bar、VWAP、ATM、straddle、spread、quote age 等确定性底层特征以 Rust Market Core 为唯一权威；Python 可保留离线参考实现用于独立 fixture 对拍。Python 基于 Rust 快照生成 `VolState`、`RegimeState`、`Signal` 和 `CandidateTradePlan`。跨语言通信使用服务契约，第一版不引入 Python/Rust FFI。
 
 ### 3.3 服务划分
 
@@ -748,8 +748,8 @@ live        受控实盘，默认关闭
 
 任务：
 
-- ThetaData 历史 QQQ/期权/VIX 适配器。
-- 标准化 Market/Option 数据并写入 Parquet。
+- Python Research Job 通过 ThetaData 官方 Python/gRPC SDK 下载历史 QQQ/期权/VIX。
+- Rust Market Core 权威标准化 Market/Option 数据；Python 兼容作业写入带 manifest/checksum 的离线 Parquet。
 - 实现 VWAP、opening range、HV20/HV60、ATM、straddle、spread。
 - 实现确定性回放时钟和事件驱动管线。
 - 实现 Regime、Vol、Risk、Strategy 初版。

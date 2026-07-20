@@ -88,6 +88,30 @@ def test_opening_range_freezes_after_window() -> None:
     assert snaps[-1]["opening_range_low"] == "499.00"
 
 
+def test_replay_uses_provider_bar_vwap() -> None:
+    snaps = list(ReplayClock(_session(2)).snapshots())
+    expected = (500.2 * 1000 + 501.2 * 1001) / 2001
+    assert snaps[-1]["vwap"] == f"{expected:.2f}"
+
+
+def test_late_start_and_gap_fail_closed() -> None:
+    late = _bars(["2026-07-09 10:00:00", "2026-07-09 10:01:00"])
+    late_snaps = list(ReplayClock(late).snapshots())
+    assert all(s["data_health"] == "DEGRADED" for s in late_snaps)
+    assert "opening_range_high" not in late_snaps[-1]
+
+    gapped = _bars(["2026-07-09 09:30:00", "2026-07-09 09:32:00"])
+    gap_snaps = list(ReplayClock(gapped).snapshots())
+    assert gap_snaps[0]["data_health"] == "HEALTHY"
+    assert gap_snaps[1]["data_health"] == "DEGRADED"
+
+
+def test_missing_provider_vwap_downgrades_health() -> None:
+    bars = _session(2).drop(columns=["vwap"])
+    snaps = list(ReplayClock(bars).snapshots())
+    assert all(s["data_health"] == "DEGRADED" for s in snaps)
+
+
 def test_replay_is_deterministic() -> None:
     a = list(ReplayClock(_session(25)).snapshots())
     b = list(ReplayClock(_session(25)).snapshots())

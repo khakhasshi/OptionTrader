@@ -40,14 +40,18 @@
 
 ## Phase 1：历史数据与离线回放（摘要，Phase 0 完成后细化）
 
-- P1-1 ThetaData 历史适配器（QQQ 股票/期权/VIX）→ 标准化 → Parquet（Rust）
-- P1-2 确定性底层特征：VWAP/opening range/HV20/HV60/ATM/straddle/spread（Rust）
+- P1-1 ThetaData 历史适配器：Python Research Job 使用官方 Python/gRPC SDK 下载 QQQ 股票/期权/VIX；Rust Market Core 负责生产标准化与数据质量，Python 保留离线兼容 Parquet 转换
+- P1-2 确定性底层特征：VWAP/opening range/HV20/HV60/ATM/straddle/spread/quote age（Rust 权威实现；Python 仅作离线 fixture 对拍）
 - P1-3 确定性回放时钟 + 事件驱动管线（Python）
 - P1-4 Regime Engine 初版（Trend/Range/Event/Chaos/No Trade + 评分）（Python）
 - P1-5 Vol Engine 初版（IV/HV、implied/realized move、状态分类）（Python）
 - P1-6 Strategy Engine 初版（No Trade/Long Gamma/Short Premium 选择 + 只读风险预检查）（Python）
 - P1-7 信号与 No Trade 原因记录 → PostgreSQL review/audit（Python）
 - P1-8 回放可重复性：同一交易日结果 hash 一致 + 指标 fixture 对拍 + 场景覆盖
+
+> Phase 1 职责说明：ThetaData v3 本地 SDK 当前通过 Python/gRPC 提供，因此历史下载属于 Python Research Job；进入交易许可链的标准化记录、DataHealth 与确定性底层特征仍以 Rust Market Core 为唯一权威。Python 同名计算仅用于离线研究和独立 fixture，不得作为 paper/live 交易许可输入。
+>
+> 2026-07-21 修复复测：`make test`（16 契约 / 34 React / 130 Python / 10 Rust）与 `make lint` 全部通过；另在隔离 PostgreSQL 16 上通过迁移、真实 FK/JSONB/timestamptz 和 4 路并发 signal 幂等测试。已覆盖固定 09:30 ET Opening Range、缺 bar 降级、provider VWAP、HV20/HV60 日线口径、同 expiry/同时间 straddle、Short Premium 完整门槛及 event/data-fault replay。进入 Phase 2 前仍需以真实 ThetaData 样本完成 entitlement/字段映射和 Rust runtime snapshot 接线验收。
 
 ## Phase 2-6：见 PROJECT_PLAN.md 第 9 节
 

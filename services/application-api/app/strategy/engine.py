@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import time
 
 from app.regime import CHAOS, EVENT, RANGE, TREND, RegimeState
-from app.vol import IV_CHEAP, IV_FAIR, IV_RICH, IV_VERY_RICH, VolState
+from app.vol import IV_CHEAP, IV_FAIR, IV_RICH, IV_VERY_RICH, SHORT_VOL, VolState
 
 LONG_GAMMA = "Long Gamma"
 SHORT_PREMIUM = "Short Premium"
@@ -33,7 +33,8 @@ NO_TRADE = "No Trade"
 # Allowed Long Gamma windows (ET), DESIGN 4.5.
 _LG_WINDOWS = ((time(9, 45), time(11, 0)), (time(14, 0), time(15, 30)))
 # Short Premium may not open in the first 30 minutes (DESIGN: 30-45m after open).
-_SP_EARLIEST = time(10, 0)
+_SP_WINDOW = (time(10, 0), time(11, 30))
+_EVENT_GUARD_MINUTES = 15
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,8 @@ class StrategyInputs:
     spread_ok: bool = True
     breakout: bool = False
     data_healthy: bool = True
+    minutes_to_major_event: int | None = None
+    event_released: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,12 @@ class StrategyDecision:
 
 def _in_long_gamma_window(now: time) -> bool:
     return any(start <= now <= end for start, end in _LG_WINDOWS)
+
+
+def _in_short_premium_window(now: time) -> bool:
+    return _SP_WINDOW[0] <= now <= _SP_WINDOW[1]
+
+
 def _select(regime: RegimeState, vol: VolState, inp: StrategyInputs) -> tuple[str, str]:
     """Pick a playbook and a human-readable reason (no risk check yet).
 
@@ -86,9 +95,18 @@ def _select(regime: RegimeState, vol: VolState, inp: StrategyInputs) -> tuple[st
     sets from DESIGN 4.5; Chaos and everything unmatched fall to No Trade.
     """
     if regime.regime == EVENT:
-        return EVENT_VOL_CRUSH, "regime=Event: manage around the timed event"
+        if not inp.event_released:
+            return NO_TRADE, "regime=Event but release not confirmed: wait"
+        if vol.iv_hv_state not in (IV_RICH, IV_VERY_RICH):
+            return NO_TRADE, "post-event but IV is not rich enough for vol crush"
+        return EVENT_VOL_CRUSH, "event released + IV rich: event vol-crush candidate"
     if regime.regime == CHAOS:
         return NO_TRADE, "regime=Chaos: conflicting trend/range signals"
+    if (
+        inp.minutes_to_major_event is not None
+        and 0 <= inp.minutes_to_major_event <= _EVENT_GUARD_MINUTES
+    ):
+        return NO_TRADE, "major event within 15 minutes"
 
     if regime.regime == TREND:
         if vol.iv_hv_state not in (IV_CHEAP, IV_FAIR):
@@ -104,9 +122,16 @@ def _select(regime: RegimeState, vol: VolState, inp: StrategyInputs) -> tuple[st
             return NO_TRADE, f"Range but IV not rich (state={vol.iv_hv_state})"
         if inp.breakout:
             return NO_TRADE, "Range but opening range broke: no premium sale"
-        if inp.now_et < _SP_EARLIEST:
-            return NO_TRADE, "Range but within first 30m: too early to sell premium"
-        return SHORT_PREMIUM, "Range + IV rich + no breakout, past the open"
+        if not _in_short_premium_window(inp.now_et):
+            return NO_TRADE, f"Range setup outside 10:00-11:30 window ({inp.now_et:%H:%M} ET)"
+        if inp.minutes_to_major_event is None:
+            return NO_TRADE, "Range but event proximity is unknown"
+        if vol.interpretation != SHORT_VOL:
+            return NO_TRADE, "Range but straddle decay/realized-implied confirmation is absent"
+        required_vol = (vol.atm_iv, vol.hv_20, vol.straddle_mark, vol.realized_implied_ratio)
+        if any(value is None for value in required_vol):
+            return NO_TRADE, "Range but required volatility inputs are unavailable"
+        return SHORT_PREMIUM, "Range + IV rich + confirmed decay + no event/breakout"
 
     return NO_TRADE, f"regime={regime.regime}: no matching playbook"
 
@@ -167,4 +192,3 @@ def decide(
         risk_notes=notes,
         limits_unconfirmed=limits.unconfirmed,
     )
-

@@ -34,7 +34,7 @@ Rust Risk & Execution Gateway > Python Strategy Engine > LLM > React UI
 | Risk & Execution Gateway | Rust | 硬风控、订单状态机、Broker 适配、幂等、对账、kill switch | 不接受缺审计上下文的自由文本指令 |
 | Research Jobs | Python | 历史导入、参数研究、walk-forward、报告 | 不直接改生产规则 |
 
-计算归属唯一：Rust 只算 bar、VWAP、opening range、ATM、straddle、spread、quote age 等确定性底层特征；Python 基于快照生成 `VolState`、`RegimeState`、`Signal`、`CandidateTradePlan`。同一决策规则不得两语言重复实现。
+计算归属唯一：ThetaData 官方 Python/gRPC SDK 只用于 Python Research Job 历史下载；Rust 权威计算 bar、VWAP、opening range、HV20/HV60、ATM、straddle、spread、quote age 与 DataHealth；Python 基于 Rust 快照生成 `VolState`、`RegimeState`、`Signal`、`CandidateTradePlan`。Python 同名函数只能作为离线 fixture/reference，不得进入 paper/live 交易许可链。同一决策规则不得两语言重复实现。
 
 三个可独立启动的服务：`web`（React）、`application-api`（Python FastAPI）、`trading-core`（Rust workspace，内部按 crate 隔离 Market/Risk/Execution/Broker Adapter）。
 

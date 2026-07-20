@@ -14,24 +14,33 @@ from app.strategy import (
     StrategyInputs,
     decide,
 )
-from app.vol import IV_CHEAP, IV_FAIR, IV_RICH, IV_UNKNOWN, IV_VERY_RICH, VolState
+from app.vol import (
+    IV_CHEAP,
+    IV_FAIR,
+    IV_RICH,
+    IV_UNKNOWN,
+    IV_VERY_RICH,
+    SHORT_VOL,
+    VolState,
+)
 
 
 def _regime(label: str) -> RegimeState:
-    return RegimeState(regime=label, trend_score=0.0, range_score=0.0, components={})
+    return RegimeState(regime=label, trend_score=0, range_score=0, components={})
 
 
-def _vol(iv_state: str) -> VolState:
+def _vol(iv_state: str, *, interpretation: str = "Undecided", complete: bool = False) -> VolState:
     return VolState(
         iv_hv_state=iv_state,
-        interpretation="Undecided",
-        atm_iv=None,
-        hv_20=None,
-        iv_hv_ratio=None,
-        implied_move=None,
+        interpretation=interpretation,
+        atm_iv=0.30 if complete else None,
+        hv_20=0.20 if complete else None,
+        hv_60=0.18 if complete else None,
+        iv_hv_ratio=1.5 if complete else None,
+        implied_move=0.02 if complete else None,
         realized_move=0.0,
-        realized_implied_ratio=None,
-        straddle_mark=None,
+        realized_implied_ratio=0.2 if complete else None,
+        straddle_mark=10.0 if complete else None,
         unavailable=[],
     )
 
@@ -68,8 +77,8 @@ def test_trend_needs_cheap_iv() -> None:
 def test_short_premium_selected() -> None:
     d = decide(
         _regime(RANGE),
-        _vol(IV_VERY_RICH),
-        StrategyInputs(now_et=time(11, 0), breakout=False),
+        _vol(IV_VERY_RICH, interpretation=SHORT_VOL, complete=True),
+        StrategyInputs(now_et=time(11, 0), breakout=False, minutes_to_major_event=60),
     )
     assert d.playbook == SHORT_PREMIUM
 
@@ -77,16 +86,72 @@ def test_short_premium_selected() -> None:
 def test_short_premium_too_early() -> None:
     d = decide(
         _regime(RANGE),
-        _vol(IV_RICH),
-        StrategyInputs(now_et=time(9, 45), breakout=False),
+        _vol(IV_RICH, interpretation=SHORT_VOL, complete=True),
+        StrategyInputs(now_et=time(9, 45), breakout=False, minutes_to_major_event=60),
     )
     assert d.playbook == NO_TRADE
-    assert "early" in d.reason
+    assert "window" in d.reason
+
+
+def test_short_premium_requires_decay_event_data_and_window() -> None:
+    regime = _regime(RANGE)
+    assert (
+        decide(
+            regime,
+            _vol(IV_RICH, complete=True),
+            StrategyInputs(now_et=time(11, 0), minutes_to_major_event=60),
+        ).playbook
+        == NO_TRADE
+    )
+    assert (
+        decide(
+            regime,
+            _vol(IV_RICH, interpretation=SHORT_VOL, complete=True),
+            StrategyInputs(now_et=time(11, 0), minutes_to_major_event=None),
+        ).playbook
+        == NO_TRADE
+    )
+    assert (
+        decide(
+            regime,
+            _vol(IV_RICH, interpretation=SHORT_VOL, complete=True),
+            StrategyInputs(now_et=time(11, 31), minutes_to_major_event=60),
+        ).playbook
+        == NO_TRADE
+    )
+    assert (
+        decide(
+            regime,
+            _vol(IV_RICH, interpretation=SHORT_VOL, complete=True),
+            StrategyInputs(now_et=time(11, 0), minutes_to_major_event=15),
+        ).playbook
+        == NO_TRADE
+    )
+
+
+def test_short_premium_window_boundaries_are_inclusive() -> None:
+    vol = _vol(IV_RICH, interpretation=SHORT_VOL, complete=True)
+    for now_et in (time(10, 0), time(11, 30)):
+        decision = decide(
+            _regime(RANGE),
+            vol,
+            StrategyInputs(now_et=now_et, minutes_to_major_event=60),
+        )
+        assert decision.playbook == SHORT_PREMIUM
 
 
 def test_event_takes_precedence() -> None:
-    d = decide(_regime(EVENT), _vol(IV_UNKNOWN), StrategyInputs(now_et=time(10, 0)))
+    d = decide(
+        _regime(EVENT),
+        _vol(IV_RICH),
+        StrategyInputs(now_et=time(10, 0), event_released=True),
+    )
     assert d.playbook == EVENT_VOL_CRUSH
+
+
+def test_event_before_release_is_no_trade() -> None:
+    d = decide(_regime(EVENT), _vol(IV_UNKNOWN), StrategyInputs(now_et=time(10, 0)))
+    assert d.playbook == NO_TRADE
 
 
 def test_chaos_is_no_trade() -> None:

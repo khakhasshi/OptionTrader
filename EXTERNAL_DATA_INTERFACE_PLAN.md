@@ -465,7 +465,7 @@ QQQ holdings：
 
 | 外部接口 | 代码所有权 | 标准化输出 | 故障策略 |
 |---|---|---|---|
-| ThetaData QQQ/Options/VIX | Rust Market Core | `MarketEvent`、`MarketSnapshot`、`OptionSnapshot`、`DataHealth` | 断流、陈旧或乱序未恢复时禁止新开仓 |
+| ThetaData QQQ/Options/VIX | Python Research Job（历史下载）+ Rust Market Core（生产标准化/实时流） | `MarketEvent`、`MarketSnapshot`、`OptionSnapshot`、`DataHealth` | 断流、陈旧或乱序未恢复时禁止新开仓 |
 | 官方宏观/持仓/财报源 | Python Event Context | `EventContext` | P0 日历缺失时提高风险或禁用相关策略 |
 | Longbridge news/filing | Python Event Context | `NewsEvent`、`FilingEvent` | 仅影响上下文，不生成方向性硬信号 |
 | Longbridge Broker Adapter | Rust Risk & Execution Gateway | `BrokerSnapshot`、`BrokerHealth`、`OrderEvent`、`FillEvent`、`PositionSnapshot` | 仅在 broker_id=longbridge 时为 Execution Truth |
@@ -697,7 +697,7 @@ Event Context 实际接入和 React 实时驾驶舱在 Phase 2 完成。
 创建 PostgreSQL schema、Alembic 单一迁移链、SQLx 离线元数据和本地 compose 服务。
 ```
 
-### Task 2：ThetaData Adapter（Phase 1，Rust）
+### Task 2：ThetaData Adapter（Phase 1 历史 Python SDK；生产标准化与 Phase 2 实时 Rust）
 
 ```text
 接入 QQQ stock quote / OHLC。

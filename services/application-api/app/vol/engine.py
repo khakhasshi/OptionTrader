@@ -11,19 +11,18 @@ ATM implied volatility, computes:
 and derives a vol-state label (IV Cheap/Fair/Rich/Very Rich) and an intraday
 interpretation (Short Vol / Long Vol / No Chase).
 
-ATM IV and the straddle mark come from an option source blocked by ASSUMPTIONS
-Q1. They are optional. When IV is absent the IV/HV state is ``UNKNOWN`` and when
-the straddle is absent the implied move is ``None`` — fail closed, never
-fabricated, so every derived value is traceable to a real input.
+ATM IV and the straddle mark come from normalized option snapshots. HV20/HV60
+must come from daily close history computed by Rust Market Core; intraday
+minute closes are never substituted. Missing inputs fail closed and are listed
+in the state so every derived value remains traceable.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import pandas as pd
-
-from app.features import historical_volatility
 
 # IV/HV thresholds (DESIGN 4.4). Ordered high-to-low for classification.
 _VERY_RICH = 1.5
@@ -55,6 +54,7 @@ class VolState:
     interpretation: str
     atm_iv: float | None
     hv_20: float | None
+    hv_60: float | None
     iv_hv_ratio: float | None
     implied_move: float | None
     realized_move: float
@@ -65,15 +65,18 @@ class VolState:
 
 @dataclass(frozen=True)
 class VolInputs:
-    """Optional option-derived inputs (blocked by ASSUMPTIONS Q1).
+    """External deterministic features consumed by the Vol Engine.
 
     * ``atm_iv`` — ATM implied volatility as an annualized decimal (0.18 = 18%).
+    * ``hv_20``/``hv_60`` — annualized daily close-to-close realized vol.
     * ``straddle_mark`` — current 0DTE ATM straddle price.
     * ``straddle_series`` — chronological straddle marks; its slope decides
       expansion vs decay for the intraday interpretation.
     """
 
     atm_iv: float | None = None
+    hv_20: float | None = None
+    hv_60: float | None = None
     straddle_mark: float | None = None
     straddle_series: list[float] | None = None
 
@@ -123,7 +126,6 @@ def _interpret(ri_ratio: float | None, expanding: bool | None) -> str:
 
 def evaluate(
     bars: pd.DataFrame,
-    hv_window: int = 20,
     inputs: VolInputs | None = None,
 ) -> VolState:
     """Evaluate the vol state as of the last bar in ``bars`` (DESIGN 4.4).
@@ -137,6 +139,17 @@ def evaluate(
     inp = inputs or VolInputs()
     ordered = bars.sort_values("occurred_at_utc").reset_index(drop=True)
 
+    if inp.atm_iv is not None and (not math.isfinite(inp.atm_iv) or inp.atm_iv <= 0):
+        raise ValueError("atm_iv must be positive and finite")
+    if inp.straddle_mark is not None and (
+        not math.isfinite(inp.straddle_mark) or inp.straddle_mark <= 0
+    ):
+        raise ValueError("straddle_mark must be positive and finite")
+    if inp.straddle_series is not None and any(
+        not math.isfinite(value) or value <= 0 for value in inp.straddle_series
+    ):
+        raise ValueError("straddle_series must contain positive finite values")
+
     spot = float(ordered["close"].iloc[-1])
     if spot <= 0:
         raise ValueError("spot must be positive")
@@ -144,8 +157,7 @@ def evaluate(
     session_high = float(ordered["high"].max())
     session_low = float(ordered["low"].min())
     realized_move = (
-        max(abs(spot - session_open), abs(spot - session_high), abs(spot - session_low))
-        / spot
+        max(abs(spot - session_open), abs(spot - session_high), abs(spot - session_low)) / spot
     )
 
     unavailable: list[str] = []
@@ -156,16 +168,18 @@ def evaluate(
     else:
         unavailable.append("straddle_mark")
 
-    ri_ratio = (
-        realized_move / implied_move if implied_move and implied_move > 0 else None
-    )
+    ri_ratio = realized_move / implied_move if implied_move and implied_move > 0 else None
 
-    hv_20: float | None
-    try:
-        hv_20 = historical_volatility(ordered["close"].astype("float64"), hv_window)
-    except ValueError:
-        hv_20 = None
+    hv_20 = inp.hv_20
+    hv_60 = inp.hv_60
+    if hv_20 is None:
         unavailable.append("hv_20")
+    elif not math.isfinite(hv_20) or hv_20 < 0:
+        raise ValueError("hv_20 must be finite and non-negative")
+    if hv_60 is None:
+        unavailable.append("hv_60")
+    elif not math.isfinite(hv_60) or hv_60 < 0:
+        raise ValueError("hv_60 must be finite and non-negative")
 
     iv_hv_ratio: float | None = None
     if inp.atm_iv is None:
@@ -182,6 +196,7 @@ def evaluate(
         interpretation=_interpret(ri_ratio, expanding),
         atm_iv=inp.atm_iv,
         hv_20=hv_20,
+        hv_60=hv_60,
         iv_hv_ratio=iv_hv_ratio,
         implied_move=implied_move,
         realized_move=realized_move,

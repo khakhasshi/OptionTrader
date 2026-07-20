@@ -12,17 +12,25 @@ re-derives the correct UTC instant from the naive Eastern wall-clock via the
 
 from app.ingestion.manifest import DatasetManifest, PartitionEntry
 from app.ingestion.standardize import (
+    OPTION_QUOTE_COLUMNS,
     STANDARD_COLUMNS,
     StandardizeResult,
     standardize_bars,
+    standardize_option_parquet,
+    standardize_option_quotes,
     standardize_parquet,
 )
+from app.ingestion.thetadata import ThetaDataHistoricalAdapter
 
 __all__ = [
     "DatasetManifest",
+    "OPTION_QUOTE_COLUMNS",
     "PartitionEntry",
     "STANDARD_COLUMNS",
     "StandardizeResult",
     "standardize_bars",
+    "standardize_option_parquet",
+    "standardize_option_quotes",
     "standardize_parquet",
+    "ThetaDataHistoricalAdapter",
 ]

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import insert, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 
 from app.persistence.serialize import SignalContext, build_signal_rows
@@ -48,12 +50,35 @@ def persist_signal(
     audit_row["created_at_utc"] = created
 
     with engine.begin() as conn:
-        existing = conn.execute(
-            select(signals.c.signal_id).where(signals.c.signal_id == ctx.signal_id)
-        ).first()
-        if existing is not None:
+        if conn.dialect.name == "postgresql":
+            inserted = (
+                conn.execute(
+                    postgresql_insert(signals)
+                    .values(**signal_row)
+                    .on_conflict_do_nothing(index_elements=[signals.c.signal_id])
+                    .returning(signals.c.signal_id)
+                ).scalar_one_or_none()
+                is not None
+            )
+        elif conn.dialect.name == "sqlite":
+            inserted = (
+                conn.execute(
+                    sqlite_insert(signals)
+                    .values(**signal_row)
+                    .on_conflict_do_nothing(index_elements=[signals.c.signal_id])
+                ).rowcount
+                == 1
+            )
+        else:
+            existing = conn.execute(
+                select(signals.c.signal_id).where(signals.c.signal_id == ctx.signal_id)
+            ).first()
+            if existing is not None:
+                return False
+            conn.execute(insert(signals).values(**signal_row))
+            inserted = True
+        if not inserted:
             return False
-        conn.execute(signals.insert().values(**signal_row))
         conn.execute(audit_events.insert().values(**audit_row))
     return True
 

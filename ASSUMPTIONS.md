@@ -26,7 +26,7 @@
 
 | ID | 问题 | 为何关键 | 暂行默认 |
 |---|---|---|---|
-| Q1 | ThetaData 的接入形态：本地 Terminal/REST、WebSocket 还是官方 SDK？并发与速率限额具体数值？ | 决定 Rust Market Core 连接层、限流、缓存与回补设计；返工成本高 | 假定本地 ThetaData Terminal + HTTP/WS，Rust 侧限流+缓存+健康状态 |
+| Q1 | ThetaData 实时流的 Rust 接入形态及并发/速率限额仍待实测；历史接口已确认使用本地官方 Python/gRPC SDK | 决定 Rust Market Core 实时连接层、限流、缓存与回补设计 | Phase 1 历史下载由 Python Research Job 执行；生产标准化、DataHealth 和底层特征仍由 Rust 权威处理；实时接入在 Phase 2 前完成实测 |
 | Q2 | Longbridge / IBKR 下单接入方式：Longbridge OpenAPI SDK？IBKR 用 TWS/Gateway + ibapi 还是 Client Portal Web API？IBKR 是否需要 Rust 之外的 sidecar？ | 决定 broker adapter 架构（DEVELOPMENT_PLAN 提到「IBKR adapter/sidecar contract」但未定形态） | Longbridge 原生 SDK；IBKR 待定，先定义 adapter trait 与契约，实现留 Phase 3 |
 | Q3 | 账户货币、初始净值、最大张数、单笔最大损失等硬风控具体数值由谁提供？ | 硬风控数值是 config 而非架构，但 paper/live 前必须由人确认并双人批准 | 用占位默认值 + 显式标注 UNCONFIRMED，Phase 3 前锁定 |
 | Q4 | LLM 供应商与模型（Anthropic/OpenAI/本地）、是否有可用密钥、成本预算？ | 决定 llm 模块的 client、Schema 校验、超时/重试/缓存策略 | Phase 4 才接入；先定义 Pydantic Schema 与 provider 无关接口 |

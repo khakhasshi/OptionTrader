@@ -1,6 +1,7 @@
 """P1-8: replay hash stability + feature fixture pinning across scenarios.
 
-Three synthetic session shapes — trend, chop, gap — are replayed and their
+Five synthetic session shapes — trend, chop, gap, event shock, and data fault —
+are replayed and their
 snapshot streams hashed. We assert:
   * the digest is stable across repeated in-memory replays,
   * it survives a standardize -> disk -> replay round-trip,
@@ -43,12 +44,20 @@ def _make(prices: list[float]) -> pd.DataFrame:
     )
 
 
-# Three deterministic scenarios (30 bars each).
+# Deterministic scenarios (30 bars each before deliberate fault injection).
 TREND = _make([500.0 + i * 0.5 for i in range(30)])
 CHOP = _make([500.0 + (1.0 if i % 2 else -1.0) for i in range(30)])
 GAP = _make([500.0] * 15 + [515.0] * 15)
+EVENT = _make([500.0] * 15 + [490.0, 510.0] + [505.0] * 13)
+DATA_FAULT = TREND.drop(index=10).reset_index(drop=True)
 
-SCENARIOS = {"trend": TREND, "chop": CHOP, "gap": GAP}
+SCENARIOS = {
+    "trend": TREND,
+    "chop": CHOP,
+    "gap": GAP,
+    "event": EVENT,
+    "data_fault": DATA_FAULT,
+}
 
 # Golden digests — pinned. If replay logic changes intentionally, recompute and
 # update these; a silent-but-stable change to the snapshot stream then fails here.
@@ -56,6 +65,8 @@ GOLDEN_HASHES = {
     "trend": "e0428b5d33758128d06d1a8d99fc6ff58e514bdaf46c1e5f061b99fd564356d3",
     "chop": "7fc6c1b8267ed0f1519cb08f50a072940eafe9444b3acbb7510eddc401f21737",
     "gap": "5b301e09b64fd79951d78b2de9c09525b7396ca3fc29bbb3ea6b0d3f72aa4397",
+    "event": "5ef6b70557a9b148b11f5ebad59ef455fc2ca9a4dea8af2b34bc4226b0892570",
+    "data_fault": "392806685b7d70a7dcb543d47bdd942032699aa5a6ffe4924a273e71993b517c",
 }
 
 
@@ -91,7 +102,7 @@ def test_hash_survives_disk_roundtrip(tmp_path: Path, name: str) -> None:
 
 def test_scenarios_have_distinct_hashes() -> None:
     digests = {name: hash_snapshots(ReplayClock(b).snapshots()) for name, b in SCENARIOS.items()}
-    assert len(set(digests.values())) == 3
+    assert len(set(digests.values())) == len(SCENARIOS)
 
 
 def test_feature_fixtures_pinned() -> None:
@@ -114,6 +125,11 @@ def test_gap_reflected_in_snapshot_high() -> None:
     assert snaps[-1]["high"] == "515.25"
     # session open stays at the pre-gap open
     assert snaps[-1]["open"] == "500.00"
+
+
+def test_data_fault_scenario_downgrades_health() -> None:
+    snaps = list(ReplayClock(DATA_FAULT).snapshots())
+    assert snaps[-1]["data_health"] == "DEGRADED"
 
 
 def test_hv_on_scenarios() -> None:

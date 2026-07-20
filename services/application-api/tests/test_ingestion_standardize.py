@@ -9,8 +9,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from app.ingestion import standardize_bars, standardize_parquet
-from app.ingestion.standardize import STANDARD_COLUMNS
+from app.ingestion import (
+    standardize_bars,
+    standardize_option_parquet,
+    standardize_option_quotes,
+    standardize_parquet,
+)
+from app.ingestion.standardize import OPTION_QUOTE_COLUMNS, STANDARD_COLUMNS
 
 SRC_TZ = ZoneInfo("Etc/GMT+4")  # THETADATA's fixed-offset (mirrors the export)
 
@@ -50,10 +55,31 @@ def test_winter_bar_corrects_dst_offset() -> None:
 
 def test_columns_and_dedup_and_sort() -> None:
     df = _bars(["2026-07-09 09:31:00", "2026-07-09 09:30:00", "2026-07-09 09:31:00"])
+    df.loc[2, ["open", "high", "low", "close", "volume", "vwap", "count"]] = df.loc[
+        0, ["open", "high", "low", "close", "volume", "vwap", "count"]
+    ]
     out, _ = standardize_bars(df, symbol="QQQ.US")
     assert list(out.columns) == STANDARD_COLUMNS
     assert len(out) == 2  # duplicate 09:31 collapsed
     assert out["occurred_at_utc"].is_monotonic_increasing
+
+
+def test_conflicting_duplicate_rejected() -> None:
+    df = _bars(["2026-07-09 09:30:00", "2026-07-09 09:30:00"])
+    with pytest.raises(ValueError, match="conflicting duplicate"):
+        standardize_bars(df, symbol="QQQ.US")
+
+
+def test_invalid_market_values_rejected() -> None:
+    bad_ohlc = _bars(["2026-07-09 09:30:00"])
+    bad_ohlc.loc[0, "high"] = 98.0
+    with pytest.raises(ValueError, match="OHLC"):
+        standardize_bars(bad_ohlc, symbol="QQQ.US")
+
+    negative_volume = _bars(["2026-07-09 09:30:00"])
+    negative_volume.loc[0, "volume"] = -1
+    with pytest.raises(ValueError, match="non-negative"):
+        standardize_bars(negative_volume, symbol="QQQ.US")
 
 
 def test_missing_column_rejected() -> None:
@@ -97,3 +123,53 @@ def test_checksum_reproducible(tmp_path: Path) -> None:
     a = standardize_parquet(src, tmp_path / "a", symbol="QQQ.US")
     b = standardize_parquet(src, tmp_path / "b", symbol="QQQ.US")
     assert a.manifest.content_checksum() == b.manifest.content_checksum()
+
+
+def _option_quotes() -> pd.DataFrame:
+    timestamp = pd.Series(
+        [
+            pd.Timestamp("2026-07-09 10:00:00", tz=SRC_TZ),
+            pd.Timestamp("2026-07-09 10:00:00", tz=SRC_TZ),
+        ]
+    )
+    return pd.DataFrame(
+        {
+            "timestamp": timestamp,
+            "expiration": ["2026-07-09", "2026-07-09"],
+            "strike": [500.0, 500.0],
+            "right": ["CALL", "PUT"],
+            "bid": [2.0, 3.0],
+            "ask": [2.2, 3.2],
+            "bid_size": [10, 12],
+            "ask_size": [11, 13],
+        }
+    )
+
+
+def test_option_quotes_standardize_identity_and_partition(tmp_path: Path) -> None:
+    quotes, manifest = standardize_option_quotes(_option_quotes())
+    assert list(quotes.columns) == OPTION_QUOTE_COLUMNS
+    assert quotes["underlying"].unique().tolist() == ["QQQ"]
+    assert set(quotes["option_type"]) == {"C", "P"}
+    assert manifest.data_type == "option_quote_1m"
+
+    source = tmp_path / "option-quotes.parquet"
+    _option_quotes().to_parquet(source, index=False)
+    result = standardize_option_parquet(source, tmp_path / "replay")
+    assert result.manifest.import_status == "COMPLETE"
+    assert result.manifest.rows == 2
+    assert (result.dataset_root / "2026-07-09" / "part-000.parquet").exists()
+
+
+def test_option_quotes_reject_crossed_and_conflicting_duplicates() -> None:
+    crossed = _option_quotes()
+    crossed.loc[0, "ask"] = 1.0
+    with pytest.raises(ValueError, match="crossed"):
+        standardize_option_quotes(crossed)
+
+    duplicate = pd.concat(
+        [_option_quotes().iloc[[0]], _option_quotes().iloc[[0]]], ignore_index=True
+    )
+    duplicate.loc[1, "bid"] = 1.5
+    with pytest.raises(ValueError, match="conflicting duplicate"):
+        standardize_option_quotes(duplicate)

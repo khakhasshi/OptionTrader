@@ -55,7 +55,13 @@ def test_realized_move_from_bars_only() -> None:
     assert state.implied_move is None
     assert state.iv_hv_state == IV_UNKNOWN
     assert state.interpretation == UNDECIDED
-    assert set(state.unavailable) >= {"straddle_mark", "atm_iv", "straddle_series"}
+    assert set(state.unavailable) >= {
+        "straddle_mark",
+        "atm_iv",
+        "hv_20",
+        "hv_60",
+        "straddle_series",
+    }
 
 
 def test_implied_move_from_straddle() -> None:
@@ -66,13 +72,42 @@ def test_implied_move_from_straddle() -> None:
 
 def test_iv_hv_state_thresholds() -> None:
     bars = _bars([500.0 + (0.5 if i % 2 else -0.5) for i in range(30)])
-    hv = evaluate(bars).hv_20
-    assert hv is not None and hv > 0
-    # pick IVs that land in each band relative to the measured HV
-    assert evaluate(bars, inputs=VolInputs(atm_iv=hv * 0.7)).iv_hv_state == IV_CHEAP
-    assert evaluate(bars, inputs=VolInputs(atm_iv=hv * 1.0)).iv_hv_state == IV_FAIR
-    assert evaluate(bars, inputs=VolInputs(atm_iv=hv * 1.3)).iv_hv_state == IV_RICH
-    assert evaluate(bars, inputs=VolInputs(atm_iv=hv * 1.6)).iv_hv_state == IV_VERY_RICH
+    hv = 0.20
+    # HV is supplied from daily history; session minute closes are not reused.
+    assert (
+        evaluate(bars, inputs=VolInputs(atm_iv=hv * 0.7, hv_20=hv, hv_60=0.18)).iv_hv_state
+        == IV_CHEAP
+    )
+    assert evaluate(bars, inputs=VolInputs(atm_iv=hv, hv_20=hv, hv_60=0.18)).iv_hv_state == IV_FAIR
+    assert (
+        evaluate(bars, inputs=VolInputs(atm_iv=hv * 1.3, hv_20=hv, hv_60=0.18)).iv_hv_state
+        == IV_RICH
+    )
+    assert (
+        evaluate(bars, inputs=VolInputs(atm_iv=hv * 1.6, hv_20=hv, hv_60=0.18)).iv_hv_state
+        == IV_VERY_RICH
+    )
+
+
+def test_intraday_closes_are_not_used_as_daily_hv() -> None:
+    state = evaluate(_bars([500.0 + i for i in range(30)]), inputs=VolInputs(atm_iv=0.2))
+    assert state.hv_20 is None
+    assert state.hv_60 is None
+    assert state.iv_hv_state == IV_UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        VolInputs(atm_iv=-0.1),
+        VolInputs(hv_20=float("nan")),
+        VolInputs(straddle_mark=0.0),
+        VolInputs(straddle_series=[5.0, -1.0]),
+    ],
+)
+def test_invalid_vol_inputs_fail_closed(inputs: VolInputs) -> None:
+    with pytest.raises(ValueError):
+        evaluate(_bars([500.0] * 6), inputs=inputs)
 
 
 def test_interpretation_short_vol() -> None:
@@ -82,6 +117,7 @@ def test_interpretation_short_vol() -> None:
         bars,
         inputs=VolInputs(straddle_mark=10.0, straddle_series=[10.0, 8.0]),
     )
+    assert state.realized_implied_ratio is not None
     assert state.realized_implied_ratio < 0.4
     assert state.interpretation == SHORT_VOL
 
@@ -93,6 +129,7 @@ def test_interpretation_long_vol() -> None:
         bars,
         inputs=VolInputs(straddle_mark=3.0, straddle_series=[3.0, 5.0]),
     )
+    assert state.realized_implied_ratio is not None
     assert state.realized_implied_ratio > 0.6
     assert state.interpretation == LONG_VOL
 
@@ -107,6 +144,7 @@ def test_interpretation_no_chase() -> None:
         bars,
         inputs=VolInputs(straddle_mark=implied_target * spot, straddle_series=[5.0, 4.0]),
     )
+    assert state.realized_implied_ratio is not None
     assert 0.9 <= state.realized_implied_ratio <= 1.1
     assert state.interpretation == NO_CHASE
 

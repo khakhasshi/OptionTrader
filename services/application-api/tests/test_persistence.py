@@ -8,10 +8,15 @@ without a live Postgres.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import os
+from typing import Any, cast
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, event, select, text
+from sqlalchemy.engine import Engine
 
 from app.persistence import (
     SignalContext,
@@ -44,6 +49,7 @@ def _vol(state: str = IV_CHEAP) -> VolState:
         interpretation="Long Vol",
         atm_iv=0.18,
         hv_20=0.12,
+        hv_60=0.14,
         iv_hv_ratio=1.5,
         implied_move=0.01,
         realized_move=0.015,
@@ -80,7 +86,8 @@ def test_serialize_traded_signal_has_no_no_trade_reason() -> None:
     assert sig["no_trade_reason"] is None
     assert sig["regime"] == TREND
     assert sig["vol_state"] == IV_CHEAP
-    assert sig["payload"]["regime"]["trend_score"] == 6
+    payload = cast(dict[str, Any], sig["payload"])
+    assert payload["regime"]["trend_score"] == 6
     assert audit["action"] == "SIGNAL_EMITTED"
     assert audit["to_status"] == LONG_GAMMA
     assert audit["entity_id"] == "sig-1"
@@ -100,7 +107,8 @@ def test_serialize_no_trade_records_reason() -> None:
 
 def test_serialize_captures_unavailable_inputs() -> None:
     sig, _ = build_signal_rows(_ctx(), _regime(), _vol(), _decision())
-    assert sig["payload"]["regime"]["unavailable"] == ["volume_vs_20d"]
+    payload = cast(dict[str, Any], sig["payload"])
+    assert payload["regime"]["unavailable"] == ["volume_vs_20d"]
 
 
 def test_serialize_rejects_naive_timestamp() -> None:
@@ -122,7 +130,7 @@ def test_serialize_rejects_non_utc_timestamp() -> None:
 
 
 @pytest.fixture()
-def engine():
+def engine() -> Engine:
     """In-memory SQLite with trading/audit schemas attached, mirror tables built.
 
     SQLAlchemy renders ``trading.signals`` as a schema reference; SQLite treats
@@ -131,7 +139,7 @@ def engine():
     eng = create_engine("sqlite://")
 
     @event.listens_for(eng, "connect")
-    def _attach(dbapi_conn, _rec):
+    def _attach(dbapi_conn: Any, _rec: Any) -> None:
         cur = dbapi_conn.cursor()
         cur.execute("ATTACH DATABASE ':memory:' AS trading")
         cur.execute("ATTACH DATABASE ':memory:' AS audit")
@@ -141,7 +149,7 @@ def engine():
     return eng
 
 
-def test_persist_writes_signal_and_audit(engine) -> None:
+def test_persist_writes_signal_and_audit(engine: Engine) -> None:
     wrote = persist_signal(engine, _ctx(), _regime(), _vol(), _decision())
     assert wrote is True
     with engine.connect() as conn:
@@ -154,7 +162,7 @@ def test_persist_writes_signal_and_audit(engine) -> None:
     assert srows[0]["created_at_utc"] is not None
 
 
-def test_persist_is_idempotent(engine) -> None:
+def test_persist_is_idempotent(engine: Engine) -> None:
     assert persist_signal(engine, _ctx(), _regime(), _vol(), _decision()) is True
     assert persist_signal(engine, _ctx(), _regime(), _vol(), _decision()) is False
     with engine.connect() as conn:
@@ -162,7 +170,7 @@ def test_persist_is_idempotent(engine) -> None:
         assert conn.execute(select(audit_events)).mappings().all().__len__() == 1
 
 
-def test_persist_no_trade_reason_persisted(engine) -> None:
+def test_persist_no_trade_reason_persisted(engine: Engine) -> None:
     decision = StrategyDecision(
         playbook=NO_TRADE,
         reason="regime=Chaos: conflicting trend/range signals",
@@ -176,7 +184,7 @@ def test_persist_no_trade_reason_persisted(engine) -> None:
     assert row["no_trade_reason"] == "regime=Chaos: conflicting trend/range signals"
 
 
-def test_transaction_atomic_on_audit_failure(engine) -> None:
+def test_transaction_atomic_on_audit_failure(engine: Engine) -> None:
     """If the audit insert fails, the signal insert must roll back too."""
     with engine.connect() as conn:
         conn.execute(text("DROP TABLE audit.audit_events"))
@@ -185,3 +193,63 @@ def test_transaction_atomic_on_audit_failure(engine) -> None:
         persist_signal(engine, _ctx(), _regime(), _vol(), _decision())
     with engine.connect() as conn:
         assert conn.execute(select(signals)).mappings().all() == []
+
+
+@pytest.mark.skipif(not os.getenv("DATABASE_URL"), reason="DATABASE_URL is required")
+def test_postgresql_migration_and_concurrent_idempotency() -> None:
+    """Exercise real FK/JSONB/timestamptz and atomic ON CONFLICT behavior."""
+    raw_url = os.environ["DATABASE_URL"]
+    url = raw_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    pg_engine = create_engine(url, pool_size=5)
+    suffix = uuid4().hex
+    session_id = f"review-{suffix}"
+    signal_id = f"sig-{suffix}"
+    ctx = SignalContext(
+        signal_id=signal_id,
+        session_id=session_id,
+        occurred_at_utc=datetime.now(UTC),
+    )
+    try:
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO trading.trading_sessions "
+                    "(session_id, trading_date, status) VALUES (:id, CURRENT_DATE, 'REPLAY')"
+                ),
+                {"id": session_id},
+            )
+
+        def write_once() -> bool:
+            return persist_signal(pg_engine, ctx, _regime(), _vol(), _decision())
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(lambda _: write_once(), range(4)))
+        assert results.count(True) == 1
+        assert results.count(False) == 3
+
+        with pg_engine.connect() as conn:
+            assert (
+                conn.execute(
+                    text("SELECT count(*) FROM trading.signals WHERE signal_id=:id"),
+                    {"id": signal_id},
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                conn.execute(
+                    text("SELECT count(*) FROM audit.audit_events WHERE entity_id=:id"),
+                    {"id": signal_id},
+                ).scalar_one()
+                == 1
+            )
+    finally:
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM audit.audit_events WHERE entity_id=:id"), {"id": signal_id}
+            )
+            conn.execute(text("DELETE FROM trading.signals WHERE signal_id=:id"), {"id": signal_id})
+            conn.execute(
+                text("DELETE FROM trading.trading_sessions WHERE session_id=:id"),
+                {"id": session_id},
+            )
+        pg_engine.dispose()

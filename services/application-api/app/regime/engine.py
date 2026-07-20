@@ -63,7 +63,12 @@ class RegimeInputs:
 
 
 def _running_vwap(bars: pd.DataFrame) -> pd.Series:
-    price = bars["close"].astype("float64")
+    close = bars["close"].astype("float64")
+    if "vwap" in bars:
+        provider_vwap = bars["vwap"].astype("float64")
+        price = provider_vwap.where(provider_vwap.notna() & (provider_vwap > 0), close)
+    else:
+        price = close
     vol = bars["volume"].astype("float64")
     cum_pv = (price * vol).cumsum()
     cum_v = vol.cumsum()
@@ -90,7 +95,7 @@ def _vwap_crossings(close: pd.Series, vwap: pd.Series) -> int:
     """Number of times close-vs-VWAP sign flips (ignoring exact touches)."""
     sign = (close - vwap).apply(lambda d: 1 if d > 0 else (-1 if d < 0 else 0))
     nonzero = sign[sign != 0]
-    return int((nonzero.diff().fillna(0) != 0).sum() - 1) if len(nonzero) > 1 else 0
+    return int((nonzero.diff().fillna(0) != 0).sum()) if len(nonzero) > 1 else 0
 
 
 def _body_wick_ratio(bars: pd.DataFrame) -> float:
@@ -99,6 +104,8 @@ def _body_wick_ratio(bars: pd.DataFrame) -> float:
     body = (bars["close"] - bars["open"]).abs().astype("float64")
     ratio = (body / rng).where(rng > 0, 1.0)
     return float(ratio.mean())
+
+
 def _straddle_slope(series: list[float] | None) -> int:
     """+1 rising, -1 decaying, 0 flat/unknown, from first-to-last comparison."""
     if not series or len(series) < 2:
@@ -131,15 +138,24 @@ def evaluate(
     close = ordered["close"].astype("float64")
     vwap = _running_vwap(ordered)
 
-    first_ts = ordered["occurred_at_utc"].iloc[0]
-    or_deadline = first_ts + pd.Timedelta(minutes=opening_range_minutes)
-    or_mask = ordered["occurred_at_utc"] < or_deadline
+    timestamps_et = pd.to_datetime(ordered["occurred_at_utc"], utc=True).dt.tz_convert(
+        "America/New_York"
+    )
+    first_et = timestamps_et.iloc[0]
+    session_open = first_et.normalize() + pd.Timedelta(hours=9, minutes=30)
+    or_deadline = session_open + pd.Timedelta(minutes=opening_range_minutes)
+    or_mask = (timestamps_et >= session_open) & (timestamps_et < or_deadline)
     or_window = ordered[or_mask]
+    expected_or_minutes = pd.date_range(session_open, periods=opening_range_minutes, freq="min")
+    actual_or_minutes = pd.DatetimeIndex(timestamps_et[or_mask]).drop_duplicates().sort_values()
+    opening_range_complete = actual_or_minutes.equals(expected_or_minutes)
     or_high = float(or_window["high"].max()) if not or_window.empty else float("nan")
     or_low = float(or_window["low"].min()) if not or_window.empty else float("nan")
     last_close = float(close.iloc[-1])
 
     unavailable: list[str] = []
+    if not opening_range_complete:
+        unavailable.append("opening_range_complete")
     c: dict[str, int] = {}
 
     # --- Trend score ---
@@ -184,7 +200,11 @@ def evaluate(
 
     range_score = sum(v for k, v in c.items() if k.startswith("range_"))
 
-    regime = _classify(trend_score, range_score, inp.event_window)
+    regime = (
+        _classify(trend_score, range_score, inp.event_window)
+        if opening_range_complete
+        else NO_TRADE
+    )
     return RegimeState(
         regime=regime,
         trend_score=trend_score,
@@ -209,4 +229,3 @@ def _classify(trend_score: int, range_score: int, event_window: bool) -> str:
     if range_score >= 5 and trend_score < 4:
         return RANGE
     return NO_TRADE
-
