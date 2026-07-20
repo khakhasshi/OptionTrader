@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/option_snapshot.json",
+  "title": "OptionSnapshot",
+  "description": "Aggregated ATM option/straddle snapshot produced by Rust Market Core.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "snapshot_id": { "type": "string" },
+    "occurred_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "timestamp_et": { "$ref": "common.json#/$defs/etTimestamp" },
+    "symbol": { "type": "string", "const": "QQQ.US" },
+    "expiry": { "type": "string", "format": "date" },
+    "atm_strike": { "$ref": "common.json#/$defs/decimal" },
+    "atm_call_mid": { "$ref": "common.json#/$defs/decimal" },
+    "atm_put_mid": { "$ref": "common.json#/$defs/decimal" },
+    "atm_straddle_mid": { "$ref": "common.json#/$defs/decimal" },
+    "atm_iv": { "$ref": "common.json#/$defs/decimal" },
+    "call_put_volume_ratio": { "$ref": "common.json#/$defs/decimal" },
+    "bid_ask_spread_percent": { "$ref": "common.json#/$defs/decimal" },
+    "quote_age_ms": { "type": "integer", "minimum": 0 },
+    "greeks_complete": { "type": "boolean" },
+    "data_health": { "$ref": "common.json#/$defs/dataHealth" }
+  },
+  "required": [
+    "schema_version", "snapshot_id", "occurred_at_utc", "symbol", "expiry",
+    "atm_strike", "atm_straddle_mid", "atm_iv", "data_health"
+  ],
+  "additionalProperties": false
+}

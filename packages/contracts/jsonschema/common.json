@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/common.json",
+  "title": "Common definitions",
+  "description": "Shared envelope fields, enums and scalar types reused across all contracts.",
+  "$defs": {
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 UTC timestamp ending in Z.",
+      "pattern": "Z$"
+    },
+    "etTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Derived Eastern Time timestamp for display/decision only. Never a source of truth."
+    },
+    "decimal": {
+      "type": "string",
+      "description": "Fixed-point decimal as a string to avoid binary float error. Implementations parse to numeric/scaled integer.",
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+    },
+    "dataHealth": {
+      "type": "string",
+      "enum": ["HEALTHY", "DEGRADED", "STALE", "DISCONNECTED", "RECONCILING"]
+    },
+    "brokerHealth": {
+      "type": "string",
+      "enum": ["HEALTHY", "DEGRADED", "DISCONNECTED", "RECONCILING"]
+    },
+    "brokerId": {
+      "type": "string",
+      "enum": ["longbridge", "ibkr"]
+    },
+    "executionMode": {
+      "type": "string",
+      "enum": ["REPLAY", "SHADOW", "PAPER", "MANUAL_CONFIRM", "CONTROLLED_AUTO"]
+    },
+    "optionRight": {
+      "type": "string",
+      "enum": ["CALL", "PUT"]
+    },
+    "orderSide": {
+      "type": "string",
+      "enum": ["BUY", "SELL"]
+    },
+    "envelope": {
+      "type": "object",
+      "description": "Common fields present on every domain event/record.",
+      "properties": {
+        "schema_version": { "type": "string" },
+        "event_id": { "type": "string" },
+        "correlation_id": { "type": "string" },
+        "causation_id": { "type": ["string", "null"] },
+        "session_id": { "type": "string" },
+        "occurred_at_utc": { "$ref": "#/$defs/utcTimestamp" },
+        "received_at_utc": { "$ref": "#/$defs/utcTimestamp" },
+        "source": { "type": "string" },
+        "source_sequence": { "type": ["integer", "string"] },
+        "rule_version": { "type": ["string", "null"] }
+      },
+      "required": ["schema_version", "event_id", "session_id", "occurred_at_utc", "source"]
+    }
+  }
+}

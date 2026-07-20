@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/candidate_trade_plan.json",
+  "title": "CandidateTradePlan",
+  "description": "Deterministic candidate trade plan. Must target exactly one broker_id. Never auto-submitted without Rust Final Risk Check.",
+  "type": "object",
+  "$defs": {
+    "leg": {
+      "type": "object",
+      "properties": {
+        "side": { "$ref": "common.json#/$defs/orderSide" },
+        "type": { "$ref": "common.json#/$defs/optionRight" },
+        "expiry": { "type": "string", "format": "date" },
+        "strike": { "$ref": "common.json#/$defs/decimal" },
+        "quantity": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["side", "type", "expiry", "strike", "quantity"],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "plan_id": { "type": "string" },
+    "plan_hash": { "type": "string" },
+    "idempotency_key": { "type": "string" },
+    "session_id": { "type": "string" },
+    "signal_id": { "type": "string" },
+    "broker_id": { "$ref": "common.json#/$defs/brokerId" },
+    "strategy": { "type": "string", "enum": ["LongGamma", "ShortPremium", "EventVolCrush"] },
+    "legs": { "type": "array", "items": { "$ref": "#/$defs/leg" }, "minItems": 1 },
+    "limit_price": { "$ref": "common.json#/$defs/decimal" },
+    "max_slippage": { "$ref": "common.json#/$defs/decimal" },
+    "max_loss": { "$ref": "common.json#/$defs/decimal" },
+    "take_profit": { "$ref": "common.json#/$defs/decimal" },
+    "stop_loss": { "$ref": "common.json#/$defs/decimal" },
+    "time_stop_minutes": { "type": "integer", "minimum": 0 },
+    "invalidation_rules": { "type": "array", "items": { "type": "string" } },
+    "expires_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "rule_version": { "type": "string" },
+    "data_snapshot_ids": { "type": "array", "items": { "type": "string" } },
+    "manual_confirmation_required": { "type": "boolean" }
+  },
+  "required": [
+    "schema_version", "plan_id", "plan_hash", "idempotency_key", "session_id",
+    "signal_id", "broker_id", "strategy", "legs", "limit_price", "max_loss",
+    "expires_at_utc", "rule_version", "manual_confirmation_required"
+  ],
+  "additionalProperties": false
+}

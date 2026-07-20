@@ -1,0 +1,107 @@
+# CLAUDE.md
+
+本文件为 Claude Code 与后续开发者提供项目的目标、约束、规范、命令和关键决策。它是开发期的第一入口，与 `PROJECT_PLAN.md`（架构与阶段）、`TASKS.md`（任务状态）、`ASSUMPTIONS.md`（假设与待确认）配套使用。
+
+## 1. 项目目标
+
+QQQ 日内期权波动率交易系统。目标不是预测 QQQ 方向，而是判断盘中实际波动相对期权隐含波动是否错配，并把交易流程标准化、量化、可复盘。
+
+第一优先级：**先避免错误交易，再寻找优秀交易。** 系统首要目标是阻止不可解释、不可审计或超出风险边界的交易，而非保证盈利。
+
+分阶段交付：离线研究与回放 → 实时驾驶舱 → 半自动订单计划 → 受控自动执行（须长期 shadow/paper 验证后单独启用）。
+
+## 2. 权威边界（不可违反）
+
+```text
+Rust Risk & Execution Gateway > Python Strategy Engine > LLM > React UI
+```
+
+- Rust Risk & Execution Gateway 是所有开仓请求的最终权威。Python、LLM、React 只能提出候选交易，不能绕过硬风控。
+- **单一行情事实源**：ThetaData。
+- **单一执行事实源**：当前 `CandidateTradePlan.broker_id` 所选 Broker 的账户/订单/成交/持仓回报。
+- **单一主数据库**：PostgreSQL。不以 SQLite、DuckDB、浏览器存储替代。DuckDB 仅用于本地只读研究 Parquet。
+- **LLM 无交易授权**：只做解释、审核、归因、研究假设。不得位于止损、撤单、kill switch、平仓的关键路径。`Proceed` 不是下单授权。
+- 每个 `CandidateTradePlan` 必须指定唯一 `broker_id`，一次计划只能提交给一个 Broker。
+- 数据缺失、时钟异常、行情陈旧、Broker 状态不一致时默认 **fail closed**。
+
+## 3. 语言与服务职责
+
+| 层 | 技术 | 职责 | 不承担 |
+|---|---|---|---|
+| Web UI | React + TypeScript | 驾驶舱、图表、告警、人工确认、复盘 | 不存密钥、不做权威风控、不直连 Broker |
+| Application Service | Python + FastAPI | SOP 编排、Regime/Vol/Strategy、事件上下文、回放、研究、LLM、Web API | 不绕过 Rust Gateway 下单 |
+| Market Core | Rust + Tokio | ThetaData 流、标准化、去重、时间排序、确定性底层特征、DataHealth | 不做 Regime/Strategy 决策或 LLM 判断 |
+| Risk & Execution Gateway | Rust | 硬风控、订单状态机、Broker 适配、幂等、对账、kill switch | 不接受缺审计上下文的自由文本指令 |
+| Research Jobs | Python | 历史导入、参数研究、walk-forward、报告 | 不直接改生产规则 |
+
+计算归属唯一：Rust 只算 bar、VWAP、opening range、ATM、straddle、spread、quote age 等确定性底层特征；Python 基于快照生成 `VolState`、`RegimeState`、`Signal`、`CandidateTradePlan`。同一决策规则不得两语言重复实现。
+
+三个可独立启动的服务：`web`（React）、`application-api`（Python FastAPI）、`trading-core`（Rust workspace，内部按 crate 隔离 Market/Risk/Execution/Broker Adapter）。
+
+## 4. 技术约束
+
+- **时间**：UTC 存储、ET 决策、用户时区展示。禁止无时区时间戳。全部 `timestamptz`。
+- **金额/价格/数量/Greeks**：`numeric` 或明确缩放整数。禁止用二进制浮点做最终风险和订单金额判断。
+- **契约优先**：跨语言结构先定 Schema 再实现。API 契约用 Protobuf；持久化与 LLM 边界用 JSON Schema/Pydantic；前端客户端由 OpenAPI 生成。
+- **迁移权威唯一**：Alembic 是唯一 schema migration 权威。Rust SQLx 只消费已迁移 schema 与离线元数据，不维护第二套迁移。生产 DDL 只允许 CI/CD 迁移任务执行。
+- **通信**：React↔Python 用 HTTPS REST + WebSocket；Python↔Rust 用 gRPC（实时行情/状态用 server streaming）。
+- **可追溯**：每个信号、计划、风控判断、LLM 输出可追溯到输入快照与规则版本。通用字段：`schema_version / event_id / correlation_id / causation_id / session_id / occurred_at_utc / received_at_utc / source / source_sequence / rule_version`。
+- **期权合约主键**：`underlying + expiry + strike + right + multiplier`。
+- 先建确定性规则基线，再引入 LLM 解释与规则研究。参数优化必须时间序列切分、walk-forward、样本外验证，不随机打乱时间。
+- 第一版不引入 Python/Rust FFI、消息队列（NATS 待需要时）、Kubernetes、多区域部署。
+
+## 5. 执行模式与环境
+
+执行模式：`REPLAY/SHADOW`（不连 Broker）、`PAPER/MANUAL_CONFIRM`（开仓与普通退出需人工确认）、`CONTROLLED_AUTO`（仅白名单策略）。任何模式下 LLM 都不在关键风险路径。
+
+环境：`local / replay / shadow / paper / live`。live 默认关闭，需显式环境开关与启动检查。环境切换不得只靠前端参数；Rust Gateway 必须校验服务端环境与账户白名单。
+
+DataHealth：`HEALTHY / DEGRADED / STALE / DISCONNECTED / RECONCILING`。BrokerHealth：`HEALTHY / DEGRADED / DISCONNECTED / RECONCILING`。只有 DataHealth=HEALTHY 且所选 Broker BrokerHealth=HEALTHY 且已对账时允许新开仓。
+
+两阶段风控：Initial Risk Check（LLM/人工确认前，不通过则终止且不调用 LLM）；Final Risk Check（人工确认后、Broker 提交前，重读最新状态，人工确认与 LLM Proceed 都不能覆盖其结论）。
+
+## 6. 本机工具链
+
+已验证可用：Node v22 / npm 10.9、uv 0.11（Python 3.14）、cargo 1.95、protoc 35.1、psql 16.14、Docker + Compose v5。
+
+决策：JS 包管理用 **npm workspaces**（无 pnpm/yarn）；Python 依赖与虚拟环境用 **uv**（无 poetry）。见 ASSUMPTIONS.md A1。
+
+## 7. 常用命令
+
+统一入口为根 `Makefile`（占位命令随各服务落地补全）：
+
+```bash
+make setup        # 安装三端依赖
+make dev          # 本地并行启动 web / application-api / trading-core
+make health       # 检查三个服务 health endpoint
+make test         # 运行三端单元测试
+make lint         # TS/Python/Rust lint + format check
+make contracts    # 生成 Protobuf / JSON Schema / OpenAPI 客户端
+make migrate      # Alembic 迁移到最新
+make up / make down  # docker compose 本地依赖（PostgreSQL 等）
+```
+
+## 8. 开发规范
+
+- 契约或数据模型变更先改 `packages/contracts` 并重新生成，再改实现。
+- 所有跨服务标识（plan_id/signal_id/order_id/event_id/idempotency_key）建立唯一约束。
+- 订单、成交、风控、审计写入与状态转换须同事务或用 transactional outbox。
+- 密钥不入 Git、日志、前端 bundle；用本地 secret store 或环境密钥管理。日志对账户号、token、订单原始凭证、PII 脱敏。
+- 不提交大量 tick 数据到 Git。fixture 必须脱敏且体积可控。
+- 每完成一个阶段更新 `TASKS.md`；重要架构决策写入本文件第 9 节并在 `docs/adr/` 建 ADR。
+- 遇错先定位根因，不通过绕过检查或隐藏错误强行继续。
+
+## 9. 关键决策记录
+
+- **D1**：JS 用 npm workspaces，Python 用 uv（本机无 pnpm/yarn/poetry）。
+- **D2**：monorepo 目录结构遵循 DEVELOPMENT_PLAN.md 第 4 节。
+- **D3**：Phase 0 先落骨架 + 契约 + 迁移基础 + 端到端 smoke（fixture 快照从 Rust→Python→React）；不在 Phase 0 接实盘。
+- 后续决策追加于此并同步 ADR。
+
+## 10. 暂不实现（第一阶段）
+
+裸卖 0DTE straddle/strangle；LLM 直接生成并提交 Broker 原生订单；自动上线 LLM 建议规则；多标的泛化；高频做市/co-location；Kubernetes/复杂消息总线/多区域。
+
+## 11. 风险声明
+
+本项目是软件工程与研究计划，不构成投资建议。QQQ 0DTE 期权具有极高 Gamma、Theta、流动性和执行风险。

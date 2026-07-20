@@ -1,0 +1,61 @@
+# OptionTrader pre-commit — 提交前拦截密钥与未格式化代码。
+# 安装: pipx install pre-commit && pre-commit install
+# 手动全量: pre-commit run --all-files
+# 所有 hook 使用本机已有工具 (gitleaks / uv / cargo)，不额外拉取镜像。
+fail_fast: false
+repos:
+  - repo: local
+    hooks:
+      # --- 密钥扫描 (阻断提交，安全关键) ---
+      - id: gitleaks
+        name: gitleaks (secret scan)
+        entry: gitleaks protect --staged --redact --verbose
+        language: system
+        pass_filenames: false
+
+      # --- Python: ruff lint + format ---
+      - id: ruff-check
+        name: ruff check (application-api)
+        entry: bash -c 'cd services/application-api && uv run ruff check .'
+        language: system
+        files: ^services/application-api/.*\.py$
+        pass_filenames: false
+      - id: ruff-format
+        name: ruff format --check (application-api)
+        entry: bash -c 'cd services/application-api && uv run ruff format --check .'
+        language: system
+        files: ^services/application-api/.*\.py$
+        pass_filenames: false
+
+      # --- Rust: fmt + clippy ---
+      - id: cargo-fmt
+        name: cargo fmt --check (trading-core)
+        entry: bash -c 'cd services/trading-core && cargo fmt --all --check'
+        language: system
+        files: ^services/trading-core/.*\.rs$
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy -D warnings (trading-core)
+        entry: bash -c 'cd services/trading-core && cargo clippy --all-targets -- -D warnings'
+        language: system
+        files: ^services/trading-core/.*\.rs$
+        pass_filenames: false
+
+      # --- Web: typecheck ---
+      - id: web-typecheck
+        name: tsc --noEmit (web)
+        entry: bash -c 'cd apps/web && npm run -s lint'
+        language: system
+        files: ^apps/web/.*\.(ts|tsx)$
+        pass_filenames: false
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-json

@@ -1,0 +1,19 @@
+{
+  "name": "optiontrader",
+  "version": "0.0.0",
+  "private": true,
+  "description": "QQQ intraday options volatility trading system (monorepo root)",
+  "workspaces": [
+    "apps/*",
+    "packages/ui",
+    "packages/contracts"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "build:web": "npm --workspace apps/web run build",
+    "test:web": "npm --workspace apps/web run test --if-present"
+  }
+}

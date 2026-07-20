@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/health.json",
+  "title": "Health states",
+  "description": "DataHealth (Market Core) and BrokerHealth (Execution Gateway) status records.",
+  "$defs": {
+    "DataHealthState": {
+      "type": "object",
+      "properties": {
+        "schema_version": { "type": "string", "const": "1.0" },
+        "occurred_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "status": { "$ref": "common.json#/$defs/dataHealth" },
+        "market_event_lag_ms": { "type": "integer", "minimum": 0 },
+        "quote_age_ms": { "type": "integer", "minimum": 0 },
+        "out_of_order_count": { "type": "integer", "minimum": 0 },
+        "reconnect_count": { "type": "integer", "minimum": 0 },
+        "reason": { "type": ["string", "null"] }
+      },
+      "required": ["schema_version", "occurred_at_utc", "status"],
+      "additionalProperties": false
+    },
+    "BrokerHealthState": {
+      "type": "object",
+      "properties": {
+        "schema_version": { "type": "string", "const": "1.0" },
+        "occurred_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "broker_id": { "$ref": "common.json#/$defs/brokerId" },
+        "status": { "$ref": "common.json#/$defs/brokerHealth" },
+        "reconciled": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] }
+      },
+      "required": ["schema_version", "occurred_at_utc", "broker_id", "status", "reconciled"],
+      "additionalProperties": false
+    }
+  }
+}

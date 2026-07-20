@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "snapshot_id": "mkt_20260720_094500_000123",
+  "occurred_at_utc": "2026-07-20T13:45:00Z",
+  "timestamp_et": "2026-07-20T09:45:00-04:00",
+  "symbol": "QQQ.US",
+  "price": "500.00",
+  "open": "498.50",
+  "high": "501.20",
+  "low": "497.90",
+  "previous_close": "497.20",
+  "vwap": "499.40",
+  "volume": 12000000,
+  "opening_range_high": "501.00",
+  "opening_range_low": "497.80",
+  "premarket_high": "499.80",
+  "premarket_low": "496.50",
+  "sequence_number": 123,
+  "quote_age_ms": 120,
+  "data_health": "HEALTHY"
+}

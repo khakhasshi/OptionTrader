@@ -1,0 +1,21 @@
+# 本地开发依赖。生产由 CI/CD 与受控环境管理，不使用本文件。
+services:
+  postgres:
+    image: postgres:16
+    container_name: optiontrader-postgres
+    environment:
+      POSTGRES_USER: optiontrader
+      POSTGRES_PASSWORD: optiontrader
+      POSTGRES_DB: optiontrader
+    ports:
+      - "5432:5432"
+    volumes:
+      - optiontrader-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U optiontrader -d optiontrader"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  optiontrader-pgdata:

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/event_context.json",
+  "title": "EventContext",
+  "description": "Daily event context produced by Python Event Context Layer. Authoritative record lives in PostgreSQL events schema; JSON is exchange/display only.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "event_context_id": { "type": "string" },
+    "trading_date": { "type": "string", "format": "date" },
+    "generated_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "event_day_type": {
+      "type": "string",
+      "enum": ["Normal", "MacroEvent", "EarningsEvent", "FOMC", "Mixed", "HighRisk"]
+    },
+    "macro_events": { "type": "array", "items": { "type": "object" } },
+    "earnings_events": { "type": "array", "items": { "type": "object" } },
+    "news_events": { "type": "array", "items": { "type": "object" } },
+    "qqq_weighted_event_score": { "$ref": "common.json#/$defs/decimal" },
+    "risk_flags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "NO_SHORT_PREMIUM_BEFORE_EVENT",
+          "SIZE_HALF",
+          "WAIT_AFTER_RELEASE",
+          "ELEVATED_EVENT_RISK",
+          "NO_NAKED_0DTE"
+        ]
+      }
+    },
+    "deterministic_context_summary": { "type": "string" }
+  },
+  "required": [
+    "schema_version", "event_context_id", "trading_date",
+    "generated_at_utc", "event_day_type", "risk_flags"
+  ],
+  "additionalProperties": false
+}

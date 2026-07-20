@@ -1,0 +1,20 @@
+[package]
+name = "trading-core-bin"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "trading-core"
+path = "src/main.rs"
+
+[dependencies]
+market-core = { path = "../market-core" }
+risk-gateway = { path = "../risk-gateway" }
+execution = { path = "../execution" }
+broker = { path = "../broker" }
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

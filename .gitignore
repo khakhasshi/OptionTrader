@@ -1,0 +1,44 @@
+# --- Secrets (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+**/credentials.json
+
+# --- Node / JS ---
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+.npm-cache/
+npm-debug.log*
+
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+
+# --- Rust ---
+target/
+**/*.rs.bk
+
+# --- Data: never commit high-frequency market data ---
+data/replay/**
+!data/replay/README.md
+*.parquet
+*.arrow
+
+# --- Local infra / logs ---
+logs/
+*.log
+.DS_Store
+
+# --- Generated contracts output (regenerated via `make contracts`) ---
+packages/contracts/generated/

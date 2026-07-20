@@ -1,0 +1,73 @@
+# OptionTrader CI — 三端 lint + test + 契约 + 迁移。
+# 平台待定：先以 GitHub Actions 脚本化，逻辑集中在 Makefile 目标，便于迁移到其他 CI。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: make test-contracts
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: make setup-web
+      - run: make lint-web
+      - run: make test-web
+
+  api:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: optiontrader
+          POSTGRES_PASSWORD: optiontrader
+          POSTGRES_DB: optiontrader
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U optiontrader"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://optiontrader:optiontrader@localhost:5432/optiontrader
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: make setup-api
+      - run: make lint-api
+      - run: make migrate
+      - run: make test-api
+
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: make lint-core
+      - run: make test-core

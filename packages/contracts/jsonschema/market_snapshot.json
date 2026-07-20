@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/market_snapshot.json",
+  "title": "MarketSnapshot",
+  "description": "Immutable aggregated QQQ market snapshot produced by Rust Market Core.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "snapshot_id": { "type": "string" },
+    "occurred_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "timestamp_et": { "$ref": "common.json#/$defs/etTimestamp" },
+    "symbol": { "type": "string", "const": "QQQ.US" },
+    "price": { "$ref": "common.json#/$defs/decimal" },
+    "open": { "$ref": "common.json#/$defs/decimal" },
+    "high": { "$ref": "common.json#/$defs/decimal" },
+    "low": { "$ref": "common.json#/$defs/decimal" },
+    "previous_close": { "$ref": "common.json#/$defs/decimal" },
+    "vwap": { "$ref": "common.json#/$defs/decimal" },
+    "volume": { "type": "integer", "minimum": 0 },
+    "opening_range_high": { "$ref": "common.json#/$defs/decimal" },
+    "opening_range_low": { "$ref": "common.json#/$defs/decimal" },
+    "premarket_high": { "type": ["string", "null"] },
+    "premarket_low": { "type": ["string", "null"] },
+    "sequence_number": { "type": "integer", "minimum": 0 },
+    "quote_age_ms": { "type": "integer", "minimum": 0 },
+    "data_health": { "$ref": "common.json#/$defs/dataHealth" }
+  },
+  "required": [
+    "schema_version", "snapshot_id", "occurred_at_utc", "symbol",
+    "price", "open", "vwap", "sequence_number", "data_health"
+  ],
+  "additionalProperties": false
+}

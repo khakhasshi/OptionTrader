@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/market-core",
+    "crates/risk-gateway",
+    "crates/execution",
+    "crates/broker",
+    "crates/trading-core-bin",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
