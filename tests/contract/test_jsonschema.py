@@ -98,3 +98,47 @@ def test_service_health_gate_invariant(fixture):
         and fx["reconciled"] is True
     )
     assert fx["new_position_allowed"] is expected
+
+
+def test_cockpit_state_fixture_validates():
+    reg, res = _registry()
+    fx = json.load(open(os.path.join(FIXTURE_DIR, "cockpit_state.sample.json")))
+    v = Draft202012Validator(res["cockpit_state.json"].contents, registry=reg)
+    assert list(v.iter_errors(fx)) == []
+
+
+def test_cockpit_state_allows_null_derivations_when_fail_closed():
+    """A fail-closed frame carries no snapshot/regime/vol/signal and must not
+    permit new positions — the disconnected/stale case the UI renders as No Trade."""
+    reg, res = _registry()
+    frame = {
+        "schema_version": "1.0",
+        "seq": 0,
+        "session_id": "sess_x",
+        "server_time_utc": "2026-07-20T13:45:00Z",
+        "connection": "DISCONNECTED",
+        "new_position_allowed": False,
+        "snapshot": None,
+        "regime": None,
+        "vol": None,
+        "signal": None,
+        "risk_flags": ["upstream stream disconnected"],
+    }
+    v = Draft202012Validator(res["cockpit_state.json"].contents, registry=reg)
+    assert list(v.iter_errors(frame)) == []
+
+
+def test_cockpit_state_rejects_bad_enums_and_extra_fields():
+    reg, res = _registry()
+    bad = {
+        "schema_version": "1.0",
+        "seq": 1,
+        "session_id": "s",
+        "server_time_utc": "2026-07-20T13:45:00Z",
+        "connection": "MAYBE",
+        "new_position_allowed": True,
+        "risk_flags": [],
+        "unexpected": "field",
+    }
+    v = Draft202012Validator(res["cockpit_state.json"].contents, registry=reg)
+    assert len(list(v.iter_errors(bad))) >= 2

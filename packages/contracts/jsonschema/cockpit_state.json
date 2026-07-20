@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/cockpit_state.json",
+  "title": "CockpitState",
+  "description": "Real-time state pushed by the Application Service to the React Cockpit over WebSocket (Phase 2). One frame reflects the derived state as of a single MarketSnapshot: the Rust-authoritative snapshot plus the Python-derived Regime/Vol/Strategy/Signal and the fail-closed trading permission. The Cockpit renders this verbatim; it does not re-derive permission.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic per-session frame sequence for gap detection and recovery."
+    },
+    "session_id": { "type": "string" },
+    "server_time_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "connection": {
+      "type": "string",
+      "enum": ["LIVE", "STALE", "DISCONNECTED"],
+      "description": "Application's view of the upstream Rust snapshot stream."
+    },
+    "new_position_allowed": {
+      "type": "boolean",
+      "description": "Fail-closed trading gate. MUST be false unless data_health==HEALTHY and the stream is LIVE."
+    },
+    "snapshot": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "market_snapshot.json" }
+      ],
+      "description": "Latest Rust-authoritative snapshot, or null when unavailable (fail closed)."
+    },
+    "regime": {
+      "type": ["object", "null"],
+      "properties": {
+        "regime": { "type": "string", "enum": ["Trend", "Range", "Event", "Chaos", "NoTrade"] },
+        "trend_score": { "type": "integer" },
+        "range_score": { "type": "integer" },
+        "components": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "unavailable": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["regime", "trend_score", "range_score"],
+      "additionalProperties": false
+    },
+    "vol": {
+      "type": ["object", "null"],
+      "properties": {
+        "iv_hv_state": { "type": "string" },
+        "interpretation": { "type": "string" },
+        "atm_iv": { "type": ["number", "null"] },
+        "hv_20": { "type": ["number", "null"] },
+        "hv_60": { "type": ["number", "null"] },
+        "iv_hv_ratio": { "type": ["number", "null"] },
+        "implied_move": { "type": ["number", "null"] },
+        "realized_move": { "type": "number" },
+        "realized_implied_ratio": { "type": ["number", "null"] },
+        "straddle_mark": { "type": ["number", "null"] },
+        "unavailable": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["iv_hv_state", "interpretation", "realized_move"],
+      "additionalProperties": false
+    },
+    "signal": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "signal.json" }
+      ],
+      "description": "Contract-compliant Signal derived this frame (enum values, not engine labels)."
+    },
+    "risk_flags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Human-readable fail-closed / risk notes surfaced to the operator."
+    }
+  },
+  "required": [
+    "schema_version", "seq", "session_id", "server_time_utc",
+    "connection", "new_position_allowed", "risk_flags"
+  ],
+  "additionalProperties": false
+}

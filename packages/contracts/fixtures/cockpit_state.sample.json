@@ -1,0 +1,61 @@
+{
+  "schema_version": "1.0",
+  "seq": 123,
+  "session_id": "sess_20260720",
+  "server_time_utc": "2026-07-20T13:45:00Z",
+  "connection": "LIVE",
+  "new_position_allowed": true,
+  "snapshot": {
+    "schema_version": "1.0",
+    "snapshot_id": "mkt_20260720_094500_000123",
+    "occurred_at_utc": "2026-07-20T13:45:00Z",
+    "timestamp_et": "2026-07-20T09:45:00-04:00",
+    "symbol": "QQQ.US",
+    "price": "500.00",
+    "open": "498.50",
+    "high": "501.20",
+    "low": "497.90",
+    "previous_close": "497.20",
+    "vwap": "499.40",
+    "volume": 12000000,
+    "opening_range_high": "501.00",
+    "opening_range_low": "497.80",
+    "premarket_high": "499.80",
+    "premarket_low": "496.50",
+    "sequence_number": 123,
+    "quote_age_ms": 120,
+    "data_health": "HEALTHY"
+  },
+  "regime": {
+    "regime": "Trend",
+    "trend_score": 3,
+    "range_score": 0,
+    "components": { "vwap_slope": 1, "opening_range_break": 2 },
+    "unavailable": []
+  },
+  "vol": {
+    "iv_hv_state": "IV Fair",
+    "interpretation": "Long Vol",
+    "atm_iv": 0.18,
+    "hv_20": 0.16,
+    "hv_60": 0.15,
+    "iv_hv_ratio": 1.13,
+    "implied_move": 0.012,
+    "realized_move": 0.009,
+    "realized_implied_ratio": 0.75,
+    "straddle_mark": 6.1,
+    "unavailable": []
+  },
+  "signal": {
+    "schema_version": "1.0",
+    "signal_id": "sig_20260720_094500_000123",
+    "session_id": "sess_20260720",
+    "occurred_at_utc": "2026-07-20T13:45:00Z",
+    "regime": "Trend",
+    "strategy": "LongGamma",
+    "initial_risk_status": "PASSED",
+    "reason": ["Trend + IV cheap/fair + breakout in allowed window"],
+    "rule_version": "phase1-2026-07-21"
+  },
+  "risk_flags": []
+}

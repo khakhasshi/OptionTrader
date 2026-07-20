@@ -1,0 +1,15 @@
+[package]
+name = "optiontrader-proto"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "optiontrader_proto"
+path = "src/lib.rs"
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true

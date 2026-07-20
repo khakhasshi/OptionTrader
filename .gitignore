@@ -42,3 +42,4 @@ logs/
 
 # --- Generated contracts output (regenerated via `make contracts`) ---
 packages/contracts/generated/
+services/application-api/app/grpc_gen/

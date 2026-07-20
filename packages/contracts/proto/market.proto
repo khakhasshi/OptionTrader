@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+// Python <-> Rust gRPC boundary for real-time market data (Phase 2).
+//
+// The Rust Market Core is the single authority for MarketSnapshot and
+// DataHealth that enter the trading-permission chain (see CLAUDE.md section 2).
+// Python consumes this stream and derives VolState/RegimeState/Signal; it never
+// re-computes the deterministic low-level features served here.
+//
+// Field/type conventions mirror the frozen JSON Schemas
+// (packages/contracts/jsonschema/market_snapshot.json, health.json):
+//   - prices/decimals are fixed-point DECIMAL STRINGS (no binary float),
+//   - timestamps are RFC3339 UTC strings ending in Z,
+//   - data_health uses the DataHealth enum below.
+package optiontrader.market.v1;
+
+// DataHealth lifecycle. Mirrors common.json#/$defs/dataHealth. UNSPECIFIED is
+// the proto3 zero value and must never be emitted by the server (fail closed
+// upstream instead) — it exists only so a missing field is not silently HEALTHY.
+enum DataHealth {
+  DATA_HEALTH_UNSPECIFIED = 0;
+  DATA_HEALTH_HEALTHY = 1;
+  DATA_HEALTH_DEGRADED = 2;
+  DATA_HEALTH_STALE = 3;
+  DATA_HEALTH_DISCONNECTED = 4;
+  DATA_HEALTH_RECONCILING = 5;
+}
+
+// Immutable aggregated QQQ snapshot. Mirrors market_snapshot.json. Optional
+// decimal fields are represented as empty strings when absent (never faked).
+message MarketSnapshot {
+  string schema_version = 1;      // const "1.0"
+  string snapshot_id = 2;
+  string occurred_at_utc = 3;     // RFC3339 UTC (Z)
+  string timestamp_et = 4;        // derived display-only
+  string symbol = 5;              // const "QQQ.US"
+  string price = 6;               // decimal string
+  string open = 7;
+  string high = 8;
+  string low = 9;
+  string previous_close = 10;
+  string vwap = 11;
+  uint64 volume = 12;
+  string opening_range_high = 13;
+  string opening_range_low = 14;
+  string premarket_high = 15;     // "" when null
+  string premarket_low = 16;      // "" when null
+  uint64 sequence_number = 17;
+  uint64 quote_age_ms = 18;
+  DataHealth data_health = 19;
+}
+
+// Runtime DataHealth record. Mirrors health.json#/$defs/DataHealthState.
+message DataHealthState {
+  string schema_version = 1;      // const "1.0"
+  string occurred_at_utc = 2;
+  DataHealth status = 3;
+  uint64 market_event_lag_ms = 4;
+  uint64 quote_age_ms = 5;
+  uint64 out_of_order_count = 6;
+  uint64 reconnect_count = 7;
+  string reason = 8;              // "" when null
+}
+
+// StreamMarketSnapshots parameters. session_id ties the stream to one trading
+// session for traceability; speedup lets replay run faster than wall clock
+// (0 or 1 = as-recorded cadence is bounded by the server, deterministic order
+// is preserved regardless).
+message StreamRequest {
+  string session_id = 1;
+  double speedup = 2;
+}
+
+message GetDataHealthRequest {}
+
+service MarketService {
+  // Server-streaming snapshot feed in deterministic occurred_at_utc order.
+  rpc StreamMarketSnapshots(StreamRequest) returns (stream MarketSnapshot);
+  // Current DataHealth as of the last processed record.
+  rpc GetDataHealth(GetDataHealthRequest) returns (DataHealthState);
+}

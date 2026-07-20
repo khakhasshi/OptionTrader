@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/proto",
     "crates/market-core",
     "crates/risk-gateway",
     "crates/execution",
@@ -15,8 +16,12 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"

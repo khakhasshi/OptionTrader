@@ -13,6 +13,8 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pandas>=2.2",
     "pyarrow>=16.0",
+    "grpcio>=1.66",
+    "protobuf>=5.27",
 ]
 
 [dependency-groups]
@@ -22,16 +24,19 @@ dev = [
     "mypy>=1.10",
     "jsonschema>=4.22",
     "referencing>=0.35",
+    "grpcio-tools>=1.66",
 ]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["app/grpc_gen"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
+exclude = ["app/grpc_gen"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
