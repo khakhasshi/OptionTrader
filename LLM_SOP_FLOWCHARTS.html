@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QQQ 日内波动率交易系统 - LLM 参与 SOP 流程图</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #f7f8fa;
+      --paper: #ffffff;
+      --ink: #1d2433;
+      --muted: #5d6677;
+      --line: #d9dee8;
+      --accent: #176b87;
+      --accent-2: #2f6f3e;
+      --danger: #a53e3e;
+      --warn: #9a6a16;
+      --soft: #eef3f6;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.6;
+    }
+
+    .page {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 32px 24px 56px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 22px;
+      margin-bottom: 24px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 21px;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 24px 0 10px;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 12px;
+      color: var(--muted);
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .meta-item {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      min-height: 64px;
+    }
+
+    .meta-item strong {
+      display: block;
+      color: var(--ink);
+      font-size: 13px;
+      margin-bottom: 3px;
+    }
+
+    .meta-item span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 22px;
+      margin: 18px 0;
+    }
+
+    .note {
+      border-left: 4px solid var(--accent);
+      background: var(--soft);
+      padding: 12px 14px;
+      border-radius: 6px;
+      color: var(--ink);
+      margin: 12px 0 18px;
+    }
+
+    .rules {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 14px 0 4px;
+    }
+
+    .rule {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcfd;
+    }
+
+    .rule strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+
+    .rule ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .diagram-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 18px;
+      margin-top: 14px;
+    }
+
+    .mermaid {
+      min-width: 980px;
+    }
+
+    .sequence-wide .mermaid {
+      min-width: 1800px;
+    }
+
+    code {
+      background: #eef1f5;
+      border-radius: 4px;
+      padding: 1px 5px;
+      color: #263246;
+    }
+
+    footer {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 24px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+    }
+
+    @media (max-width: 860px) {
+      .page {
+        padding: 22px 14px 42px;
+      }
+
+      .meta,
+      .rules {
+        grid-template-columns: 1fr;
+      }
+
+      h1 {
+        font-size: 23px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <h1>QQQ 日内波动率交易系统：LLM 参与 SOP 流程图</h1>
+      <p>
+        本页面与系统设计、外部接口计划和开发计划使用同一架构。LLM 用于上下文解释、SOP 审核、
+        持仓归因和研究假设，不拥有交易授权，也不位于止损、撤单、kill switch 或平仓的关键路径。PostgreSQL
+        是生产系统唯一主数据库，Parquet 只保存高频行情与回放文件。
+      </p>
+      <div class="meta">
+        <div class="meta-item">
+          <strong>系统定位</strong>
+          <span>交易驾驶舱 + 半自动信号系统</span>
+        </div>
+        <div class="meta-item">
+          <strong>LLM 角色</strong>
+          <span>解释、审核、归因、改进建议</span>
+        </div>
+        <div class="meta-item">
+          <strong>交易权限</strong>
+          <span>MANUAL_CONFIRM 需人工确认；所有执行均需 Final Risk</span>
+        </div>
+        <div class="meta-item">
+          <strong>硬边界</strong>
+          <span>LLM 和 React 均不能覆盖 Rust Risk &amp; Execution Gateway</span>
+        </div>
+        <div class="meta-item">
+          <strong>主数据库</strong>
+          <span>PostgreSQL；Parquet 仅用于行情与回放</span>
+        </div>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. LLM 参与边界</h2>
+      <div class="note">
+        核心原则：规则系统负责判断条件是否满足，LLM 负责解释原因、识别冲突、提示风险，人负责确认执行。
+      </div>
+      <div class="rules">
+        <div class="rule">
+          <strong>LLM 可以做</strong>
+          <ul>
+            <li>解释市场状态变化</li>
+            <li>审核候选交易是否符合 SOP</li>
+            <li>归因盈亏来自方向、IV、Theta 或滑点</li>
+            <li>生成复盘和规则改进假设</li>
+          </ul>
+        </div>
+        <div class="rule">
+          <strong>LLM 不可以做</strong>
+          <ul>
+            <li>绕过硬风控</li>
+            <li>直接扩大仓位</li>
+            <li>在 No Trade 状态下强行开仓</li>
+            <li>把新闻情绪当成确定交易信号</li>
+          </ul>
+        </div>
+        <div class="rule">
+          <strong>程序必须做</strong>
+          <ul>
+            <li>结构化输入输出</li>
+            <li>记录每次 LLM 建议</li>
+            <li>把规则变更放入回测或模拟</li>
+            <li>MANUAL_CONFIRM 模式保留人工确认</li>
+            <li>提交 Broker 前执行最终硬风控</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. LLM 参与 SOP 主流程图</h2>
+      <p>
+        该图展示从盘前扫描到盘后复盘的业务主流程。ThetaData 是行情事实源，当前计划指定 Broker 的
+        回报是执行事实源。本图同时标明无执行、人工确认和受控自动三种模式；所有真实订单都必须经过 Rust Final Risk，
+        所有关键状态转换写入 PostgreSQL。
+      </p>
+      <div class="diagram-wrap">
+        <pre class="mermaid">
+flowchart TD
+    A([交易日开始]) --> B[Rust Market Core<br/>ThetaData 标准化与 DataHealth]
+    B --> C{DataHealth = HEALTHY<br/>且 BrokerHealth = HEALTHY?}
+    C -->|否| D[No Trade<br/>记录原因并继续健康检查]
+    C -->|是| E[Python Event/Rule Engine<br/>生成事件标签与禁止事项]
+    E --> F[Python Regime + Vol + Strategy<br/>生成结构化市场状态]
+
+    F --> G{存在有效候选信号?}
+    G -->|否| H[记录 No Trade 原因]
+    G -->|是| I[CandidateTradePlan<br/>唯一 broker_id / plan hash / TTL]
+
+    I --> J[Rust Initial Risk Check]
+    J --> K{初始风控通过?}
+    K -->|否| H
+    K -->|是| L[LLM SOP Review<br/>可选、结构化、无交易授权]
+
+    L --> M{LLM 结果}
+    M -->|Conflict / Cancel| H
+    M -->|Reduce Risk| N[Python 生成全新计划<br/>新 plan_id 与 plan hash]
+    N --> J
+    M -->|Proceed / Review Unavailable| O{执行模式}
+    O -->|REPLAY / SHADOW| H
+    O -->|PAPER / MANUAL_CONFIRM| P[React 展示并等待人工确认]
+    O -->|CONTROLLED_AUTO 白名单| Q[Rust Final Risk Check<br/>最新行情/事件/账户/计划校验]
+
+    P -->|拒绝/超时| H
+    P -->|确认| Q
+    Q --> R{最终风控通过?}
+    R -->|否| H
+    R -->|是| S[向唯一指定 Broker 提交限价单]
+    S --> T[订单状态机与成交/持仓对账]
+
+    T --> U[Rust Risk & Execution Gateway / Position Engine<br/>先判断确定性退出]
+    U --> V{触发退出?}
+    V -->|否| W[LLM 异步归因<br/>不阻塞风险路径]
+    W --> U
+    V -->|是| X[按执行模式强提醒或保护性退出]
+    X --> Y[平仓、对账并记录]
+
+    D --> Z{仍在交易窗口?}
+    H --> Z
+    Y --> Z
+    Z -->|是| B
+    Z -->|否| AA[Review Engine + LLM 盘后复盘]
+    AA --> AB[研究假设进入验证流水线]
+    AB --> AC([交易日结束])
+
+    classDef llm fill:#e8f3f7,stroke:#176b87,stroke-width:1px,color:#102936;
+    classDef risk fill:#fff1ef,stroke:#a53e3e,stroke-width:1px,color:#3f1717;
+    classDef rule fill:#eef7ef,stroke:#2f6f3e,stroke-width:1px,color:#16351f;
+    classDef wait fill:#fff8e6,stroke:#9a6a16,stroke-width:1px,color:#3a2707;
+
+    class L,W,AA llm;
+    class J,K,Q,R,U risk;
+    class B,E,F,I,N,S,T,X,Y,AB rule;
+    class D,H,O,P,Z wait;
+        </pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>3. LLM 执行前决策审核流程图</h2>
+      <p>
+        该图强调双阶段硬风控：LLM 只在 Initial Risk 通过后参与；人工确认后必须再次执行 Final Risk。
+      </p>
+      <div class="diagram-wrap">
+        <pre class="mermaid">
+flowchart LR
+    A[CandidateTradePlan] --> B[Rust Initial Risk Check]
+    B --> C{通过?}
+    C -->|否| D[Risk Rejected + Audit]
+    C -->|是| E[结构化上下文包<br/>Market/Option/Regime/Vol/Event/Risk/DataHealth/BrokerHealth]
+    E --> F[LLM SOP Reviewer]
+
+    F --> G{Schema 有效?}
+    G -->|否/超时/不可用| H[Review Unavailable<br/>记录并继续确定性流程]
+    G -->|是| I{Recommended Action}
+
+    I -->|Conflict / Cancel| J[取消或等待]
+    I -->|Reduce Risk| K[Python 生成新计划<br/>不得原地修改]
+    K --> B
+    I -->|Proceed / Review Only| L{执行模式}
+    H --> L
+
+    L -->|REPLAY / SHADOW| M[记录信号，不提交订单]
+    L -->|PAPER / MANUAL_CONFIRM| N[React 人工确认]
+    L -->|CONTROLLED_AUTO 白名单| O[Rust Final Risk Check]
+    N -->|拒绝/超时| M
+    N -->|确认| O
+    O --> P{最新状态仍通过?}
+    P -->|否| D
+    P -->|是| Q[提交唯一指定 Broker]
+    J --> M
+
+    classDef llm fill:#e8f3f7,stroke:#176b87,stroke-width:1px,color:#102936;
+    classDef decision fill:#fff8e6,stroke:#9a6a16,stroke-width:1px,color:#3a2707;
+    classDef action fill:#eef7ef,stroke:#2f6f3e,stroke-width:1px,color:#16351f;
+    class F,H llm;
+    class C,G,I,L,P decision;
+    class K,N,O,Q action;
+        </pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>4. 候选交易与下单时序图（PAPER / MANUAL_CONFIRM）</h2>
+      <p>
+        该图展开人工确认模式的实际实现边界：React 不直连 Broker；Python 编排策略和 LLM；Rust 执行两阶段硬风控、幂等下单和对账。其他模式在主流程图中定义。
+      </p>
+      <div class="diagram-wrap sequence-wide">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Trader as 交易员
+    participant Web as React Cockpit
+    participant API as Python Application API
+    participant LLM as LLM Intelligence Layer
+    participant Market as Rust Market Core
+    participant Risk as Rust Risk & Execution Gateway
+    participant Broker as Selected Broker
+    participant Audit as PostgreSQL Audit/Review Store
+
+    Market-->>API: HEALTHY Market/Option Snapshot
+    API->>API: 生成 Regime/Vol/Signal/CandidateTradePlan
+    API->>Risk: EvaluateRisk(plan, phase=INITIAL)
+    Risk->>Risk: 校验 DataHealth、事件、仓位、日亏损、broker_id
+    Risk-->>Audit: Initial RiskDecision
+
+    alt Initial Risk 拒绝
+        Risk-->>API: RiskRejected
+        API-->>Web: No Trade + 拒绝原因
+    else Initial Risk 通过
+        Risk-->>API: InitialRiskPassed
+        API->>LLM: 结构化上下文 + plan hash
+        alt LLM 有效返回
+            LLM-->>API: Proceed / Wait / Cancel / Reduce Risk
+        else LLM 超时、不可用或 Schema 错误
+            API->>Audit: Review Unavailable
+            API->>API: 继续确定性流程，不授予交易权限
+        end
+
+        alt Cancel / Conflict
+            API-->>Web: 取消或等待
+            API->>Audit: 记录未交易信号
+        else Reduce Risk
+            API->>API: 创建新 plan_id 与 plan hash
+            API->>Risk: 新计划重新执行 Initial Risk
+        else Proceed / Review Unavailable
+            API-->>Web: 展示计划、最大损失、TTL 和审核状态
+            Trader->>Web: 人工确认
+            Web->>API: confirmation token + plan hash
+            API->>Risk: SubmitApprovedPlan
+            Risk->>Market: 获取最新 DataHealth 和 quote
+            Market-->>Risk: 最新不可变快照
+            Risk->>Broker: 查询账户、持仓、订单和 buying power
+            Broker-->>Risk: BrokerSnapshot + BrokerHealth
+            Risk->>Risk: Final Risk Check
+
+            alt Final Risk 拒绝
+                Risk-->>Audit: Final RiskRejected
+                Risk-->>API: 拒绝提交
+                API-->>Web: 计划失效或风险状态变化
+            else Final Risk 通过
+                Risk->>Broker: 幂等提交唯一限价单
+                Broker-->>Risk: Accepted / Rejected / OrderEvent
+                Risk-->>Audit: 订单与风险审计
+                Risk-->>API: 订单状态
+                API-->>Web: Submitted / Working / Partial / Filled
+            end
+        end
+    end
+        </pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>5. 持仓监控与退出时序图</h2>
+      <p>
+        确定性风险判断始终先执行。LLM 只接收审计快照做异步解释，失败时不影响止损、撤单、kill switch 或平仓。
+      </p>
+      <div class="diagram-wrap sequence-wide">
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Market as Rust Market Core
+    participant Broker as Selected Broker
+    participant Risk as Rust Risk & Execution Gateway / Position Engine
+    participant API as Python Application API
+    participant LLM as LLM Intelligence Layer
+    participant Web as React Cockpit
+    participant Trader as 交易员
+    participant Audit as PostgreSQL Audit/Review Store
+
+    Market-->>Risk: 最新 quote/IV/spread/DataHealth
+    Broker-->>Risk: Order/Fill/PositionSnapshot
+    Risk->>Risk: 先评估止损、止盈、时间退出、事件和 kill switch
+
+    alt 触发退出
+        alt CONTROLLED_AUTO 或已授权保护退出
+            Risk->>Broker: 幂等提交退出/减仓限价单
+            Broker-->>Risk: OrderEvent / FillEvent
+            Risk-->>Audit: 退出决策与成交审计
+        else MANUAL_CONFIRM
+            Risk-->>API: MandatoryClosePlan + 原因 + TTL
+            API-->>Web: 高优先级退出确认
+            Trader->>Web: 确认退出
+            Web->>API: confirmation token
+            API->>Risk: ClosePosition
+            Risk->>Risk: Final Risk Check for Close
+            Risk->>Broker: 提交退出/减仓限价单
+            Broker-->>Risk: OrderEvent / FillEvent
+            Risk-->>Audit: 退出决策与成交审计
+        end
+    else 未触发退出
+        Risk-->>Audit: 持仓状态与未退出原因
+    end
+
+    Risk-->>API: 只读 Position/Risk Attribution Snapshot
+    API->>LLM: 异步提交结构化归因上下文
+    alt LLM 有效返回
+        LLM-->>API: 方向/IV/Theta/滑点解释
+        API-->>Web: 展示解释，不改变 RiskDecision
+    else LLM 不可用
+        API->>Audit: Review Unavailable
+        API-->>Web: 仅展示确定性持仓与风险状态
+    end
+        </pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>6. 规则改进验证流程图</h2>
+      <p>
+        LLM 只能生成研究假设。任何规则改动必须依次通过成本回测、walk-forward、样本外、shadow/paper 和人工 Gate Review。
+      </p>
+      <div class="diagram-wrap">
+        <pre class="mermaid">
+flowchart LR
+    A[PostgreSQL Daily Review<br/>信号/交易/未交易/SOP违规] --> B[LLM 生成规则改进假设]
+    B --> C[Research Queue<br/>人工定义可检验假设]
+    C --> D[Backtest<br/>bid-ask/手续费/滑点/TTL]
+    D --> E[Walk-forward + 样本外验证]
+    E --> F{指标和稳定性通过?}
+    F -->|否| G[归档或修改假设]
+    F -->|是| H[Shadow / Paper Trading]
+    H --> I{运行门槛通过?}
+    I -->|否| G
+    I -->|是| J[人工 Gate Review]
+    J --> K{批准?}
+    K -->|否| G
+    K -->|是| L[创建新 rule_version<br/>记录 checksum 和报告]
+    L --> M[下一交易会话生效]
+
+    classDef llm fill:#e8f3f7,stroke:#176b87,stroke-width:1px,color:#102936;
+    classDef decision fill:#fff8e6,stroke:#9a6a16,stroke-width:1px,color:#3a2707;
+    classDef action fill:#eef7ef,stroke:#2f6f3e,stroke-width:1px,color:#16351f;
+    class B llm;
+    class F,I,K decision;
+    class C,D,E,H,J,L,M action;
+        </pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>7. LLM 输出标准</h2>
+      <p>所有 LLM 输出必须是结构化结果，方便系统记录、审计和后续验证。</p>
+      <div class="diagram-wrap">
+        <pre><code>{
+  "schema_version": "1.0",
+  "review_id": "llm_review_20260720_094501",
+  "plan_id": "plan_20260720_094501",
+  "review_status": "COMPLETED | UNAVAILABLE | INVALID",
+  "summary": "当前市场状态解释",
+  "decision_support": "支持或反对当前候选交易的理由",
+  "sop_alignment": "Aligned | Conflict | Unknown",
+  "risk_notes": [
+    "主要风险 1",
+    "主要风险 2"
+  ],
+  "invalidations": [
+    "失效条件 1",
+    "失效条件 2"
+  ],
+  "recommended_action": "Proceed | Wait | Cancel | Reduce Risk | Review Only",
+  "confidence": 0.0
+}</code></pre>
+      </div>
+    </section>
+
+    <footer>
+      文档版本：v0.3。风险声明：本文档用于系统设计和研究，不构成投资建议。QQQ 日内期期权尤其是 0DTE 期权具有高 Gamma、
+      高 Theta 和高滑点风险。LLM 输出只能作为辅助解释，不应作为独立交易依据。
+    </footer>
+  </main>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      securityLevel: "loose",
+      theme: "base",
+      themeVariables: {
+        primaryColor: "#ffffff",
+        primaryTextColor: "#1d2433",
+        primaryBorderColor: "#8fa4b2",
+        lineColor: "#5d6677",
+        secondaryColor: "#eef3f6",
+        tertiaryColor: "#f7f8fa",
+        fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, Arial"
+      },
+      flowchart: {
+        curve: "basis",
+        nodeSpacing: 42,
+        rankSpacing: 50
+      },
+      sequence: {
+        mirrorActors: false,
+        actorMargin: 60,
+        messageMargin: 42
+      }
+    });
+  </script>
+</body>
+</html>
