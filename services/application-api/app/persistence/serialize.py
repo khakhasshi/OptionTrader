@@ -15,9 +15,34 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from app.regime import RegimeState
-from app.strategy import NO_TRADE, StrategyDecision
+from app.regime import CHAOS, EVENT, NO_TRADE as REGIME_NO_TRADE, RANGE, TREND, RegimeState
+from app.strategy import (
+    EVENT_VOL_CRUSH,
+    LONG_GAMMA,
+    NO_TRADE as STRATEGY_NO_TRADE,
+    SHORT_PREMIUM,
+    StrategyDecision,
+)
 from app.vol import VolState
+
+_REGIME_CONTRACT = {
+    TREND: "Trend",
+    RANGE: "Range",
+    EVENT: "Event",
+    CHAOS: "Chaos",
+    REGIME_NO_TRADE: "NoTrade",
+}
+_STRATEGY_CONTRACT = {
+    LONG_GAMMA: "LongGamma",
+    SHORT_PREMIUM: "ShortPremium",
+    EVENT_VOL_CRUSH: "EventVolCrush",
+    STRATEGY_NO_TRADE: "NoTrade",
+}
+_INITIAL_RISK_CONTRACT = {
+    "PASS_READONLY": "PASSED",
+    "BLOCKED": "REJECTED",
+    "NOT_EVALUATED": "NOT_EVALUATED",
+}
 
 
 @dataclass(frozen=True)
@@ -31,6 +56,7 @@ class SignalContext:
     signal_id: str
     session_id: str
     occurred_at_utc: datetime
+    rule_version: str
 
 
 def _require_utc(ts: datetime) -> datetime:
@@ -40,6 +66,40 @@ def _require_utc(ts: datetime) -> datetime:
     if ts.utcoffset() != timezone.utc.utcoffset(None):
         raise ValueError("occurred_at_utc must be UTC")
     return ts
+
+
+def _contract_enum(mapping: dict[str, str], value: str, field: str) -> str:
+    try:
+        return mapping[value]
+    except KeyError as exc:
+        raise ValueError(f"unmapped {field} label: {value!r}") from exc
+
+
+def build_signal_contract(
+    ctx: SignalContext,
+    regime: RegimeState,
+    decision: StrategyDecision,
+) -> dict[str, object]:
+    """Build the schema-facing Signal object using contract enum values only."""
+    occurred_at_utc = _require_utc(ctx.occurred_at_utc)
+    if not ctx.signal_id or not ctx.session_id or not ctx.rule_version:
+        raise ValueError("signal_id, session_id and rule_version must be non-empty")
+    reason = [decision.reason, *decision.risk_notes]
+    if not all(reason):
+        raise ValueError("signal reasons must be non-empty")
+    return {
+        "schema_version": "1.0",
+        "signal_id": ctx.signal_id,
+        "session_id": ctx.session_id,
+        "occurred_at_utc": occurred_at_utc.isoformat().replace("+00:00", "Z"),
+        "regime": _contract_enum(_REGIME_CONTRACT, regime.regime, "regime"),
+        "strategy": _contract_enum(_STRATEGY_CONTRACT, decision.playbook, "strategy"),
+        "initial_risk_status": _contract_enum(
+            _INITIAL_RISK_CONTRACT, decision.risk_status, "initial risk status"
+        ),
+        "reason": reason,
+        "rule_version": ctx.rule_version,
+    }
 
 
 def _regime_payload(regime: RegimeState) -> dict[str, object]:
@@ -58,6 +118,7 @@ def _vol_payload(vol: VolState) -> dict[str, object]:
         "interpretation": vol.interpretation,
         "atm_iv": vol.atm_iv,
         "hv_20": vol.hv_20,
+        "hv_60": vol.hv_60,
         "iv_hv_ratio": vol.iv_hv_ratio,
         "implied_move": vol.implied_move,
         "realized_move": vol.realized_move,
@@ -88,11 +149,11 @@ def build_signal_rows(
     The No-Trade reason is recorded whenever the selected playbook is No Trade,
     capturing exactly why nothing was traded — the core review requirement.
     """
-    _require_utc(ctx.occurred_at_utc)
-
-    no_trade_reason = decision.reason if decision.playbook == NO_TRADE else None
+    signal_contract = build_signal_contract(ctx, regime, decision)
+    no_trade_reason = decision.reason if decision.playbook == STRATEGY_NO_TRADE else None
 
     payload = {
+        "signal": signal_contract,
         "regime": _regime_payload(regime),
         "vol": _vol_payload(vol),
         "strategy": _strategy_payload(decision),
@@ -102,9 +163,9 @@ def build_signal_rows(
         "signal_id": ctx.signal_id,
         "session_id": ctx.session_id,
         "occurred_at_utc": ctx.occurred_at_utc,
-        "regime": regime.regime,
+        "regime": signal_contract["regime"],
         "vol_state": vol.iv_hv_state,
-        "strategy_kind": decision.playbook,
+        "strategy_kind": signal_contract["strategy"],
         "no_trade_reason": no_trade_reason,
         "payload": payload,
     }
@@ -118,11 +179,15 @@ def build_signal_rows(
         "entity_type": "signal",
         "entity_id": ctx.signal_id,
         "from_status": None,
-        "to_status": decision.playbook,
-        "payload": {"reason": decision.reason, "risk_status": decision.risk_status},
+        "to_status": signal_contract["strategy"],
+        "payload": {
+            "reason": signal_contract["reason"],
+            "risk_status": signal_contract["initial_risk_status"],
+            "rule_version": signal_contract["rule_version"],
+        },
     }
 
     return signal_row, audit_row
 
 
-__all__ = ["SignalContext", "build_signal_rows"]
+__all__ = ["SignalContext", "build_signal_contract", "build_signal_rows"]

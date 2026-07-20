@@ -10,27 +10,49 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import json
 import os
+from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
+from jsonschema import Draft202012Validator
 import pytest
+from referencing import Registry, Resource
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import Engine
 
 from app.persistence import (
     SignalContext,
     audit_events,
+    build_signal_contract,
     build_signal_rows,
     metadata,
     persist_signal,
     signals,
 )
-from app.regime import RANGE, TREND, RegimeState
-from app.strategy import LONG_GAMMA, NO_TRADE, StrategyDecision
+from app.regime import CHAOS, EVENT, NO_TRADE as REGIME_NO_TRADE, RANGE, TREND, RegimeState
+from app.strategy import (
+    EVENT_VOL_CRUSH,
+    LONG_GAMMA,
+    NO_TRADE,
+    SHORT_PREMIUM,
+    StrategyDecision,
+)
 from app.vol import IV_CHEAP, IV_RICH, VolState
 
 UTC = timezone.utc
+_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _signal_validator() -> Draft202012Validator:
+    schema_dir = _ROOT / "packages/contracts/jsonschema"
+    resources = {
+        path.name: Resource.from_contents(json.loads(path.read_text()))
+        for path in schema_dir.glob("*.json")
+    }
+    registry = Registry().with_resources(list(resources.items()))
+    return Draft202012Validator(resources["signal.json"].contents, registry=registry)
 
 
 def _regime(kind: str = TREND) -> RegimeState:
@@ -74,6 +96,7 @@ def _ctx(signal_id: str = "sig-1") -> SignalContext:
         signal_id=signal_id,
         session_id="2026-07-09",
         occurred_at_utc=datetime(2026, 7, 9, 13, 45, tzinfo=UTC),
+        rule_version="rules_p1_1.0.0",
     )
 
 
@@ -82,14 +105,16 @@ def _ctx(signal_id: str = "sig-1") -> SignalContext:
 
 def test_serialize_traded_signal_has_no_no_trade_reason() -> None:
     sig, audit = build_signal_rows(_ctx(), _regime(), _vol(), _decision(LONG_GAMMA))
-    assert sig["strategy_kind"] == LONG_GAMMA
+    assert sig["strategy_kind"] == "LongGamma"
     assert sig["no_trade_reason"] is None
-    assert sig["regime"] == TREND
+    assert sig["regime"] == "Trend"
     assert sig["vol_state"] == IV_CHEAP
     payload = cast(dict[str, Any], sig["payload"])
     assert payload["regime"]["trend_score"] == 6
+    assert payload["vol"]["hv_60"] == 0.14
+    assert list(_signal_validator().iter_errors(payload["signal"])) == []
     assert audit["action"] == "SIGNAL_EMITTED"
-    assert audit["to_status"] == LONG_GAMMA
+    assert audit["to_status"] == "LongGamma"
     assert audit["entity_id"] == "sig-1"
 
 
@@ -101,7 +126,7 @@ def test_serialize_no_trade_records_reason() -> None:
         risk_notes=[],
     )
     sig, _ = build_signal_rows(_ctx(), _regime(), _vol(), decision)
-    assert sig["strategy_kind"] == NO_TRADE
+    assert sig["strategy_kind"] == "NoTrade"
     assert sig["no_trade_reason"] == "Trend but no confirmed opening-range breakout"
 
 
@@ -111,8 +136,93 @@ def test_serialize_captures_unavailable_inputs() -> None:
     assert payload["regime"]["unavailable"] == ["volume_vs_20d"]
 
 
+@pytest.mark.parametrize(
+    ("label", "contract_value"),
+    [
+        (TREND, "Trend"),
+        (RANGE, "Range"),
+        (EVENT, "Event"),
+        (CHAOS, "Chaos"),
+        (REGIME_NO_TRADE, "NoTrade"),
+    ],
+)
+def test_all_regime_labels_map_to_contract(label: str, contract_value: str) -> None:
+    signal = build_signal_contract(_ctx(), _regime(label), _decision())
+    assert signal["regime"] == contract_value
+
+
+@pytest.mark.parametrize(
+    ("label", "contract_value"),
+    [
+        (LONG_GAMMA, "LongGamma"),
+        (SHORT_PREMIUM, "ShortPremium"),
+        (EVENT_VOL_CRUSH, "EventVolCrush"),
+        (NO_TRADE, "NoTrade"),
+    ],
+)
+def test_all_strategy_labels_map_to_contract(label: str, contract_value: str) -> None:
+    signal = build_signal_contract(_ctx(), _regime(), _decision(label))
+    assert signal["strategy"] == contract_value
+
+
+@pytest.mark.parametrize(
+    ("risk_status", "contract_value"),
+    [
+        ("PASS_READONLY", "PASSED"),
+        ("BLOCKED", "REJECTED"),
+        ("NOT_EVALUATED", "NOT_EVALUATED"),
+    ],
+)
+def test_all_initial_risk_labels_map_to_contract(risk_status: str, contract_value: str) -> None:
+    decision = StrategyDecision(
+        playbook=LONG_GAMMA,
+        reason="contract mapping",
+        risk_status=risk_status,
+        risk_notes=[],
+    )
+    signal = build_signal_contract(_ctx(), _regime(), decision)
+    assert signal["initial_risk_status"] == contract_value
+
+
+def test_signal_contract_has_required_shape_and_validates_schema() -> None:
+    signal = build_signal_contract(_ctx(), _regime(), _decision())
+    assert set(signal) == {
+        "schema_version",
+        "signal_id",
+        "session_id",
+        "occurred_at_utc",
+        "regime",
+        "strategy",
+        "initial_risk_status",
+        "reason",
+        "rule_version",
+    }
+    assert list(_signal_validator().iter_errors(signal)) == []
+
+
+def test_unmapped_contract_labels_fail_closed() -> None:
+    with pytest.raises(ValueError, match="unmapped regime"):
+        build_signal_contract(_ctx(), _regime("Trendish"), _decision())
+    with pytest.raises(ValueError, match="unmapped strategy"):
+        build_signal_contract(_ctx(), _regime(), _decision("Gamma Maybe"))
+    unknown_risk = StrategyDecision(
+        playbook=LONG_GAMMA,
+        reason="bad risk status",
+        risk_status="MAYBE",
+        risk_notes=[],
+    )
+    with pytest.raises(ValueError, match="unmapped initial risk status"):
+        build_signal_contract(_ctx(), _regime(), unknown_risk)
+
+
+def test_signal_contract_requires_rule_version() -> None:
+    ctx = SignalContext("sig-1", "session-1", datetime(2026, 7, 9, tzinfo=UTC), "")
+    with pytest.raises(ValueError, match="rule_version"):
+        build_signal_contract(ctx, _regime(), _decision())
+
+
 def test_serialize_rejects_naive_timestamp() -> None:
-    ctx = SignalContext("sig-1", "2026-07-09", datetime(2026, 7, 9, 13, 45))
+    ctx = SignalContext("sig-1", "2026-07-09", datetime(2026, 7, 9, 13, 45), "rules-test")
     with pytest.raises(ValueError, match="timezone-aware"):
         build_signal_rows(ctx, _regime(), _vol(), _decision())
 
@@ -121,7 +231,9 @@ def test_serialize_rejects_non_utc_timestamp() -> None:
     from datetime import timedelta
 
     est = timezone(timedelta(hours=-5))
-    ctx = SignalContext("sig-1", "2026-07-09", datetime(2026, 7, 9, 8, 45, tzinfo=est))
+    ctx = SignalContext(
+        "sig-1", "2026-07-09", datetime(2026, 7, 9, 8, 45, tzinfo=est), "rules-test"
+    )
     with pytest.raises(ValueError, match="must be UTC"):
         build_signal_rows(ctx, _regime(), _vol(), _decision())
 
@@ -157,7 +269,7 @@ def test_persist_writes_signal_and_audit(engine: Engine) -> None:
         arows = conn.execute(select(audit_events)).mappings().all()
     assert len(srows) == 1
     assert len(arows) == 1
-    assert srows[0]["strategy_kind"] == LONG_GAMMA
+    assert srows[0]["strategy_kind"] == "LongGamma"
     assert arows[0]["entity_id"] == "sig-1"
     assert srows[0]["created_at_utc"] is not None
 
@@ -180,7 +292,7 @@ def test_persist_no_trade_reason_persisted(engine: Engine) -> None:
     persist_signal(engine, _ctx("sig-nt"), _regime(RANGE), _vol(IV_RICH), decision)
     with engine.connect() as conn:
         row = conn.execute(select(signals)).mappings().one()
-    assert row["strategy_kind"] == NO_TRADE
+    assert row["strategy_kind"] == "NoTrade"
     assert row["no_trade_reason"] == "regime=Chaos: conflicting trend/range signals"
 
 
@@ -208,6 +320,7 @@ def test_postgresql_migration_and_concurrent_idempotency() -> None:
         signal_id=signal_id,
         session_id=session_id,
         occurred_at_utc=datetime.now(UTC),
+        rule_version="rules_p1_1.0.0",
     )
     try:
         with pg_engine.begin() as conn:

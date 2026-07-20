@@ -51,7 +51,7 @@
 
 > Phase 1 职责说明：ThetaData v3 本地 SDK 当前通过 Python/gRPC 提供，因此历史下载属于 Python Research Job；进入交易许可链的标准化记录、DataHealth 与确定性底层特征仍以 Rust Market Core 为唯一权威。Python 同名计算仅用于离线研究和独立 fixture，不得作为 paper/live 交易许可输入。
 >
-> 2026-07-21 修复复测：`make test`（16 契约 / 34 React / 130 Python / 10 Rust）与 `make lint` 全部通过；另在隔离 PostgreSQL 16 上通过迁移、真实 FK/JSONB/timestamptz 和 4 路并发 signal 幂等测试。已覆盖固定 09:30 ET Opening Range、缺 bar 降级、provider VWAP、HV20/HV60 日线口径、同 expiry/同时间 straddle、Short Premium 完整门槛及 event/data-fault replay。进入 Phase 2 前仍需以真实 ThetaData 样本完成 entitlement/字段映射和 Rust runtime snapshot 接线验收。
+> 2026-07-21 修复复测：`make test`（16 契约 / 34 React / 145 Python / 10 Rust）与 `make lint` 全部通过；另在隔离 PostgreSQL 16 上通过迁移、真实 FK/JSONB/timestamptz 和 4 路并发 signal 幂等测试。已覆盖固定 09:30 ET Opening Range、缺 bar 降级、provider VWAP、HV20/HV60 日线口径、同 expiry/同时间 straddle、Short Premium 完整门槛、event/data-fault replay，以及完整 Signal label→contract enum 映射和 `signal.json` 校验。进入 Phase 2 前仍需以真实 ThetaData 样本完成 entitlement/字段映射和 Rust runtime snapshot 接线验收。
 
 ## Phase 2-6：见 PROJECT_PLAN.md 第 9 节
 

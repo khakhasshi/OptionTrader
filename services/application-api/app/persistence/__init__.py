@@ -7,12 +7,13 @@ the row shapes are testable without a database.
 """
 
 from app.persistence.repository import persist_signal
-from app.persistence.serialize import SignalContext, build_signal_rows
+from app.persistence.serialize import SignalContext, build_signal_contract, build_signal_rows
 from app.persistence.tables import audit_events, metadata, signals
 
 __all__ = [
     "SignalContext",
     "audit_events",
+    "build_signal_contract",
     "build_signal_rows",
     "metadata",
     "persist_signal",
