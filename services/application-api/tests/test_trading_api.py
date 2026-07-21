@@ -259,3 +259,92 @@ def test_latest_order_rejects_gateway_version_rollback(monkeypatch: pytest.Monke
     response = TestClient(main.app).get("/api/v1/trading/orders")
     assert response.status_code == 409
     assert response.json()["detail"] == "execution_reconciliation_required"
+
+
+def test_startup_restore_persists_successful_broker_auto_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working = _result("WORKING").order
+    assert working is not None
+    pending = working.model_copy(
+        update={"state": "RECONCILE_PENDING", "state_version": 2, "residual_exposure": True}
+    )
+    actions: list[str] = []
+    monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
+    monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: object())
+    monkeypatch.setattr(
+        main, "restorable_execution_workflow", lambda *_args: [(_plan(), working, "")]
+    )
+    monkeypatch.setattr(
+        main, "grpc_restore_workflow", lambda *_args: ([pending], [pending.order_id])
+    )
+    monkeypatch.setattr(main, "grpc_reconcile_execution_order", lambda *_args: working)
+
+    def persist(*_args: object, **kwargs: object) -> bool:
+        actions.append(str(kwargs["action"]))
+        return True
+
+    monkeypatch.setattr(
+        main,
+        "persist_order_projection",
+        persist,
+    )
+    assert main.restore_durable_execution_workflow() == (1, 0)
+    assert actions == ["PROCESS_RESTART_RECONCILIATION", "BROKER_AUTO_RECONCILED"]
+
+
+def test_startup_restore_keeps_unavailable_broker_order_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working = _result("WORKING").order
+    assert working is not None
+    pending = working.model_copy(
+        update={"state": "RECONCILE_PENDING", "state_version": 2, "residual_exposure": True}
+    )
+
+    class BrokerUnavailable(grpc.RpcError):  # type: ignore[misc]
+        pass
+
+    monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
+    monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: object())
+    monkeypatch.setattr(
+        main, "restorable_execution_workflow", lambda *_args: [(_plan(), working, "")]
+    )
+    monkeypatch.setattr(
+        main, "grpc_restore_workflow", lambda *_args: ([pending], [pending.order_id])
+    )
+    monkeypatch.setattr(
+        main,
+        "grpc_reconcile_execution_order",
+        lambda *_args: (_ for _ in ()).throw(BrokerUnavailable()),
+    )
+    monkeypatch.setattr(main, "persist_order_projection", lambda *_args, **_kwargs: True)
+    assert main.restore_durable_execution_workflow() == (1, 1)
+
+
+def test_startup_restore_counts_broker_pending_response_as_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working = _result("WORKING").order
+    assert working is not None
+    pending = working.model_copy(
+        update={"state": "RECONCILE_PENDING", "state_version": 2, "residual_exposure": True}
+    )
+    actions: list[str] = []
+    monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
+    monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: object())
+    monkeypatch.setattr(
+        main, "restorable_execution_workflow", lambda *_args: [(_plan(), working, "")]
+    )
+    monkeypatch.setattr(
+        main, "grpc_restore_workflow", lambda *_args: ([pending], [pending.order_id])
+    )
+    monkeypatch.setattr(main, "grpc_reconcile_execution_order", lambda *_args: pending)
+
+    def persist(*_args: object, **kwargs: object) -> bool:
+        actions.append(str(kwargs["action"]))
+        return True
+
+    monkeypatch.setattr(main, "persist_order_projection", persist)
+    assert main.restore_durable_execution_workflow() == (1, 1)
+    assert actions[-1] == "BROKER_RECONCILIATION_PENDING"

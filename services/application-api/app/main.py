@@ -50,6 +50,7 @@ from app.trading.grpc_client import (
     cancel_order as grpc_cancel_order,
     confirm_candidate as grpc_confirm_candidate,
     get_order as grpc_get_order,
+    reconcile_execution_order as grpc_reconcile_execution_order,
     restore_workflow as grpc_restore_workflow,
     stage_candidate as grpc_stage_candidate,
 )
@@ -112,7 +113,23 @@ def restore_durable_execution_workflow() -> tuple[int, int]:
             ),
             actor="rust-execution-gateway",
         )
-    return len(restored), len(reconciliation_ids)
+    unresolved = 0
+    for order_id in reconciliation_ids:
+        try:
+            reconciled = grpc_reconcile_execution_order(order_id)
+        except grpc.RpcError:
+            unresolved += 1
+            continue
+        still_pending = reconciled.state == "RECONCILE_PENDING"
+        if still_pending:
+            unresolved += 1
+        persist_order_projection(
+            engine,
+            reconciled,
+            action=("BROKER_RECONCILIATION_PENDING" if still_pending else "BROKER_AUTO_RECONCILED"),
+            actor="rust-execution-gateway",
+        )
+    return len(restored), unresolved
 
 
 @asynccontextmanager

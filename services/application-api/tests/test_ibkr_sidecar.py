@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from time import sleep
 from app.grpc_gen import broker_pb2
 from app.ibkr_sidecar.config import IbkrEndpointConfig
-from app.ibkr_sidecar.mapping import map_submit_request
+from app.ibkr_sidecar.mapping import IbkrContractSpec, IbkrOrderSpec, map_submit_request
 from app.ibkr_sidecar.native import IbkrSocketClient
-from app.ibkr_sidecar.service import IbkrBrokerService, NativeIbkrBackend
+from app.ibkr_sidecar.service import IbkrBrokerService, NativeIbkrBackend, _execution_time
 from app.grpc_gen import broker_pb2_grpc
 import grpc
 import pytest
@@ -127,9 +129,29 @@ def test_native_client_cannot_submit_before_explicit_enable_and_handshake() -> N
 
 class _FakeNativeClient:
     def __init__(self) -> None:
-        self.config = SimpleNamespace(account="DU123")
+        self.config = SimpleNamespace(account="DU123", timezone="America/New_York")
         self.placed = 0
         self.cancelled: list[int] = []
+        self.orders: list[dict[str, object]] = [
+            {
+                "broker_order_id": "901",
+                "contract_id": "999",
+                "contract_ids": [999],
+                "combo_actions": [],
+                "sec_type": "OPT",
+                "symbol": "QQQ",
+                "exchange": "SMART",
+                "order_ref": "external",
+                "quantity": 1,
+                "filled": 0,
+                "status": "Submitted",
+                "side": "BUY",
+                "order_type": "LMT",
+                "submitted_price": "1.00",
+                "algo_strategy": "",
+                "adaptive_priority": "",
+            }
+        ]
 
     def refresh_snapshot(self) -> None:
         return
@@ -140,22 +162,12 @@ class _FakeNativeClient:
             "reconciled": True,
             "account": {"BuyingPower": "10000", "NetLiquidation": "25000", "Currency": "USD"},
             "positions": [{"contract_id": "101", "quantity": 2, "average_price": "1.25"}],
-            "orders": [
-                {
-                    "broker_order_id": "901",
-                    "contract_id": "999",
-                    "quantity": 1,
-                    "filled": 0,
-                    "status": "Submitted",
-                    "side": "BUY",
-                    "order_type": "LMT",
-                    "submitted_price": "1.00",
-                }
-            ],
+            "orders": list(self.orders),
             "fills": [
                 {
                     "fill_id": "fill-1",
                     "broker_order_id": "900",
+                    "order_ref": "",
                     "contract_id": "101",
                     "side": "BOT",
                     "quantity": 1,
@@ -165,8 +177,29 @@ class _FakeNativeClient:
             ],
         }
 
-    def place_order(self, _contract: object, _order: object) -> int:
+    def place_order(self, contract: IbkrContractSpec, order: IbkrOrderSpec) -> int:
         self.placed += 1
+        sleep(0.01)
+        self.orders.append(
+            {
+                "broker_order_id": "900",
+                "contract_id": "",
+                "contract_ids": [leg.con_id for leg in contract.combo_legs],
+                "combo_actions": [leg.action for leg in contract.combo_legs],
+                "sec_type": contract.sec_type,
+                "symbol": contract.symbol,
+                "exchange": contract.exchange,
+                "order_ref": order.order_ref,
+                "quantity": order.quantity,
+                "filled": 0,
+                "status": "Submitted",
+                "side": order.action,
+                "order_type": order.order_type,
+                "submitted_price": str(order.limit_price or ""),
+                "algo_strategy": "Adaptive" if order.adaptive_priority else "",
+                "adaptive_priority": order.adaptive_priority or "",
+            }
+        )
         return 900
 
     def cancel_order(self, order_id: int) -> None:
@@ -187,8 +220,58 @@ def test_native_backend_projects_full_snapshot_and_idempotent_mutations() -> Non
     assert snapshot.orders[0].plan_hash == "a" * 64
     assert snapshot.orders[1].idempotency_key == "external:901"
     assert snapshot.account.reconciled is False
+    assert snapshot.account.health == broker_pb2.BROKER_HEALTH_RECONCILING
     backend.cancel("900")
     assert client.cancelled == [900]
+
+
+def test_native_backend_recovers_remote_order_after_restart_without_resubmit() -> None:
+    client = _FakeNativeClient()
+    first = NativeIbkrBackend(client)  # type: ignore[arg-type]
+    assert first.submit(_request()).broker_order_id == "900"
+
+    restarted = NativeIbkrBackend(client)  # type: ignore[arg-type]
+    recovered = restarted.submit(_request())
+    assert recovered.broker_order_id == "900"
+    assert recovered.idempotency_key == "submit-key"
+    assert client.placed == 1
+
+    read_only_restart = NativeIbkrBackend(client)  # type: ignore[arg-type]
+    recovered_read_only = read_only_restart.recover(_request(), "900")
+    assert recovered_read_only.broker_order_id == "900"
+    assert client.placed == 1
+
+
+def test_read_only_recovery_never_submits_a_missing_order() -> None:
+    client = _FakeNativeClient()
+    backend = NativeIbkrBackend(client)  # type: ignore[arg-type]
+    with pytest.raises(KeyError, match="not found"):
+        backend.recover(_request(), "900")
+    assert client.placed == 0
+
+
+def test_native_backend_serializes_concurrent_idempotent_submit() -> None:
+    client = _FakeNativeClient()
+    backend = NativeIbkrBackend(client)  # type: ignore[arg-type]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: backend.submit(_request()), range(2)))
+    assert [item.broker_order_id for item in results] == ["900", "900"]
+    assert client.placed == 1
+
+
+def test_missing_locally_known_active_order_keeps_account_reconciling() -> None:
+    client = _FakeNativeClient()
+    backend = NativeIbkrBackend(client)  # type: ignore[arg-type]
+    backend.submit(_request())
+    client.orders = []
+    snapshot = backend.snapshot()
+    assert snapshot.account.health == broker_pb2.BROKER_HEALTH_RECONCILING
+    assert snapshot.account.reconciled is False
+
+
+def test_execution_timestamp_uses_configured_or_explicit_timezone() -> None:
+    assert _execution_time("20260721 10:30:00", "Asia/Shanghai") == "2026-07-21T02:30:00Z"
+    assert _execution_time("20260721 10:30:00 UTC", "Asia/Shanghai") == ("2026-07-21T10:30:00Z")
 
 
 class _GrpcBackend:
@@ -218,6 +301,17 @@ class _GrpcBackend:
     def cancel(self, broker_order_id: str) -> broker_pb2.BrokerOrderSnapshot:
         return broker_pb2.BrokerOrderSnapshot(broker_order_id=broker_order_id)
 
+    def recover(
+        self,
+        request: broker_pb2.SubmitBrokerOrderRequest,
+        expected_broker_order_id: str,
+    ) -> broker_pb2.BrokerOrderSnapshot:
+        return broker_pb2.BrokerOrderSnapshot(
+            broker_order_id=expected_broker_order_id,
+            idempotency_key=request.idempotency_key,
+            plan_hash=request.plan_hash,
+        )
+
 
 def test_ibkr_loopback_grpc_snapshot_and_reconcile_contract() -> None:
     async def scenario() -> None:
@@ -240,6 +334,12 @@ def test_ibkr_loopback_grpc_snapshot_and_reconcile_contract() -> None:
                 )
             )
             assert reconciled.matched is True
+            recovered = await stub.RecoverBrokerOrder(
+                broker_pb2.RecoverBrokerOrderRequest(
+                    expected_order=_request(), expected_broker_order_id="900"
+                )
+            )
+            assert recovered.broker_order_id == "900"
         finally:
             await channel.close()
             await server.stop(None)

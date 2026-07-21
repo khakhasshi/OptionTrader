@@ -23,6 +23,7 @@ class IbkrSocketClient:
         self._next_order_id: int | None = None
         self._id_lock = Lock()
         self._message_lock = Lock()
+        self._refresh_lock = Lock()
         self._last_message_at = 0.0
         self._ready = Event()
         self._accounts = Event()
@@ -103,18 +104,35 @@ class IbkrSocketClient:
 
             def openOrder(self, order_id: int, contract: Any, order: Any, order_state: Any) -> None:  # noqa: N802
                 order_type = str(getattr(order, "orderType", ""))
+                combo_legs = list(getattr(contract, "comboLegs", []) or [])
+                algo_params = list(getattr(order, "algoParams", []) or [])
                 with owner._snapshot_lock:
                     owner._open_orders[order_id] = {
                         "broker_order_id": str(order_id),
                         "contract_id": str(
                             getattr(contract, "conId", "") or getattr(contract, "localSymbol", "")
                         ),
+                        "contract_ids": [int(getattr(leg, "conId", 0)) for leg in combo_legs]
+                        or [int(getattr(contract, "conId", 0))],
+                        "combo_actions": [str(getattr(leg, "action", "")) for leg in combo_legs],
+                        "sec_type": str(getattr(contract, "secType", "")),
+                        "symbol": str(getattr(contract, "symbol", "")),
+                        "exchange": str(getattr(contract, "exchange", "")),
                         "order_ref": str(getattr(order, "orderRef", "")),
                         "side": str(getattr(order, "action", "")),
                         "order_type": order_type,
                         "quantity": int(getattr(order, "totalQuantity", 0)),
                         "submitted_price": (
                             "" if order_type == "MKT" else str(getattr(order, "lmtPrice", "") or "")
+                        ),
+                        "algo_strategy": str(getattr(order, "algoStrategy", "")),
+                        "adaptive_priority": next(
+                            (
+                                str(getattr(item, "value", ""))
+                                for item in algo_params
+                                if str(getattr(item, "tag", "")) == "adaptivePriority"
+                            ),
+                            "",
                         ),
                         "status": str(getattr(order_state, "status", "")),
                         "filled": 0,
@@ -151,6 +169,7 @@ class IbkrSocketClient:
                     owner._executions[fill_id] = {
                         "fill_id": fill_id,
                         "broker_order_id": str(getattr(execution, "orderId", "")),
+                        "order_ref": str(getattr(execution, "orderRef", "")),
                         "contract_id": str(
                             getattr(contract, "conId", "") or getattr(contract, "localSymbol", "")
                         ),
@@ -235,27 +254,28 @@ class IbkrSocketClient:
         self._app.cancelOrder(order_id, "")
 
     def refresh_snapshot(self) -> None:
-        if not self.ready:
-            raise ConnectionError("IBKR connection is not ready")
-        for event in self._snapshot_events.values():
-            event.clear()
-        with self._snapshot_lock:
-            self._account_values.clear()
-            self._positions.clear()
-            self._open_orders.clear()
-            self._executions.clear()
-        self._app.reqAccountSummary(90_001, "All", "BuyingPower,NetLiquidation")
-        self._app.reqPositions()
-        self._app.reqAllOpenOrders()
-        execution_filter = self._types["ExecutionFilter"]()
-        execution_filter.acctCode = self.config.account
-        self._app.reqExecutions(90_002, execution_filter)
-        deadline = monotonic() + self.config.connect_timeout_seconds
-        for event in self._snapshot_events.values():
-            remaining = deadline - monotonic()
-            if remaining <= 0 or not event.wait(remaining):
-                self._ready.clear()
-                raise TimeoutError("IBKR account/order/fill snapshot timed out")
+        with self._refresh_lock:
+            if not self.ready:
+                raise ConnectionError("IBKR connection is not ready")
+            for event in self._snapshot_events.values():
+                event.clear()
+            with self._snapshot_lock:
+                self._account_values.clear()
+                self._positions.clear()
+                self._open_orders.clear()
+                self._executions.clear()
+            self._app.reqAccountSummary(90_001, "All", "BuyingPower,NetLiquidation")
+            self._app.reqPositions()
+            self._app.reqAllOpenOrders()
+            execution_filter = self._types["ExecutionFilter"]()
+            execution_filter.acctCode = self.config.account
+            self._app.reqExecutions(90_002, execution_filter)
+            deadline = monotonic() + self.config.connect_timeout_seconds
+            for event in self._snapshot_events.values():
+                remaining = deadline - monotonic()
+                if remaining <= 0 or not event.wait(remaining):
+                    self._ready.clear()
+                    raise TimeoutError("IBKR account/order/fill snapshot timed out")
 
     def snapshot(self) -> dict[str, object]:
         with self._snapshot_lock:

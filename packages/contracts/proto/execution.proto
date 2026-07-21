@@ -284,6 +284,10 @@ message GetOrderRequest {
   string order_id = 1;
 }
 
+message ReconcileExecutionOrderRequest {
+  string order_id = 1;
+}
+
 message RestorableExecutionOrder {
   CandidateTradePlan plan = 1;
   ExecutionOrder order = 2;
@@ -307,5 +311,6 @@ service RiskExecutionService {
   rpc ConfirmCandidate(ConfirmCandidateRequest) returns (ExecutionOrder);
   rpc CancelOrder(CancelOrderRequest) returns (ExecutionOrder);
   rpc GetOrder(GetOrderRequest) returns (ExecutionOrder);
+  rpc ReconcileExecutionOrder(ReconcileExecutionOrderRequest) returns (ExecutionOrder);
   rpc RestoreWorkflow(RestoreWorkflowRequest) returns (RestoreWorkflowResponse);
 }

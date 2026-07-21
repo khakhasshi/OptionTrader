@@ -20,10 +20,10 @@ use optiontrader_proto::execution_v1::{
     EventRiskFlag as ProtoEventFlag, ExecutionChildOrder as ProtoChildOrder,
     ExecutionChildOrderState as ProtoChildState, ExecutionMode as ProtoMode,
     ExecutionOrder as ProtoOrder, ExecutionOrderState as ProtoOrderState, GetOrderRequest,
-    OptionRight as ProtoRight, OrderSide as ProtoSide, RestorableExecutionOrder,
-    RestoreWorkflowRequest, RestoreWorkflowResponse, RiskDecision as ProtoDecision,
-    RiskDecisionKind, RiskReasonCode as ProtoReason, StageCandidateResponse,
-    StrategyKind as ProtoStrategy,
+    OptionRight as ProtoRight, OrderSide as ProtoSide, ReconcileExecutionOrderRequest,
+    RestorableExecutionOrder, RestoreWorkflowRequest, RestoreWorkflowResponse,
+    RiskDecision as ProtoDecision, RiskDecisionKind, RiskReasonCode as ProtoReason,
+    StageCandidateResponse, StrategyKind as ProtoStrategy,
 };
 use prost::Message;
 use risk_gateway::{
@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+use crate::broker_registry::{expected_request, BrokerRecoveryError, BrokerSnapshotAuthority};
 use crate::grpc::{LiveMarketServiceImpl, MarketServiceImpl};
 use crate::option_registry::OptionRegistryAuthority;
 
@@ -228,6 +229,7 @@ pub struct RiskExecutionServiceImpl {
     workflow: Arc<Mutex<Workflow>>,
     clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     options: OptionRegistryAuthority,
+    broker_snapshots: BrokerSnapshotAuthority,
 }
 
 struct StagedOrder {
@@ -266,6 +268,7 @@ impl RiskExecutionServiceImpl {
                 std::env::var("THETADATA_SDK_GRPC")
                     .unwrap_or_else(|_| "http://127.0.0.1:50052".into()),
             ),
+            broker_snapshots: BrokerSnapshotAuthority::from_env(),
         }
     }
 
@@ -281,7 +284,12 @@ impl RiskExecutionServiceImpl {
             workflow: Arc::new(Mutex::new(Workflow::default())),
             clock: Arc::new(clock),
             options: OptionRegistryAuthority::Fixture,
+            broker_snapshots: BrokerSnapshotAuthority::Fixed(Err(BrokerRecoveryError::Unavailable)),
         }
+    }
+
+    pub fn broker_handle(&self) -> Arc<RwLock<BrokerAuthority>> {
+        Arc::clone(&self.broker)
     }
 
     async fn evaluate_raw(
@@ -289,6 +297,7 @@ impl RiskExecutionServiceImpl {
         raw_plan: Option<&ProtoPlan>,
         raw_event: Option<&ProtoEventContext>,
         now: DateTime<Utc>,
+        refresh_options: bool,
     ) -> Result<ProtoDecision, Status> {
         let Some(raw_plan) = raw_plan else {
             return Ok(rejected(None, now, ProtoReason::PlanInvalid));
@@ -297,7 +306,7 @@ impl RiskExecutionServiceImpl {
             Ok(value) => value,
             Err(_) => return Ok(rejected(Some(raw_plan), now, ProtoReason::PlanInvalid)),
         };
-        if !self.options.verify(raw_plan, now).await {
+        if !self.options.verify(raw_plan, now, refresh_options).await {
             return Ok(rejected(
                 Some(raw_plan),
                 now,
@@ -476,7 +485,7 @@ fn broker_legs(
         .collect()
 }
 
-fn priced_broker_order(
+pub(super) fn priced_broker_order(
     raw: &ProtoPlan,
     now: DateTime<Utc>,
 ) -> Result<
@@ -573,6 +582,24 @@ fn priced_broker_order(
         }
     }
     Ok((side, order_type, submitted_price, legs))
+}
+
+fn recovery_pricing_time(raw: &ProtoPlan) -> Result<DateTime<Utc>, BrokerError> {
+    raw.legs
+        .iter()
+        .map(|leg| {
+            leg.quote
+                .as_ref()
+                .ok_or(BrokerError::QuoteUnavailable)
+                .and_then(|quote| {
+                    utc(&quote.occurred_at_utc, "quote time")
+                        .map_err(|_| BrokerError::QuoteUnavailable)
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .min()
+        .ok_or(BrokerError::QuoteUnavailable)
 }
 
 fn map_adaptive_error(error: AdaptivePriceError) -> BrokerError {
@@ -1105,7 +1132,7 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
         let now = (self.clock)();
         let raw = request.into_inner();
         Ok(Response::new(
-            self.evaluate_raw(raw.plan.as_ref(), raw.event_context.as_ref(), now)
+            self.evaluate_raw(raw.plan.as_ref(), raw.event_context.as_ref(), now, false)
                 .await?,
         ))
     }
@@ -1117,7 +1144,7 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
         let now = (self.clock)();
         let raw = request.into_inner();
         let decision = self
-            .evaluate_raw(raw.plan.as_ref(), raw.event_context.as_ref(), now)
+            .evaluate_raw(raw.plan.as_ref(), raw.event_context.as_ref(), now, false)
             .await?;
         if decision.decision != RiskDecisionKind::Approved as i32 {
             return Ok(Response::new(StageCandidateResponse {
@@ -1218,7 +1245,7 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
             staged.raw_plan.clone()
         };
         let decision = self
-            .evaluate_raw(Some(&stored_plan), raw.event_context.as_ref(), now)
+            .evaluate_raw(Some(&stored_plan), raw.event_context.as_ref(), now, true)
             .await?;
         let mut workflow = workflow_lock(self)
             .map_err(|()| Status::internal("execution workflow lock poisoned"))?;
@@ -1391,6 +1418,125 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
         Ok(Response::new(order_proto(staged, now)))
     }
 
+    async fn reconcile_execution_order(
+        &self,
+        request: Request<ReconcileExecutionOrderRequest>,
+    ) -> Result<Response<ProtoOrder>, Status> {
+        let now = (self.clock)();
+        let order_id = request.into_inner().order_id;
+        let (raw_plan, broker_order_id, total_quantity) =
+            {
+                let workflow = workflow_lock(self)
+                    .map_err(|()| Status::internal("execution workflow lock poisoned"))?;
+                let staged = workflow
+                    .orders
+                    .get(&order_id)
+                    .ok_or_else(|| Status::not_found("order not found"))?;
+                if staged.record.state != OrderState::ReconcilePending {
+                    return Err(Status::failed_precondition(
+                        "order does not require broker reconciliation",
+                    ));
+                }
+                (
+                    staged.raw_plan.clone(),
+                    staged.record.broker_order_id.clone().ok_or_else(|| {
+                        Status::failed_precondition("broker order id is unavailable")
+                    })?,
+                    staged.record.total_quantity,
+                )
+            };
+        let pricing_time = recovery_pricing_time(&raw_plan)
+            .map_err(|_| Status::failed_precondition("durable pricing proof is invalid"))?;
+        let (side, order_type, submitted_price, legs) =
+            priced_broker_order(&raw_plan, pricing_time)
+                .map_err(|_| Status::failed_precondition("durable order proof is invalid"))?;
+        let expected = expected_request(
+            match ProtoBrokerId::try_from(raw_plan.broker_id).ok() {
+                Some(ProtoBrokerId::Longbridge) => {
+                    optiontrader_proto::broker_v1::BrokerId::Longbridge as i32
+                }
+                Some(ProtoBrokerId::Ibkr) => optiontrader_proto::broker_v1::BrokerId::Ibkr as i32,
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "durable broker route is invalid",
+                    ))
+                }
+            },
+            broker::BrokerOrderRequest {
+                idempotency_key: raw_plan.idempotency_key.clone(),
+                plan_hash: raw_plan.plan_hash.clone(),
+                side,
+                order_type,
+                total_quantity,
+                submitted_price,
+                legs,
+            },
+        );
+        let recovered = match self
+            .broker_snapshots
+            .recover(expected, broker_order_id, now)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let mut broker = self
+                    .broker
+                    .write()
+                    .map_err(|_| Status::internal("broker authority lock poisoned"))?;
+                broker.health = BrokerHealth::Reconciling;
+                broker.reconciled = false;
+                return Err(match error {
+                    BrokerRecoveryError::Unavailable => {
+                        Status::unavailable("broker recovery authority is unavailable")
+                    }
+                    BrokerRecoveryError::UnsupportedBroker => {
+                        Status::failed_precondition("broker recovery route is not certified")
+                    }
+                    BrokerRecoveryError::InvalidSnapshot
+                    | BrokerRecoveryError::NotReconciled
+                    | BrokerRecoveryError::OrderConflict => {
+                        Status::failed_precondition("broker recovery proof did not reconcile")
+                    }
+                });
+            }
+        };
+        let (response, reconciliation_remains) = {
+            let mut workflow = workflow_lock(self)
+                .map_err(|()| Status::internal("execution workflow lock poisoned"))?;
+            let staged = workflow
+                .orders
+                .get_mut(&order_id)
+                .ok_or_else(|| Status::not_found("order disappeared during reconciliation"))?;
+            if staged.record.state != OrderState::ReconcilePending {
+                return Err(Status::failed_precondition(
+                    "order changed during broker reconciliation",
+                ));
+            }
+            staged
+                .record
+                .apply_broker_order(&recovered.order, now)
+                .map_err(|_| Status::failed_precondition("broker order conflicts with workflow"))?;
+            let response = order_proto(staged, now);
+            let remains = workflow
+                .orders
+                .values()
+                .any(|entry| entry.record.state == OrderState::ReconcilePending);
+            (response, remains)
+        };
+        let mut broker = self
+            .broker
+            .write()
+            .map_err(|_| Status::internal("broker authority lock poisoned"))?;
+        broker.buying_power = recovered.buying_power;
+        broker.health = if reconciliation_remains {
+            BrokerHealth::Reconciling
+        } else {
+            BrokerHealth::Healthy
+        };
+        broker.reconciled = !reconciliation_remains;
+        Ok(Response::new(response))
+    }
+
     async fn restore_workflow(
         &self,
         request: Request<RestoreWorkflowRequest>,
@@ -1458,6 +1604,16 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
             }
             orders.push(order_proto(&staged, now));
             workflow.orders.insert(order_id, staged);
+        }
+        let reconciliation_required = !reconciliation_order_ids.is_empty();
+        drop(workflow);
+        if reconciliation_required {
+            let mut broker = self
+                .broker
+                .write()
+                .map_err(|_| Status::internal("broker authority lock poisoned"))?;
+            broker.health = BrokerHealth::Reconciling;
+            broker.reconciled = false;
         }
         Ok(Response::new(RestoreWorkflowResponse {
             orders,
@@ -1931,6 +2087,11 @@ mod tests {
         );
         assert!(response.orders[0].residual_exposure);
         assert_eq!(response.orders[0].state_version, working.state_version + 1);
+        {
+            let authority = restarted.broker.read().unwrap();
+            assert_eq!(authority.health, BrokerHealth::Reconciling);
+            assert!(!authority.reconciled);
+        }
 
         let repeated = restarted
             .restore_workflow(Request::new(RestoreWorkflowRequest {
@@ -1947,6 +2108,71 @@ mod tests {
             repeated.orders[0].state_version,
             response.orders[0].state_version
         );
+    }
+
+    #[tokio::test]
+    async fn broker_proof_resolves_restart_reconciliation_and_reopens_authority() {
+        let original = service();
+        let staged = stage(&original, ProtoMode::Paper).await;
+        let awaiting = staged.order.unwrap();
+        let working = original
+            .confirm_candidate(Request::new(ConfirmCandidateRequest {
+                order_id: awaiting.order_id,
+                confirmed_plan_hash: awaiting.plan_hash,
+                confirmation_token: staged.confirmation_token,
+                event_context: Some(context()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let raw_plan = candidate(ProtoMode::Paper);
+        let (side, order_type, submitted_price, legs) =
+            priced_broker_order(&raw_plan, now()).unwrap();
+        let mut restarted = service();
+        restarted.broker_snapshots =
+            BrokerSnapshotAuthority::Fixed(Ok(crate::broker_registry::RecoveredBrokerOrder {
+                order: broker::BrokerOrder {
+                    broker_order_id: working.broker_order_id.clone(),
+                    idempotency_key: raw_plan.idempotency_key.clone(),
+                    plan_hash: raw_plan.plan_hash.clone(),
+                    status: AdapterOrderStatus::Working,
+                    side,
+                    order_type,
+                    total_quantity: working.total_quantity,
+                    filled_quantity: 0,
+                    submitted_price,
+                    legs,
+                    child_orders: Vec::new(),
+                    residual_exposure: false,
+                },
+                buying_power: Decimal::new(75_000, 0),
+            }));
+        restarted
+            .restore_workflow(Request::new(RestoreWorkflowRequest {
+                entries: vec![RestorableExecutionOrder {
+                    plan: Some(raw_plan),
+                    order: Some(working.clone()),
+                    confirmation_token: String::new(),
+                }],
+            }))
+            .await
+            .unwrap();
+        let reconciled = restarted
+            .reconcile_execution_order(Request::new(ReconcileExecutionOrderRequest {
+                order_id: working.order_id,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            ProtoOrderState::try_from(reconciled.state).unwrap(),
+            ProtoOrderState::Working
+        );
+        assert!(!reconciled.residual_exposure);
+        let authority = restarted.broker.read().unwrap();
+        assert_eq!(authority.health, BrokerHealth::Healthy);
+        assert!(authority.reconciled);
+        assert_eq!(authority.buying_power, Decimal::new(75_000, 0));
     }
 
     #[tokio::test]

@@ -352,6 +352,20 @@ def get_order(order_id: str, *, target: str | None = None) -> ExecutionOrder:
         channel.close()
 
 
+def reconcile_execution_order(order_id: str, *, target: str | None = None) -> ExecutionOrder:
+    channel = grpc.insecure_channel(target or TRADING_CORE_GRPC)
+    try:
+        stub = execution_pb2_grpc.RiskExecutionServiceStub(channel)
+        return order_from_proto(
+            stub.ReconcileExecutionOrder(
+                execution_pb2.ReconcileExecutionOrderRequest(order_id=order_id),
+                timeout=10,
+            )
+        )
+    finally:
+        channel.close()
+
+
 def restore_workflow(
     entries: list[tuple[CandidateTradePlan, ExecutionOrder, str]],
     *,
@@ -389,6 +403,7 @@ __all__ = [
     "event_context_hash",
     "event_context_proto",
     "get_order",
+    "reconcile_execution_order",
     "order_from_proto",
     "stage_candidate",
 ]

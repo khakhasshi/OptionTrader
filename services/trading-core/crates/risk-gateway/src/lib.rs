@@ -341,7 +341,7 @@ fn quote_reasons(input: &FinalRiskInput, reasons: &mut BTreeSet<RiskReasonCode>)
             reasons.insert(RiskReasonCode::QuoteSpreadTooWide);
         }
         if quote.delta.abs() > Decimal::ONE
-            || quote.gamma < Decimal::ZERO
+            || quote.gamma <= Decimal::ZERO
             || quote.gamma > Decimal::from(10u32)
             || quote.vega < Decimal::ZERO
             || quote.vega > Decimal::from(100u32)

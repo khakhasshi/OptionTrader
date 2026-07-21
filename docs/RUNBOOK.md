@@ -83,7 +83,9 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
 6. Application API 启动时会从 PostgreSQL 读取 plan/order/capability 并调用 Rust
    `RestoreWorkflow`：未 claim 且未过期的确认能力原样恢复；终态保持终态；已提交、已 claim、
    过期但结果不明的订单统一进入 `RECONCILE_PENDING`，版本号加一且残余敞口置 true。返回的
-   `reconciliation_order_ids` 必须逐个对 Broker truth；不得删除数据库行或重建计划绕过。
+   `reconciliation_order_ids` 会逐个调用 Rust 对账。IBKR 恢复只读匹配 native id/orderRef/完整
+   订单形状，再要求新鲜、HEALTHY、已对账账户快照；成功结果回写 PostgreSQL。失败或 Longbridge
+   未认证路径保持 unresolved/RECONCILING；不得删除数据库行或重建计划绕过。
 7. 订单进入 `RECONCILE_PENDING`、BrokerHealth 非 HEALTHY、账本不一致或 kill switch
    激活时，禁止新开仓；撤单/减仓恢复路径不得依赖 LLM。
 8. capability claim 使用 PostgreSQL 行锁，可跨 API worker 仲裁；CLI worker 参数不再是

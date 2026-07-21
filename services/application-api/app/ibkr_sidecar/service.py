@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from threading import Lock
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -11,7 +12,7 @@ from zoneinfo import ZoneInfo
 import grpc
 
 from app.grpc_gen import broker_pb2, broker_pb2_grpc
-from app.ibkr_sidecar.mapping import map_submit_request
+from app.ibkr_sidecar.mapping import IbkrContractSpec, IbkrOrderSpec, map_submit_request
 from app.ibkr_sidecar.native import IbkrSocketClient
 
 
@@ -23,6 +24,12 @@ class IbkrBackend(Protocol):
     ) -> broker_pb2.BrokerOrderSnapshot: ...
 
     def cancel(self, broker_order_id: str) -> broker_pb2.BrokerOrderSnapshot: ...
+
+    def recover(
+        self,
+        request: broker_pb2.SubmitBrokerOrderRequest,
+        expected_broker_order_id: str,
+    ) -> broker_pb2.BrokerOrderSnapshot: ...
 
 
 def _status(value: str) -> Any:
@@ -45,19 +52,55 @@ def _side(value: str) -> Any:
     return broker_pb2.ORDER_SIDE_UNSPECIFIED
 
 
-def _execution_time(value: str) -> str:
-    for suffix in (" US/Eastern", " America/New_York"):
-        if value.endswith(suffix):
-            value = value[: -len(suffix)]
-    for pattern in ("%Y%m%d %H:%M:%S %Z", "%Y%m%d %H:%M:%S"):
-        try:
-            parsed = datetime.strptime(value, pattern)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=ZoneInfo("America/New_York"))
-            return parsed.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-        except ValueError:
-            continue
-    raise ValueError("IBKR execution timestamp is invalid")
+def _execution_time(value: str, default_timezone: str) -> str:
+    timezone_name = default_timezone
+    aliases = {"US/Eastern": "America/New_York", "UTC": "UTC", "GMT": "UTC"}
+    parts = value.rsplit(" ", 1)
+    if len(parts) == 2 and (parts[1] in aliases or "/" in parts[1] or parts[1] in {"UTC", "GMT"}):
+        value, timezone_name = parts[0], aliases.get(parts[1], parts[1])
+    try:
+        parsed = datetime.strptime(value, "%Y%m%d %H:%M:%S")
+        parsed = parsed.replace(tzinfo=ZoneInfo(timezone_name))
+    except (ValueError, KeyError) as exc:
+        raise ValueError("IBKR execution timestamp is invalid") from exc
+    return parsed.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _decimal_matches(raw: object, expected: Decimal | None) -> bool:
+    if expected is None:
+        return str(raw or "") == ""
+    try:
+        actual = Decimal(str(raw))
+    except InvalidOperation:
+        return False
+    return actual.is_finite() and actual == expected
+
+
+def _remote_order_matches(
+    raw: dict[str, object], contract: IbkrContractSpec, order: IbkrOrderSpec
+) -> bool:
+    expected_contract_ids = (
+        [leg.con_id for leg in contract.combo_legs] if contract.combo_legs else [contract.con_id]
+    )
+    expected_combo_actions = [leg.action for leg in contract.combo_legs]
+    raw_contract_ids = raw.get("contract_ids")
+    raw_combo_actions = raw.get("combo_actions")
+    if not isinstance(raw_contract_ids, list) or not isinstance(raw_combo_actions, list):
+        return False
+    return (
+        str(raw.get("order_ref", "")) == order.order_ref
+        and str(raw.get("sec_type", "")) == contract.sec_type
+        and str(raw.get("symbol", "")) == contract.symbol
+        and str(raw.get("exchange", "")) == contract.exchange
+        and raw_contract_ids == expected_contract_ids
+        and raw_combo_actions == expected_combo_actions
+        and str(raw.get("side", "")) == order.action
+        and str(raw.get("order_type", "")) == order.order_type
+        and int(str(raw.get("quantity", 0))) == order.quantity
+        and _decimal_matches(raw.get("submitted_price", ""), order.limit_price)
+        and str(raw.get("algo_strategy", "")) == ("Adaptive" if order.adaptive_priority else "")
+        and str(raw.get("adaptive_priority", "")) == (order.adaptive_priority or "")
+    )
 
 
 class NativeIbkrBackend:
@@ -99,6 +142,57 @@ class NativeIbkrBackend:
             },
         )
 
+    def _recover_locked(
+        self,
+        request: broker_pb2.SubmitBrokerOrderRequest,
+        contract: IbkrContractSpec,
+        order: IbkrOrderSpec,
+        expected_broker_order_id: str | None,
+    ) -> broker_pb2.BrokerOrderSnapshot | None:
+        self._client.refresh_snapshot()
+        raw_snapshot = self._client.snapshot()
+        raw_orders = raw_snapshot.get("orders")
+        raw_fills = raw_snapshot.get("fills")
+        if not isinstance(raw_orders, list) or not isinstance(raw_fills, list):
+            raise RuntimeError("IBKR snapshot shape is invalid")
+        candidates = [
+            item
+            for item in raw_orders
+            if isinstance(item, dict)
+            and str(item.get("order_ref", "")) == order.order_ref
+            and (
+                expected_broker_order_id is None
+                or str(item.get("broker_order_id", "")) == expected_broker_order_id
+            )
+        ]
+        if len(candidates) > 1:
+            raise ValueError("IBKR orderRef resolves to multiple active orders")
+        if candidates:
+            candidate = candidates[0]
+            if not _remote_order_matches(candidate, contract, order):
+                raise ValueError("IBKR orderRef conflicts with a different active order")
+            native_id = str(candidate.get("broker_order_id", ""))
+            if not native_id:
+                raise RuntimeError("IBKR recovered order id is missing")
+            saved = broker_pb2.SubmitBrokerOrderRequest()
+            saved.CopyFrom(request)
+            self._requests[native_id] = saved
+            self._order_by_key[request.idempotency_key] = native_id
+            return self._known_order(native_id, candidate)
+
+        prior_fill = any(
+            isinstance(item, dict)
+            and str(item.get("order_ref", "")) == order.order_ref
+            and (
+                expected_broker_order_id is None
+                or str(item.get("broker_order_id", "")) == expected_broker_order_id
+            )
+            for item in raw_fills
+        )
+        if prior_fill:
+            raise RuntimeError("IBKR prior execution requires durable reconciliation")
+        return None
+
     def snapshot(self) -> broker_pb2.BrokerSnapshot:
         self._client.refresh_snapshot()
         raw = self._client.snapshot()
@@ -109,6 +203,7 @@ class NativeIbkrBackend:
         assert isinstance(raw_orders, list)
         orders_by_id = {str(item["broker_order_id"]): item for item in raw_orders}
         with self._lock:
+            missing_known_order = any(order_id not in orders_by_id for order_id in self._requests)
             known_orders = [
                 self._known_order(order_id, orders_by_id.get(order_id))
                 for order_id in self._requests
@@ -140,6 +235,9 @@ class NativeIbkrBackend:
             unknown_fill = any(
                 str(item.get("broker_order_id", "")) not in self._requests for item in fills_raw
             )
+        account_reconciled = (
+            reconciled and not missing_known_order and not unknown_orders and not unknown_fill
+        )
         return broker_pb2.BrokerSnapshot(
             schema_version="1.0",
             snapshot_sequence=int(str(raw["sequence"])),
@@ -150,10 +248,10 @@ class NativeIbkrBackend:
                 .replace("+00:00", "Z"),
                 health=(
                     broker_pb2.BROKER_HEALTH_HEALTHY
-                    if reconciled
+                    if account_reconciled
                     else broker_pb2.BROKER_HEALTH_RECONCILING
                 ),
-                reconciled=reconciled and not unknown_orders and not unknown_fill,
+                reconciled=account_reconciled,
                 buying_power=str(account_values.get("BuyingPower", "0")),
                 net_liquidation=str(account_values.get("NetLiquidation", "0")),
                 currency=str(account_values.get("Currency", "USD")),
@@ -168,7 +266,9 @@ class NativeIbkrBackend:
                     side=_side(str(item["side"])),
                     quantity=int(item["quantity"]),
                     price=str(item["price"]),
-                    occurred_at_utc=_execution_time(str(item["occurred_at_utc"])),
+                    occurred_at_utc=_execution_time(
+                        str(item["occurred_at_utc"]), self._client.config.timezone
+                    ),
                 )
                 for item in fills_raw
             ],
@@ -177,6 +277,7 @@ class NativeIbkrBackend:
     def submit(
         self, request: broker_pb2.SubmitBrokerOrderRequest
     ) -> broker_pb2.BrokerOrderSnapshot:
+        contract, order = map_submit_request(request, account=self._client.config.account)
         with self._lock:
             existing_id = self._order_by_key.get(request.idempotency_key)
             if existing_id is not None:
@@ -186,14 +287,40 @@ class NativeIbkrBackend:
                 ):
                     raise ValueError("IBKR idempotency key conflicts with a different order")
                 return self._known_order(existing_id)
-        contract, order = map_submit_request(request, account=self._client.config.account)
-        native_id = str(self._client.place_order(contract, order))
-        with self._lock:
+
+            recovered = self._recover_locked(request, contract, order, None)
+            if recovered is not None:
+                return recovered
+
+            native_id = str(self._client.place_order(contract, order))
             saved = broker_pb2.SubmitBrokerOrderRequest()
             saved.CopyFrom(request)
             self._requests[native_id] = saved
             self._order_by_key[request.idempotency_key] = native_id
             return self._known_order(native_id)
+
+    def recover(
+        self,
+        request: broker_pb2.SubmitBrokerOrderRequest,
+        expected_broker_order_id: str,
+    ) -> broker_pb2.BrokerOrderSnapshot:
+        if not expected_broker_order_id:
+            raise ValueError("IBKR expected broker order id is required")
+        contract, order = map_submit_request(request, account=self._client.config.account)
+        with self._lock:
+            existing_id = self._order_by_key.get(request.idempotency_key)
+            if existing_id is not None:
+                if existing_id != expected_broker_order_id:
+                    raise ValueError("IBKR recovery id conflicts with local identity")
+                existing = self._requests[existing_id]
+                if existing.SerializeToString(deterministic=True) != request.SerializeToString(
+                    deterministic=True
+                ):
+                    raise ValueError("IBKR recovery request conflicts with local identity")
+            recovered = self._recover_locked(request, contract, order, expected_broker_order_id)
+            if recovered is None:
+                raise KeyError("IBKR expected order was not found")
+            return recovered
 
     def cancel(self, broker_order_id: str) -> broker_pb2.BrokerOrderSnapshot:
         try:
@@ -242,6 +369,19 @@ class IbkrBrokerService(broker_pb2_grpc.BrokerAdapterServiceServicer):  # type: 
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "wrong broker route")
         try:
             return await asyncio.to_thread(self._backend.cancel, str(request.broker_order_id))
+        except Exception as exc:
+            await self._abort(context, exc)
+            raise AssertionError("gRPC abort must raise") from exc
+
+    async def RecoverBrokerOrder(self, request: Any, context: Any) -> Any:
+        if request.expected_order.broker_id != broker_pb2.BROKER_ID_IBKR:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "wrong broker route")
+        try:
+            return await asyncio.to_thread(
+                self._backend.recover,
+                request.expected_order,
+                str(request.expected_broker_order_id),
+            )
         except Exception as exc:
             await self._abort(context, exc)
             raise AssertionError("gRPC abort must raise") from exc

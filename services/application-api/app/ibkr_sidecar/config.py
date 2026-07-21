@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def _boolean(name: str, default: bool) -> bool:
@@ -26,6 +27,7 @@ class IbkrEndpointConfig:
     account: str
     paper: bool
     submission_enabled: bool
+    timezone: str = "America/New_York"
     connect_timeout_seconds: float = 10.0
 
     @classmethod
@@ -45,6 +47,11 @@ class IbkrEndpointConfig:
             raise ValueError("OPTIONTRADER_IBKR_ACCOUNT is required")
         port = int(os.getenv("OPTIONTRADER_IBKR_PORT", str(default_port)))
         client_id = int(os.getenv("OPTIONTRADER_IBKR_CLIENT_ID", "37"))
+        timezone = os.getenv("OPTIONTRADER_IBKR_TIMEZONE", "America/New_York")
+        try:
+            ZoneInfo(timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("OPTIONTRADER_IBKR_TIMEZONE is invalid") from exc
         if not 1 <= port <= 65_535 or not 1 <= client_id <= 2_147_483_647:
             raise ValueError("IBKR port or client id is outside its valid range")
         return cls(
@@ -55,4 +62,5 @@ class IbkrEndpointConfig:
             account=account,
             paper=paper,
             submission_enabled=_boolean("OPTIONTRADER_IBKR_SUBMISSION_ENABLED", False),
+            timezone=timezone,
         )

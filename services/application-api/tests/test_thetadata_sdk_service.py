@@ -89,6 +89,9 @@ class FakeClient:
                 "gamma": [0.08],
                 "theta": [-0.12],
                 "vega": [0.05],
+                "implied_vol": [0.20],
+                "underlying_price": [500.0],
+                "underlying_timestamp": pd.to_datetime(["2026-07-20 10:29:59.800-04:00"]),
             }
         )
 
@@ -196,6 +199,17 @@ def test_standard_tier_first_order_inputs_derive_gamma_without_broker_data() -> 
     greeks["underlying_timestamp"] = greeks["timestamp"]
     snapshot = normalize_option_snapshot(quote, greeks, option_contract())
     assert Decimal(snapshot.gamma) > 0
+
+    provider_gamma = greeks.copy()
+    provider_gamma["gamma"] = [0.0]
+    assert normalize_option_snapshot(quote, provider_gamma, option_contract()).gamma == (
+        snapshot.gamma
+    )
+
+    boundary_delta = greeks.copy()
+    boundary_delta["delta"] = [1.0]
+    with pytest.raises(ValueError, match="delta"):
+        normalize_option_snapshot(quote, boundary_delta, option_contract())
 
     greeks.loc[0, "underlying_timestamp"] = pd.Timestamp("2026-07-20 10:31:00-04:00")
     with pytest.raises(ValueError, match="underlying timestamps"):

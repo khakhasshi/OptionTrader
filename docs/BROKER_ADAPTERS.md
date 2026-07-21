@@ -57,15 +57,22 @@ Rust 是价格权威。Broker adapter 只接收已经确定的订单级方向、
 - `OPTIONTRADER_IBKR_SUBMISSION_ENABLED` 默认 false，且必须精确写为 true 才允许调用
   `placeOrder` / `cancelOrder`。
 - `make dev-ibkr-sidecar` 启动 loopback `BrokerAdapterService`，提供完整 snapshot、幂等 submit、
-  cancel 和 sequence-bound reconcile。未知活动订单也进入 snapshot，并强制 account 未对账。
+  cancel、只读 `RecoverBrokerOrder` 和 sequence-bound reconcile。恢复请求必须同时匹配已知 native
+  order id、`orderRef`、合约/腿、方向、数量、类型、价格和 Adaptive 参数；零匹配、多匹配或
+  历史成交无法完整证明原请求时拒绝，恢复 RPC 永不提交。未知活动订单也进入 snapshot，并强制
+  account health/reconciled 同时降为 RECONCILING/false。
+- `OPTIONTRADER_IBKR_TIMEZONE` 默认 `America/New_York`，仅用于 TWS 返回不带时区的 execution
+  时间；带显式时区的回报优先，非法时区拒绝启动。
 
 ## 进程恢复
 
 Application API 启动时从 PostgreSQL 重建 Rust workflow。只有未 claim 且未过期的确认能力
 可以继续确认；终态只读恢复；任何可能已经跨过 Broker 提交边界的订单都提升为
 `RECONCILE_PENDING`、版本加一并保留残余敞口。恢复 RPC 从不提交或撤单，返回的订单清单必须
-随后与所选 Broker snapshot 对账。当前 reconciliation worker 尚未接入，因此真实 adapter
-仍不得进入主确认路径。
+随后与所选 Broker snapshot 对账。Application API 会逐项调用 Rust
+`ReconcileExecutionOrder`；Rust 直接向 IBKR sidecar 发只读恢复请求并复核新鲜账户快照，成功后
+更新订单投影和动态 buying power，失败则保持 BrokerHealth=RECONCILING。Longbridge 自动恢复
+尚未接入；两家真实 adapter 仍不得进入主确认路径。
 
 ## 现场认证 Gate
 

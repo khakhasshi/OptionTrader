@@ -148,15 +148,11 @@ def normalize_option_snapshot(
         for name in ("delta", "theta", "vega")
     }
     delta = Decimal(values["delta"])
-    if not Decimal("-1") <= delta <= Decimal("1"):
-        raise ValueError("ThetaData delta is outside [-1, 1]")
-    values["gamma"] = (
-        _decimal_text(_column(greeks, "gamma"), "gamma", positive=False)
-        if "gamma" in greeks.index
-        else _gamma_from_first_order(greeks, contract, quote_at, delta)
-    )
-    if Decimal(values["gamma"]) < 0 or Decimal(values["vega"]) < 0:
-        raise ValueError("ThetaData gamma and vega must be non-negative")
+    if not Decimal("-1") < delta < Decimal("1"):
+        raise ValueError("ThetaData delta is outside (-1, 1)")
+    values["gamma"] = _gamma_from_first_order(greeks, contract, quote_at, delta)
+    if Decimal(values["gamma"]) <= 0 or Decimal(values["vega"]) < 0:
+        raise ValueError("ThetaData gamma must be positive and vega non-negative")
     return market_pb2.ThetaOptionSnapshot(
         contract_id=str(contract.contract_id),
         symbol=str(contract.symbol).upper(),

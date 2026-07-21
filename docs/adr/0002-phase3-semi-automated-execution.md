@@ -59,11 +59,13 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
 
 ## 当前限制
 
-- PaperBroker 和真实 Broker 连接仍为进程内状态。PostgreSQL workflow 已自动重建，但所有
-  可能已提交的订单只恢复为 `RECONCILE_PENDING`；当前不会自动替操作者完成 Broker 对账。
+- PostgreSQL workflow 已自动重建；可能已提交的订单先恢复为 `RECONCILE_PENDING`。IBKR 路径
+  已通过只读 `RecoverBrokerOrder` 自动复核 native id/orderRef/完整订单形状和新鲜账户快照，
+  不以 Submit 代替恢复。Longbridge 自动恢复尚未接入。
 - capability 密文只有持有同一 Fernet 密钥的 API 实例可解密；缺失、错误或轮换不当均
   fail closed。密钥轮换与多密钥解密尚未实现。
-- Broker snapshot 尚未成为账户风险字段的动态来源；首个切片仍由启动配置注入。
+- IBKR 自动恢复成功后会更新动态 buying power/health/reconciled；其余账户风险字段以及
+  Longbridge snapshot 仍未成为完整动态风险来源。
 - ThetaData Standard 的二阶/all-Greeks entitlement 不可用。derived Gamma 已有确定性实现和
   时间同步闸门，但完整 RTH option soak 仍是 paper Gate。
 - IBKR sidecar gRPC 与四类快照代码已完成，Longbridge 当日成交与未知活动订单闭锁已完成；

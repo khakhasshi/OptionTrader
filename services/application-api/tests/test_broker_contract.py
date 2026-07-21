@@ -7,6 +7,7 @@ def test_broker_sidecar_contract_exposes_complete_phase3_boundary() -> None:
         "GetBrokerSnapshot",
         "SubmitBrokerOrder",
         "CancelBrokerOrder",
+        "RecoverBrokerOrder",
         "ReconcileBroker",
     ]
 
@@ -61,3 +62,8 @@ def test_broker_order_round_trip_preserves_all_combo_legs() -> None:
         "QQQ-20260721-C-501",
     ]
     assert [leg.submitted_price for leg in restored.legs] == ["1.50", "0.50"]
+
+    recovery = broker_pb2.RecoverBrokerOrderRequest(
+        expected_order=request, expected_broker_order_id="900"
+    )
+    assert broker_pb2.RecoverBrokerOrderRequest.FromString(recovery.SerializeToString()) == recovery

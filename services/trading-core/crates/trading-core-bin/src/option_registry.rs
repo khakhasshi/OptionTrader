@@ -26,9 +26,14 @@ impl OptionRegistryAuthority {
         Self::Sdk(TrustedOptionRegistry::new(endpoint))
     }
 
-    pub async fn verify(&self, plan: &CandidateTradePlan, now: DateTime<Utc>) -> bool {
+    pub async fn verify(
+        &self,
+        plan: &CandidateTradePlan,
+        now: DateTime<Utc>,
+        force_refresh: bool,
+    ) -> bool {
         match self {
-            Self::Sdk(registry) => registry.verify(plan, now).await,
+            Self::Sdk(registry) => registry.verify(plan, now, force_refresh).await,
             #[cfg(test)]
             Self::Fixture => true,
         }
@@ -38,7 +43,7 @@ impl OptionRegistryAuthority {
 #[derive(Clone)]
 pub struct TrustedOptionRegistry {
     endpoint: String,
-    batches: Arc<Mutex<BTreeMap<String, Vec<ThetaOptionSnapshot>>>>,
+    batches: Arc<Mutex<BTreeMap<String, ThetaOptionSnapshotBatch>>>,
 }
 
 impl TrustedOptionRegistry {
@@ -49,7 +54,12 @@ impl TrustedOptionRegistry {
         }
     }
 
-    async fn verify(&self, plan: &CandidateTradePlan, now: DateTime<Utc>) -> bool {
+    async fn verify(
+        &self,
+        plan: &CandidateTradePlan,
+        now: DateTime<Utc>,
+        force_refresh: bool,
+    ) -> bool {
         if plan.legs.is_empty() || plan.legs.len() > 4 {
             return false;
         }
@@ -66,9 +76,12 @@ impl TrustedOptionRegistry {
             Some(ids) if ids.iter().all(|id| !id.is_empty() && *id == ids[0]) => ids[0],
             _ => return false,
         };
-        if let Ok(cache) = self.batches.lock() {
-            if let Some(snapshots) = cache.get(expected_id) {
-                return snapshots_match(plan, snapshots);
+        if let Ok(mut cache) = self.batches.lock() {
+            cache.retain(|_, batch| batch_valid(batch, now));
+            if !force_refresh {
+                if let Some(batch) = cache.get(expected_id) {
+                    return cached_batch_matches(plan, batch, now);
+                }
             }
         } else {
             return false;
@@ -123,11 +136,22 @@ impl TrustedOptionRegistry {
         self.batches
             .lock()
             .map(|mut cache| {
-                cache.insert(response.chain_snapshot_id, response.snapshots);
+                while cache.len() >= 256 {
+                    cache.pop_first();
+                }
+                cache.insert(response.chain_snapshot_id.clone(), response);
                 true
             })
             .unwrap_or(false)
     }
+}
+
+fn cached_batch_matches(
+    plan: &CandidateTradePlan,
+    batch: &ThetaOptionSnapshotBatch,
+    now: DateTime<Utc>,
+) -> bool {
+    batch_valid(batch, now) && snapshots_match(plan, &batch.snapshots)
 }
 
 fn batch_valid(batch: &ThetaOptionSnapshotBatch, now: DateTime<Utc>) -> bool {
@@ -273,5 +297,69 @@ mod tests {
         batch.chain_snapshot_id = id;
         batch.fetched_at_utc = "2026-07-21T14:29:00.000Z".into();
         assert!(!batch_valid(&batch, now));
+    }
+
+    #[tokio::test]
+    async fn confirm_refresh_bypasses_valid_cache_and_stale_cache_is_evicted() {
+        let snapshot = ThetaOptionSnapshot {
+            contract_id: "QQQ-C-500".into(),
+            symbol: "QQQ".into(),
+            expiration: "2026-07-21".into(),
+            strike: "500".into(),
+            right: ThetaOptionRight::Call as i32,
+            bid: "2.4".into(),
+            ask: "2.5".into(),
+            bid_size: 20,
+            ask_size: 25,
+            occurred_at_utc: "2026-07-21T14:30:00.000Z".into(),
+            delta: "0.52".into(),
+            gamma: "0.08".into(),
+            theta: "-0.12".into(),
+            vega: "0.05".into(),
+            provider: "THETADATA".into(),
+        };
+        let id = format!("thetaopt_{:x}", Sha256::digest(snapshot.encode_to_vec()));
+        let plan = CandidateTradePlan {
+            legs: vec![CandidateLeg {
+                side: OrderSide::Buy as i32,
+                option_right: ExecutionRight::Call as i32,
+                contract_id: snapshot.contract_id.clone(),
+                expiry: snapshot.expiration.clone(),
+                strike: snapshot.strike.clone(),
+                quantity: 1,
+                quote: Some(OptionQuoteProof {
+                    bid: snapshot.bid.clone(),
+                    ask: snapshot.ask.clone(),
+                    bid_size: snapshot.bid_size,
+                    ask_size: snapshot.ask_size,
+                    occurred_at_utc: snapshot.occurred_at_utc.clone(),
+                    delta: snapshot.delta.clone(),
+                    gamma: snapshot.gamma.clone(),
+                    theta: snapshot.theta.clone(),
+                    vega: snapshot.vega.clone(),
+                    chain_snapshot_id: id.clone(),
+                    provider: "THETADATA".into(),
+                }),
+                broker_contract_id: "123".into(),
+                symbol: "QQQ".into(),
+                exchange: "SMART".into(),
+            }],
+            ..CandidateTradePlan::default()
+        };
+        let batch = ThetaOptionSnapshotBatch {
+            chain_snapshot_id: id.clone(),
+            fetched_at_utc: "2026-07-21T14:30:00.000Z".into(),
+            snapshots: vec![snapshot],
+            provider: "THETADATA".into(),
+        };
+        let registry = TrustedOptionRegistry::new("http://127.0.0.1:1".into());
+        registry.batches.lock().unwrap().insert(id.clone(), batch);
+        let now: DateTime<Utc> = "2026-07-21T14:30:01Z".parse().unwrap();
+        assert!(registry.verify(&plan, now, false).await);
+        assert!(!registry.verify(&plan, now, true).await);
+
+        let stale_now: DateTime<Utc> = "2026-07-21T14:30:11Z".parse().unwrap();
+        assert!(!registry.verify(&plan, stale_now, false).await);
+        assert!(!registry.batches.lock().unwrap().contains_key(&id));
     }
 }

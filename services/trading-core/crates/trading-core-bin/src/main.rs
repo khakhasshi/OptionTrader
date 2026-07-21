@@ -6,13 +6,14 @@
 //! HTTP and gRPC run concurrently in one process. Market DataHealth derives
 //! from the selected source; broker reconciliation remains a Phase 3 concern.
 
+mod broker_registry;
 mod grpc;
 mod option_registry;
 mod risk_grpc;
 mod theta_live;
 
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use grpc::{LiveMarketServiceImpl, MarketFeed, MarketServiceImpl};
@@ -27,7 +28,7 @@ use theta_live::ThetaLiveConfig;
 #[derive(Clone)]
 struct AppState {
     live: Option<LiveMarketServiceImpl>,
-    broker: BrokerAuthority,
+    broker: Arc<RwLock<BrokerAuthority>>,
 }
 
 /// Default replay dataset bundled with the binary for local/replay runs.
@@ -43,25 +44,28 @@ fn scenario() -> (DataHealth, BrokerHealth, bool) {
     }
 }
 
-async fn health(State(state): State<AppState>) -> Json<Value> {
+async fn health(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     let data = if let Some(live) = state.live {
         live.current_health().await
     } else {
         scenario().0
     };
-    let allowed = state
+    let broker = state
         .broker
-        .allows_new_position(data.allows_new_position(), chrono::Utc::now());
-    Json(json!({
+        .read()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .clone();
+    let allowed = broker.allows_new_position(data.allows_new_position(), chrono::Utc::now());
+    Ok(Json(json!({
         "schema_version": "1.0",
         "status": "ok",
         "service": "trading-core",
         "environment": env::var("OPTIONTRADER_ENV").unwrap_or_else(|_| "local".into()),
         "data_health": data,
-        "broker_health": state.broker.health,
-        "reconciled": state.broker.reconciled,
+        "broker_health": broker.health,
+        "reconciled": broker.reconciled,
         "new_position_allowed": allowed,
-    }))
+    })))
 }
 
 async fn market_snapshot(
@@ -133,14 +137,15 @@ async fn main() {
     let (_, broker_health, broker_reconciled) = scenario();
     let broker_authority = BrokerAuthority::from_env(broker_health, broker_reconciled)
         .expect("valid OPTIONTRADER risk authority configuration");
-    let risk_service = RiskExecutionServiceImpl::new(market_authority, broker_authority.clone());
+    let risk_service = RiskExecutionServiceImpl::new(market_authority, broker_authority);
+    let broker_handle = risk_service.broker_handle();
 
     let http_app = Router::new()
         .route("/health", get(health))
         .route("/market/snapshot", get(market_snapshot))
         .with_state(AppState {
             live: live_service.clone(),
-            broker: broker_authority,
+            broker: broker_handle,
         });
     let http_addr = format!("{http_bind}:{http_port}");
     let http_listener = tokio::net::TcpListener::bind(&http_addr)

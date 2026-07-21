@@ -148,6 +148,14 @@ message CancelBrokerOrderRequest {
   string broker_order_id = 2;
 }
 
+// Read-only restart recovery. The adapter may attach durable identities to an
+// existing native order only after every broker-visible field matches. It must
+// never submit a new order from this RPC.
+message RecoverBrokerOrderRequest {
+  SubmitBrokerOrderRequest expected_order = 1;
+  string expected_broker_order_id = 2;
+}
+
 message ReconcileBrokerRequest {
   BrokerId broker_id = 1;
   uint64 expected_snapshot_sequence = 2;
@@ -163,5 +171,6 @@ service BrokerAdapterService {
   rpc GetBrokerSnapshot(GetBrokerSnapshotRequest) returns (BrokerSnapshot);
   rpc SubmitBrokerOrder(SubmitBrokerOrderRequest) returns (BrokerOrderSnapshot);
   rpc CancelBrokerOrder(CancelBrokerOrderRequest) returns (BrokerOrderSnapshot);
+  rpc RecoverBrokerOrder(RecoverBrokerOrderRequest) returns (BrokerOrderSnapshot);
   rpc ReconcileBroker(ReconcileBrokerRequest) returns (ReconcileBrokerResponse);
 }
