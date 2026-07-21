@@ -13,9 +13,10 @@ SnapshotUnavailable body with HTTP 503 (never a partial fake MarketSnapshot).
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Annotated, Literal
@@ -39,6 +40,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.persistence import (
     claim_confirmation_intent,
     latest_execution_ticket,
+    persist_broker_reconciliation_failure,
     persist_order_projection,
     persist_staged_candidate,
     restorable_execution_workflow,
@@ -56,6 +58,7 @@ from app.trading.grpc_client import (
 )
 from app.trading.capability import ConfirmationCipher
 from app.trading.models import CandidateTradePlan, ExecutionOrder, RiskDecision
+from app.trading.reconciliation import supervisor as reconciliation_supervisor
 
 __all__ = ["app", "httpx"]
 
@@ -102,6 +105,7 @@ def restore_durable_execution_workflow() -> tuple[int, int]:
     cipher = _require_confirmation_cipher()
     entries = restorable_execution_workflow(engine, cipher)
     restored, reconciliation_ids = grpc_restore_workflow(entries)
+    broker_by_order_id = {order.order_id: order.broker_id for order in restored}
     for order in restored:
         persist_order_projection(
             engine,
@@ -119,6 +123,12 @@ def restore_durable_execution_workflow() -> tuple[int, int]:
             reconciled = grpc_reconcile_execution_order(order_id)
         except grpc.RpcError:
             unresolved += 1
+            persist_broker_reconciliation_failure(
+                engine,
+                broker_by_order_id[order_id],
+                "BROKER_RPC_FAILURE",
+                order_id=order_id,
+            )
             continue
         still_pending = reconciled.state == "RECONCILE_PENDING"
         if still_pending:
@@ -134,9 +144,29 @@ def restore_durable_execution_workflow() -> tuple[int, int]:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    reconciliation_task: asyncio.Task[None] | None = None
     if os.getenv("DATABASE_URL") and os.getenv("OPTIONTRADER_CONFIRMATION_FERNET_KEY"):
-        restore_durable_execution_workflow()
-    yield
+        _, unresolved = restore_durable_execution_workflow()
+        reconciliation_supervisor.note_startup(unresolved)
+        enabled = os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_ENABLED", "true")
+        if enabled not in {"true", "false"}:
+            raise ValueError(
+                "OPTIONTRADER_BROKER_RECONCILIATION_ENABLED must be exactly true or false"
+            )
+        if enabled == "true":
+            interval = int(os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_INTERVAL_SECONDS", "30"))
+            if not 5 <= interval <= 300:
+                raise ValueError("broker reconciliation interval must be between 5 and 300 seconds")
+            reconciliation_task = asyncio.create_task(
+                reconciliation_supervisor.serve(_require_execution_engine(), interval)
+            )
+    try:
+        yield
+    finally:
+        if reconciliation_task is not None:
+            reconciliation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await reconciliation_task
 
 
 app = FastAPI(title="OptionTrader Application API", version="0.0.0", lifespan=lifespan)
@@ -192,6 +222,21 @@ UtcTimestamp = Annotated[str, AfterValidator(_check_utc)]
 EtTimestamp = Annotated[str, AfterValidator(_check_et)]
 NonNegInt = Annotated[int, Field(ge=0)]
 SchemaVersion = Literal["1.0"]
+
+
+class BrokerReconciliationView(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    broker_id: Literal["ibkr", "longbridge"]
+    running: bool
+    last_attempt_at_utc: UtcTimestamp | None
+    last_success_at_utc: UtcTimestamp | None
+    broker_reconciled: bool
+    snapshot_sequence: int | None
+    snapshot_hash: str | None
+    unresolved_order_ids: list[str]
+    mismatch_codes: list[str]
+    failure_code: str | None
 
 
 class HealthResponse(BaseModel):
@@ -508,6 +553,14 @@ def latest_trading_order(session_id: str | None = None) -> ExecutionTicket:
     except (SQLAlchemyError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="execution_audit_write_failed") from exc
     return ExecutionTicket(plan=plan, order=gateway_order)
+
+
+@app.get(
+    "/api/v1/trading/reconciliation",
+    response_model=BrokerReconciliationView,
+)
+def broker_reconciliation_status() -> BrokerReconciliationView:
+    return BrokerReconciliationView.model_validate(reconciliation_supervisor.status())
 
 
 @app.websocket("/api/v1/stream/cockpit")

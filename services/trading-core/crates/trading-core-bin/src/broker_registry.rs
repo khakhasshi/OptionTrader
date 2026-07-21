@@ -16,6 +16,7 @@ use optiontrader_proto::broker_v1::{
 };
 use prost::Message;
 use rust_decimal::Decimal;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerRecoveryError {
@@ -32,6 +33,13 @@ pub struct RecoveredBrokerOrder {
     pub buying_power: Decimal,
 }
 
+#[derive(Debug, Clone)]
+pub struct ValidatedBrokerSnapshot {
+    pub snapshot: BrokerSnapshot,
+    pub snapshot_hash: String,
+    pub buying_power: Decimal,
+}
+
 #[derive(Clone)]
 pub enum BrokerSnapshotAuthority {
     Remote {
@@ -39,6 +47,8 @@ pub enum BrokerSnapshotAuthority {
     },
     #[cfg(test)]
     Fixed(Result<RecoveredBrokerOrder, BrokerRecoveryError>),
+    #[cfg(test)]
+    FullFixed(Result<ValidatedBrokerSnapshot, BrokerRecoveryError>),
 }
 
 impl BrokerSnapshotAuthority {
@@ -59,6 +69,8 @@ impl BrokerSnapshotAuthority {
             Self::Remote { ibkr_endpoint } => ibkr_endpoint,
             #[cfg(test)]
             Self::Fixed(result) => return result.clone(),
+            #[cfg(test)]
+            Self::FullFixed(_) => return Err(BrokerRecoveryError::Unavailable),
         };
         if BrokerId::try_from(expected_order.broker_id).ok() != Some(BrokerId::Ibkr) {
             return Err(BrokerRecoveryError::UnsupportedBroker);
@@ -102,6 +114,119 @@ impl BrokerSnapshotAuthority {
             now,
         )
     }
+
+    pub async fn fetch_snapshot(
+        &self,
+        broker_id: i32,
+        now: DateTime<Utc>,
+    ) -> Result<ValidatedBrokerSnapshot, BrokerRecoveryError> {
+        let ibkr_endpoint = match self {
+            Self::Remote { ibkr_endpoint } => ibkr_endpoint,
+            #[cfg(test)]
+            Self::Fixed(_) => return Err(BrokerRecoveryError::Unavailable),
+            #[cfg(test)]
+            Self::FullFixed(result) => return result.clone(),
+        };
+        if BrokerId::try_from(broker_id).ok() != Some(BrokerId::Ibkr) {
+            return Err(BrokerRecoveryError::UnsupportedBroker);
+        }
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(2),
+            BrokerAdapterServiceClient::connect(ibkr_endpoint.clone()),
+        )
+        .await
+        .map_err(|_| BrokerRecoveryError::Unavailable)?
+        .map_err(|_| BrokerRecoveryError::Unavailable)?;
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get_broker_snapshot(GetBrokerSnapshotRequest { broker_id }),
+        )
+        .await
+        .map_err(|_| BrokerRecoveryError::Unavailable)?
+        .map_err(|_| BrokerRecoveryError::Unavailable)?
+        .into_inner();
+        validate_full_snapshot(snapshot, broker_id, now)
+    }
+}
+
+fn validate_full_snapshot(
+    snapshot: BrokerSnapshot,
+    broker_id: i32,
+    now: DateTime<Utc>,
+) -> Result<ValidatedBrokerSnapshot, BrokerRecoveryError> {
+    if snapshot.schema_version != "1.0" || snapshot.snapshot_sequence == 0 {
+        return Err(BrokerRecoveryError::InvalidSnapshot);
+    }
+    let account = snapshot
+        .account
+        .as_ref()
+        .ok_or(BrokerRecoveryError::InvalidSnapshot)?;
+    let account_at = parse_utc(&account.occurred_at_utc)?;
+    let account_age = now.timestamp_millis() - account_at.timestamp_millis();
+    if account.broker_id != broker_id
+        || BrokerHealth::try_from(account.health).ok() != Some(BrokerHealth::Healthy)
+        || !account.reconciled
+        || !(-5_000..=30_000).contains(&account_age)
+        || account.currency.trim().is_empty()
+    {
+        return Err(BrokerRecoveryError::NotReconciled);
+    }
+    let buying_power = positive_or_zero_decimal(&account.buying_power)?;
+    positive_or_zero_decimal(&account.net_liquidation)?;
+
+    let mut position_ids = BTreeSet::new();
+    for position in &snapshot.positions {
+        if position.contract_id.is_empty()
+            || !position_ids.insert(position.contract_id.as_str())
+            || positive_or_zero_decimal(&position.average_price).is_err()
+        {
+            return Err(BrokerRecoveryError::InvalidSnapshot);
+        }
+    }
+    let mut order_ids = BTreeSet::new();
+    for order in &snapshot.orders {
+        if order.broker_order_id.is_empty()
+            || !order_ids.insert(order.broker_order_id.as_str())
+            || order.idempotency_key.is_empty()
+            || order.plan_hash.len() != 64
+            || !order
+                .plan_hash
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit())
+            || order.legs.is_empty()
+            || order.total_quantity == 0
+            || order.filled_quantity > order.total_quantity
+            || domain_order(order.clone()).is_err()
+        {
+            return Err(BrokerRecoveryError::InvalidSnapshot);
+        }
+        for child in &order.child_orders {
+            if !order_ids.insert(child.broker_order_id.as_str()) {
+                return Err(BrokerRecoveryError::InvalidSnapshot);
+            }
+        }
+    }
+    let mut fill_ids = BTreeSet::new();
+    for fill in &snapshot.fills {
+        let occurred = parse_utc(&fill.occurred_at_utc)?;
+        if fill.fill_id.is_empty()
+            || fill.broker_order_id.is_empty()
+            || fill.contract_id.is_empty()
+            || !fill_ids.insert(fill.fill_id.as_str())
+            || side(fill.side).is_err()
+            || fill.quantity == 0
+            || positive_or_zero_decimal(&fill.price)? == Decimal::ZERO
+            || occurred.timestamp_millis() - now.timestamp_millis() > 5_000
+        {
+            return Err(BrokerRecoveryError::InvalidSnapshot);
+        }
+    }
+    let snapshot_hash = format!("{:x}", Sha256::digest(snapshot.encode_to_vec()));
+    Ok(ValidatedBrokerSnapshot {
+        snapshot,
+        snapshot_hash,
+        buying_power,
+    })
 }
 
 fn validate_snapshot(
@@ -429,6 +554,22 @@ mod tests {
         .unwrap();
         assert_eq!(result.buying_power, Decimal::new(10_000, 0));
         assert_eq!(result.order.status, BrokerOrderStatus::Working);
+    }
+
+    #[test]
+    fn full_snapshot_validation_binds_hash_and_rejects_duplicate_facts() {
+        let valid = snapshot(order());
+        let expected_hash = format!("{:x}", Sha256::digest(valid.encode_to_vec()));
+        let result = validate_full_snapshot(valid.clone(), BrokerId::Ibkr as i32, now()).unwrap();
+        assert_eq!(result.snapshot_hash, expected_hash);
+        assert_eq!(result.snapshot, valid);
+
+        let mut duplicate = valid;
+        duplicate.orders.push(duplicate.orders[0].clone());
+        assert!(matches!(
+            validate_full_snapshot(duplicate, BrokerId::Ibkr as i32, now()),
+            Err(BrokerRecoveryError::InvalidSnapshot)
+        ));
     }
 
     #[test]

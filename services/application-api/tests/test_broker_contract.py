@@ -67,3 +67,20 @@ def test_broker_order_round_trip_preserves_all_combo_legs() -> None:
         expected_order=request, expected_broker_order_id="900"
     )
     assert broker_pb2.RecoverBrokerOrderRequest.FromString(recovery.SerializeToString()) == recovery
+
+
+def test_execution_gateway_exposes_hash_bound_broker_reconciliation() -> None:
+    service = execution_pb2.DESCRIPTOR.services_by_name["RiskExecutionService"]
+    methods = {method.name for method in service.methods}
+    assert "BeginBrokerReconciliation" in methods
+    assert "CommitBrokerReconciliation" in methods
+    batch = execution_pb2.BrokerReconciliationBatch(
+        schema_version="1.0",
+        broker_id=execution_pb2.BROKER_ID_IBKR,
+        snapshot_sequence=1,
+        snapshot_hash="a" * 64,
+        snapshot_protobuf=b"exact-broker-protobuf",
+        expires_at_utc="2026-07-21T14:30:15Z",
+    )
+    restored = execution_pb2.BrokerReconciliationBatch.FromString(batch.SerializeToString())
+    assert restored.snapshot_protobuf == b"exact-broker-protobuf"

@@ -9,6 +9,7 @@ import grpc
 import pytest
 
 from app import main
+from app.trading import reconciliation
 from app.trading.models import (
     CandidateTradePlan,
     ExecutionOrder,
@@ -319,7 +320,39 @@ def test_startup_restore_keeps_unavailable_broker_order_unresolved(
         lambda *_args: (_ for _ in ()).throw(BrokerUnavailable()),
     )
     monkeypatch.setattr(main, "persist_order_projection", lambda *_args, **_kwargs: True)
+    failures: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        main,
+        "persist_broker_reconciliation_failure",
+        lambda _engine, broker, reason, **_kwargs: failures.append((broker, reason)),
+    )
     assert main.restore_durable_execution_workflow() == (1, 1)
+    assert failures == [("ibkr", "BROKER_RPC_FAILURE")]
+
+
+def test_reconciliation_status_endpoint_exposes_unresolved_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        reconciliation.supervisor,
+        "status",
+        lambda: {
+            "broker_id": "ibkr",
+            "running": False,
+            "last_attempt_at_utc": "2026-07-21T14:30:00Z",
+            "last_success_at_utc": None,
+            "broker_reconciled": False,
+            "snapshot_sequence": 12,
+            "snapshot_hash": "a" * 64,
+            "unresolved_order_ids": ["order_demo_001"],
+            "mismatch_codes": ["UNKNOWN_BROKER_FILL"],
+            "failure_code": None,
+        },
+    )
+    response = TestClient(main.app).get("/api/v1/trading/reconciliation")
+    assert response.status_code == 200
+    assert response.json()["broker_reconciled"] is False
+    assert response.json()["unresolved_order_ids"] == ["order_demo_001"]
 
 
 def test_startup_restore_counts_broker_pending_response_as_unresolved(

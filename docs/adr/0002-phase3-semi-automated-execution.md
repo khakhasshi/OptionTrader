@@ -56,6 +56,10 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
 16. IBKR sidecar 只绑定 loopback，并在账户、持仓、未结订单、成交四个 snapshot end callback
     全部完成前保持未对账。未知活动订单会使账户对账失败。Longbridge reconcile 同步读取账户、
     持仓、全部活动订单和当日成交；未知活动订单或无法归属的成交 fail closed。
+17. 全账户事实对账采用 Rust 签发的两阶段快照凭证：Begin 先把共享 BrokerAuthority 置为
+    RECONCILING，再返回经过结构/时效验证的 BrokerSnapshot protobuf 字节、sequence、SHA-256 与
+    15 秒 TTL；Python 原子持久化并核对本地订单后 Commit。哈希/序号漂移、过期、数据库失败、
+    任一 mismatch 或未解决 workflow 均不得恢复 HEALTHY。该路径只读，不具有提交能力。
 
 ## 当前限制
 
@@ -64,8 +68,8 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
   不以 Submit 代替恢复。Longbridge 自动恢复尚未接入。
 - capability 密文只有持有同一 Fernet 密钥的 API 实例可解密；缺失、错误或轮换不当均
   fail closed。密钥轮换与多密钥解密尚未实现。
-- IBKR 自动恢复成功后会更新动态 buying power/health/reconciled；其余账户风险字段以及
-  Longbridge snapshot 仍未成为完整动态风险来源。
+- IBKR 自动恢复和持续全账户事实账本已更新动态 buying power/health/reconciled，并持久化净值、
+  持仓与成交；这些字段尚未全部进入仓位风险计算，Longbridge 全量 snapshot authority 仍未接入。
 - ThetaData Standard 的二阶/all-Greeks entitlement 不可用。derived Gamma 已有确定性实现和
   时间同步闸门，但完整 RTH option soak 仍是 paper Gate。
 - IBKR sidecar gRPC 与四类快照代码已完成，Longbridge 当日成交与未知活动订单闭锁已完成；

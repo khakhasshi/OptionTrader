@@ -88,7 +88,8 @@ def _remote_order_matches(
     if not isinstance(raw_contract_ids, list) or not isinstance(raw_combo_actions, list):
         return False
     return (
-        str(raw.get("order_ref", "")) == order.order_ref
+        str(raw.get("account", "")) == order.account
+        and str(raw.get("order_ref", "")) == order.order_ref
         and str(raw.get("sec_type", "")) == contract.sec_type
         and str(raw.get("symbol", "")) == contract.symbol
         and str(raw.get("exchange", "")) == contract.exchange

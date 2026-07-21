@@ -14,16 +14,18 @@ use chrono::{DateTime, Utc};
 use execution::{submit_to_broker, OrderRecord, OrderState};
 use market_core::{DataHealth, MarketSnapshot};
 use optiontrader_proto::execution_v1::{
-    risk_execution_service_server::RiskExecutionService, BrokerId as ProtoBrokerId,
-    BrokerOrderType as ProtoOrderType, CancelOrderRequest, CandidateTradePlan as ProtoPlan,
-    ConfirmCandidateRequest, EvaluateCandidateRequest, EventRiskContext as ProtoEventContext,
-    EventRiskFlag as ProtoEventFlag, ExecutionChildOrder as ProtoChildOrder,
-    ExecutionChildOrderState as ProtoChildState, ExecutionMode as ProtoMode,
-    ExecutionOrder as ProtoOrder, ExecutionOrderState as ProtoOrderState, GetOrderRequest,
-    OptionRight as ProtoRight, OrderSide as ProtoSide, ReconcileExecutionOrderRequest,
-    RestorableExecutionOrder, RestoreWorkflowRequest, RestoreWorkflowResponse,
-    RiskDecision as ProtoDecision, RiskDecisionKind, RiskReasonCode as ProtoReason,
-    StageCandidateResponse, StrategyKind as ProtoStrategy,
+    risk_execution_service_server::RiskExecutionService, BeginBrokerReconciliationRequest,
+    BrokerId as ProtoBrokerId, BrokerOrderType as ProtoOrderType, BrokerReconciliationBatch,
+    CancelOrderRequest, CandidateTradePlan as ProtoPlan, CommitBrokerReconciliationRequest,
+    CommitBrokerReconciliationResponse, ConfirmCandidateRequest, EvaluateCandidateRequest,
+    EventRiskContext as ProtoEventContext, EventRiskFlag as ProtoEventFlag,
+    ExecutionChildOrder as ProtoChildOrder, ExecutionChildOrderState as ProtoChildState,
+    ExecutionMode as ProtoMode, ExecutionOrder as ProtoOrder,
+    ExecutionOrderState as ProtoOrderState, GetOrderRequest, OptionRight as ProtoRight,
+    OrderSide as ProtoSide, ReconcileExecutionOrderRequest, RestorableExecutionOrder,
+    RestoreWorkflowRequest, RestoreWorkflowResponse, RiskDecision as ProtoDecision,
+    RiskDecisionKind, RiskReasonCode as ProtoReason, StageCandidateResponse,
+    StrategyKind as ProtoStrategy,
 };
 use prost::Message;
 use risk_gateway::{
@@ -34,10 +36,13 @@ use risk_gateway::{
 };
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::broker_registry::{expected_request, BrokerRecoveryError, BrokerSnapshotAuthority};
+use crate::broker_registry::{
+    expected_request, BrokerRecoveryError, BrokerSnapshotAuthority, ValidatedBrokerSnapshot,
+};
 use crate::grpc::{LiveMarketServiceImpl, MarketServiceImpl};
 use crate::option_registry::OptionRegistryAuthority;
 
@@ -230,6 +235,16 @@ pub struct RiskExecutionServiceImpl {
     clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     options: OptionRegistryAuthority,
     broker_snapshots: BrokerSnapshotAuthority,
+    broker_reconciliations: Arc<AsyncMutex<BTreeMap<i32, PendingBrokerReconciliation>>>,
+}
+
+#[derive(Clone)]
+struct PendingBrokerReconciliation {
+    snapshot_sequence: u64,
+    snapshot_hash: String,
+    expires_at: DateTime<Utc>,
+    buying_power: Decimal,
+    committed: bool,
 }
 
 struct StagedOrder {
@@ -269,6 +284,7 @@ impl RiskExecutionServiceImpl {
                     .unwrap_or_else(|_| "http://127.0.0.1:50052".into()),
             ),
             broker_snapshots: BrokerSnapshotAuthority::from_env(),
+            broker_reconciliations: Arc::new(AsyncMutex::new(BTreeMap::new())),
         }
     }
 
@@ -285,6 +301,7 @@ impl RiskExecutionServiceImpl {
             clock: Arc::new(clock),
             options: OptionRegistryAuthority::Fixture,
             broker_snapshots: BrokerSnapshotAuthority::Fixed(Err(BrokerRecoveryError::Unavailable)),
+            broker_reconciliations: Arc::new(AsyncMutex::new(BTreeMap::new())),
         }
     }
 
@@ -1523,18 +1540,178 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
                 .any(|entry| entry.record.state == OrderState::ReconcilePending);
             (response, remains)
         };
+        let account_reconciliation_pending = self
+            .broker_reconciliations
+            .lock()
+            .await
+            .values()
+            .any(|entry| !entry.committed);
         let mut broker = self
             .broker
             .write()
             .map_err(|_| Status::internal("broker authority lock poisoned"))?;
         broker.buying_power = recovered.buying_power;
-        broker.health = if reconciliation_remains {
+        broker.health = if reconciliation_remains || account_reconciliation_pending {
             BrokerHealth::Reconciling
         } else {
             BrokerHealth::Healthy
         };
-        broker.reconciled = !reconciliation_remains;
+        broker.reconciled = !reconciliation_remains && !account_reconciliation_pending;
         Ok(Response::new(response))
+    }
+
+    async fn begin_broker_reconciliation(
+        &self,
+        request: Request<BeginBrokerReconciliationRequest>,
+    ) -> Result<Response<BrokerReconciliationBatch>, Status> {
+        let now = (self.clock)();
+        let broker_id = request.into_inner().broker_id;
+        if !matches!(
+            ProtoBrokerId::try_from(broker_id).ok(),
+            Some(ProtoBrokerId::Ibkr | ProtoBrokerId::Longbridge)
+        ) {
+            return Err(Status::invalid_argument("broker route is invalid"));
+        }
+        let mut reconciliations = self.broker_reconciliations.lock().await;
+        reconciliations.insert(
+            broker_id,
+            PendingBrokerReconciliation {
+                snapshot_sequence: 0,
+                snapshot_hash: String::new(),
+                expires_at: now + chrono::Duration::seconds(15),
+                buying_power: Decimal::ZERO,
+                committed: false,
+            },
+        );
+        {
+            let mut broker = self
+                .broker
+                .write()
+                .map_err(|_| Status::internal("broker authority lock poisoned"))?;
+            broker.health = BrokerHealth::Reconciling;
+            broker.reconciled = false;
+        }
+        let ValidatedBrokerSnapshot {
+            snapshot,
+            snapshot_hash,
+            buying_power,
+        } = self
+            .broker_snapshots
+            .fetch_snapshot(broker_id, now)
+            .await
+            .map_err(|error| match error {
+                BrokerRecoveryError::Unavailable => {
+                    Status::unavailable("broker snapshot authority is unavailable")
+                }
+                BrokerRecoveryError::UnsupportedBroker => {
+                    Status::failed_precondition("broker snapshot route is not certified")
+                }
+                BrokerRecoveryError::InvalidSnapshot
+                | BrokerRecoveryError::NotReconciled
+                | BrokerRecoveryError::OrderConflict => {
+                    Status::failed_precondition("broker account snapshot did not reconcile")
+                }
+            })?;
+        let expires_at = now + chrono::Duration::seconds(15);
+        reconciliations.insert(
+            broker_id,
+            PendingBrokerReconciliation {
+                snapshot_sequence: snapshot.snapshot_sequence,
+                snapshot_hash: snapshot_hash.clone(),
+                expires_at,
+                buying_power,
+                committed: false,
+            },
+        );
+        Ok(Response::new(BrokerReconciliationBatch {
+            schema_version: "1.0".into(),
+            broker_id,
+            snapshot_sequence: snapshot.snapshot_sequence,
+            snapshot_hash,
+            snapshot_protobuf: snapshot.encode_to_vec(),
+            expires_at_utc: expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }))
+    }
+
+    async fn commit_broker_reconciliation(
+        &self,
+        request: Request<CommitBrokerReconciliationRequest>,
+    ) -> Result<Response<CommitBrokerReconciliationResponse>, Status> {
+        let now = (self.clock)();
+        let raw = request.into_inner();
+        if raw.snapshot_hash.len() != 64
+            || !raw
+                .snapshot_hash
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit())
+            || raw.mismatch_codes.len() > 100
+        {
+            return Err(Status::invalid_argument(
+                "broker reconciliation receipt is invalid",
+            ));
+        }
+        let mut pending = self.broker_reconciliations.lock().await;
+        let entry = pending
+            .get_mut(&raw.broker_id)
+            .ok_or_else(|| Status::failed_precondition("no broker reconciliation is pending"))?;
+        if entry.snapshot_sequence != raw.snapshot_sequence
+            || entry.snapshot_hash != raw.snapshot_hash
+        {
+            return Err(Status::failed_precondition(
+                "broker reconciliation receipt does not match pending snapshot",
+            ));
+        }
+        if entry.expires_at < now {
+            return Err(Status::failed_precondition(
+                "broker reconciliation receipt expired",
+            ));
+        }
+        if !raw.persistence_succeeded || !raw.mismatch_codes.is_empty() {
+            return Ok(Response::new(CommitBrokerReconciliationResponse {
+                accepted: true,
+                broker_reconciled: false,
+                reason_codes: if raw.persistence_succeeded {
+                    raw.mismatch_codes
+                } else {
+                    vec!["PERSISTENCE_FAILED".into()]
+                },
+            }));
+        }
+        let buying_power = entry.buying_power;
+        let already_committed = entry.committed;
+        let workflow_pending = workflow_lock(self)
+            .map_err(|()| Status::internal("execution workflow lock poisoned"))?
+            .orders
+            .values()
+            .any(|entry| entry.record.state == OrderState::ReconcilePending);
+        if workflow_pending {
+            return Ok(Response::new(CommitBrokerReconciliationResponse {
+                accepted: true,
+                broker_reconciled: false,
+                reason_codes: vec!["WORKFLOW_RECONCILIATION_PENDING".into()],
+            }));
+        }
+        let mut broker = self
+            .broker
+            .write()
+            .map_err(|_| Status::internal("broker authority lock poisoned"))?;
+        if !already_committed {
+            entry.committed = true;
+            broker.buying_power = buying_power;
+            broker.health = BrokerHealth::Healthy;
+            broker.reconciled = true;
+        } else if broker.health != BrokerHealth::Healthy || !broker.reconciled {
+            return Ok(Response::new(CommitBrokerReconciliationResponse {
+                accepted: true,
+                broker_reconciled: false,
+                reason_codes: vec!["BROKER_AUTHORITY_CHANGED".into()],
+            }));
+        }
+        Ok(Response::new(CommitBrokerReconciliationResponse {
+            accepted: true,
+            broker_reconciled: true,
+            reason_codes: Vec::new(),
+        }))
     }
 
     async fn restore_workflow(
@@ -2157,6 +2334,16 @@ mod tests {
             }))
             .await
             .unwrap();
+        restarted.broker_reconciliations.lock().await.insert(
+            ProtoBrokerId::Ibkr as i32,
+            PendingBrokerReconciliation {
+                snapshot_sequence: 91,
+                snapshot_hash: "c".repeat(64),
+                expires_at: now() + chrono::Duration::seconds(15),
+                buying_power: Decimal::new(80_000, 0),
+                committed: false,
+            },
+        );
         let reconciled = restarted
             .reconcile_execution_order(Request::new(ReconcileExecutionOrderRequest {
                 order_id: working.order_id,
@@ -2169,10 +2356,141 @@ mod tests {
             ProtoOrderState::Working
         );
         assert!(!reconciled.residual_exposure);
+        {
+            let authority = restarted.broker.read().unwrap();
+            assert_eq!(authority.health, BrokerHealth::Reconciling);
+            assert!(!authority.reconciled);
+        }
+        let account_commit = restarted
+            .commit_broker_reconciliation(Request::new(CommitBrokerReconciliationRequest {
+                broker_id: ProtoBrokerId::Ibkr as i32,
+                snapshot_sequence: 91,
+                snapshot_hash: "c".repeat(64),
+                persistence_succeeded: true,
+                mismatch_codes: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(account_commit.broker_reconciled);
         let authority = restarted.broker.read().unwrap();
         assert_eq!(authority.health, BrokerHealth::Healthy);
         assert!(authority.reconciled);
-        assert_eq!(authority.buying_power, Decimal::new(75_000, 0));
+        assert_eq!(authority.buying_power, Decimal::new(80_000, 0));
+    }
+
+    #[tokio::test]
+    async fn broker_fact_commit_requires_same_hash_and_durable_success() {
+        let mut service = service();
+        let snapshot = optiontrader_proto::broker_v1::BrokerSnapshot {
+            schema_version: "1.0".into(),
+            snapshot_sequence: 44,
+            account: Some(optiontrader_proto::broker_v1::AccountSnapshot {
+                broker_id: optiontrader_proto::broker_v1::BrokerId::Ibkr as i32,
+                occurred_at_utc: now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                health: optiontrader_proto::broker_v1::BrokerHealth::Healthy as i32,
+                reconciled: true,
+                buying_power: "12345".into(),
+                net_liquidation: "25000".into(),
+                currency: "USD".into(),
+            }),
+            positions: Vec::new(),
+            orders: Vec::new(),
+            fills: Vec::new(),
+        };
+        let hash = format!("{:x}", Sha256::digest(snapshot.encode_to_vec()));
+        service.broker_snapshots =
+            BrokerSnapshotAuthority::FullFixed(Ok(ValidatedBrokerSnapshot {
+                snapshot: snapshot.clone(),
+                snapshot_hash: hash.clone(),
+                buying_power: Decimal::new(12_345, 0),
+            }));
+
+        let batch = service
+            .begin_broker_reconciliation(Request::new(BeginBrokerReconciliationRequest {
+                broker_id: ProtoBrokerId::Ibkr as i32,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(batch.snapshot_protobuf, snapshot.encode_to_vec());
+        assert!(!service.broker_handle().read().unwrap().reconciled);
+
+        let wrong = service
+            .commit_broker_reconciliation(Request::new(CommitBrokerReconciliationRequest {
+                broker_id: ProtoBrokerId::Ibkr as i32,
+                snapshot_sequence: batch.snapshot_sequence,
+                snapshot_hash: "f".repeat(64),
+                persistence_succeeded: true,
+                mismatch_codes: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(wrong.code(), tonic::Code::FailedPrecondition);
+        assert!(!service.broker_handle().read().unwrap().reconciled);
+
+        let committed = service
+            .commit_broker_reconciliation(Request::new(CommitBrokerReconciliationRequest {
+                broker_id: ProtoBrokerId::Ibkr as i32,
+                snapshot_sequence: batch.snapshot_sequence,
+                snapshot_hash: hash,
+                persistence_succeeded: true,
+                mismatch_codes: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(committed.broker_reconciled);
+        let broker_handle = service.broker_handle();
+        let authority = broker_handle.read().unwrap().clone();
+        assert!(authority.reconciled);
+        assert_eq!(authority.buying_power, Decimal::new(12_345, 0));
+
+        let second = service
+            .begin_broker_reconciliation(Request::new(BeginBrokerReconciliationRequest {
+                broker_id: ProtoBrokerId::Ibkr as i32,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let failed = service
+            .commit_broker_reconciliation(Request::new(CommitBrokerReconciliationRequest {
+                broker_id: ProtoBrokerId::Ibkr as i32,
+                snapshot_sequence: second.snapshot_sequence,
+                snapshot_hash: second.snapshot_hash,
+                persistence_succeeded: false,
+                mismatch_codes: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!failed.broker_reconciled);
+        assert!(!service.broker_handle().read().unwrap().reconciled);
+        assert!(service
+            .broker_reconciliations
+            .lock()
+            .await
+            .values()
+            .any(|entry| !entry.committed));
+    }
+
+    #[tokio::test]
+    async fn unavailable_full_snapshot_leaves_sticky_account_reconciliation() {
+        let service = service();
+        let error = service
+            .begin_broker_reconciliation(Request::new(BeginBrokerReconciliationRequest {
+                broker_id: ProtoBrokerId::Ibkr as i32,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(!service.broker.read().unwrap().reconciled);
+        assert!(service
+            .broker_reconciliations
+            .lock()
+            .await
+            .values()
+            .any(|entry| !entry.committed));
     }
 
     #[tokio::test]

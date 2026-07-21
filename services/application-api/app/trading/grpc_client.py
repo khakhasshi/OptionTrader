@@ -392,18 +392,62 @@ def restore_workflow(
         channel.close()
 
 
+def begin_broker_reconciliation(broker_id: str, *, target: str | None = None) -> Any:
+    try:
+        proto_broker_id = _BROKER_PROTO[broker_id]
+    except KeyError as exc:
+        raise ValueError("broker reconciliation route is invalid") from exc
+    channel = grpc.insecure_channel(target or TRADING_CORE_GRPC)
+    try:
+        return execution_pb2_grpc.RiskExecutionServiceStub(channel).BeginBrokerReconciliation(
+            execution_pb2.BeginBrokerReconciliationRequest(broker_id=cast(Any, proto_broker_id)),
+            timeout=10,
+        )
+    finally:
+        channel.close()
+
+
+def commit_broker_reconciliation(
+    batch: Any,
+    *,
+    persistence_succeeded: bool,
+    mismatch_codes: list[str],
+    target: str | None = None,
+) -> tuple[bool, list[str]]:
+    channel = grpc.insecure_channel(target or TRADING_CORE_GRPC)
+    try:
+        response = execution_pb2_grpc.RiskExecutionServiceStub(channel).CommitBrokerReconciliation(
+            execution_pb2.CommitBrokerReconciliationRequest(
+                broker_id=batch.broker_id,
+                snapshot_sequence=batch.snapshot_sequence,
+                snapshot_hash=batch.snapshot_hash,
+                persistence_succeeded=persistence_succeeded,
+                mismatch_codes=mismatch_codes,
+            ),
+            timeout=5,
+        )
+        if not response.accepted:
+            raise ValueError("Rust rejected broker reconciliation receipt")
+        return bool(response.broker_reconciled), list(response.reason_codes)
+    finally:
+        channel.close()
+
+
 def event_context_hash(context: EventContext) -> str:
     return event_context_proto(context).context_hash
 
 
 __all__ = [
     "cancel_order",
+    "begin_broker_reconciliation",
+    "commit_broker_reconciliation",
     "confirm_candidate",
     "evaluate_candidate",
     "event_context_hash",
     "event_context_proto",
     "get_order",
     "reconcile_execution_order",
+    "restore_workflow",
     "order_from_proto",
     "stage_candidate",
 ]

@@ -103,12 +103,16 @@ class IbkrSocketClient:
                 owner._finish_snapshot_part("positions")
 
             def openOrder(self, order_id: int, contract: Any, order: Any, order_state: Any) -> None:  # noqa: N802
+                account = str(getattr(order, "account", ""))
+                if account != owner.config.account:
+                    return
                 order_type = str(getattr(order, "orderType", ""))
                 combo_legs = list(getattr(contract, "comboLegs", []) or [])
                 algo_params = list(getattr(order, "algoParams", []) or [])
                 with owner._snapshot_lock:
                     owner._open_orders[order_id] = {
                         "broker_order_id": str(order_id),
+                        "account": account,
                         "contract_id": str(
                             getattr(contract, "conId", "") or getattr(contract, "localSymbol", "")
                         ),
@@ -152,10 +156,9 @@ class IbkrSocketClient:
             ) -> None:
                 del remaining, avg_fill_price, args
                 with owner._snapshot_lock:
-                    order = owner._open_orders.setdefault(
-                        order_id,
-                        {"broker_order_id": str(order_id), "contract_id": "", "quantity": 0},
-                    )
+                    order = owner._open_orders.get(order_id)
+                    if order is None:
+                        return
                     order["status"] = status
                     order["filled"] = int(filled)
                     owner._snapshot_sequence += 1

@@ -135,6 +135,7 @@ class _FakeNativeClient:
         self.orders: list[dict[str, object]] = [
             {
                 "broker_order_id": "901",
+                "account": "DU123",
                 "contract_id": "999",
                 "contract_ids": [999],
                 "combo_actions": [],
@@ -183,6 +184,7 @@ class _FakeNativeClient:
         self.orders.append(
             {
                 "broker_order_id": "900",
+                "account": order.account,
                 "contract_id": "",
                 "contract_ids": [leg.con_id for leg in contract.combo_legs],
                 "combo_actions": [leg.action for leg in contract.combo_legs],
@@ -239,6 +241,18 @@ def test_native_backend_recovers_remote_order_after_restart_without_resubmit() -
     read_only_restart = NativeIbkrBackend(client)  # type: ignore[arg-type]
     recovered_read_only = read_only_restart.recover(_request(), "900")
     assert recovered_read_only.broker_order_id == "900"
+    assert client.placed == 1
+
+
+def test_native_backend_never_recovers_another_accounts_order() -> None:
+    client = _FakeNativeClient()
+    first = NativeIbkrBackend(client)  # type: ignore[arg-type]
+    assert first.submit(_request()).broker_order_id == "900"
+    client.orders[-1]["account"] = "DU999"
+
+    restarted = NativeIbkrBackend(client)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="different active order"):
+        restarted.recover(_request(), "900")
     assert client.placed == 1
 
 

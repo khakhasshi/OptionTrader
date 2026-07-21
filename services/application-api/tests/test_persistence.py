@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -27,15 +28,19 @@ from sqlalchemy.engine import Engine
 from app.persistence import (
     SignalContext,
     audit_events,
+    broker_snapshots,
     candidate_trade_plans,
     claim_confirmation_intent,
     confirmation_capabilities,
     build_signal_contract,
     build_signal_rows,
     event_contexts,
+    fills,
     metadata,
     order_events,
     orders,
+    position_snapshots,
+    persist_broker_reconciliation,
     persist_order_projection,
     persist_signal,
     persist_event_context,
@@ -44,6 +49,7 @@ from app.persistence import (
     risk_decisions,
     signals,
 )
+from app.grpc_gen import broker_pb2, execution_pb2
 from app.persistence import repository
 from app.events import unavailable_event_context
 from app.regime import CHAOS, EVENT, NO_TRADE as REGIME_NO_TRADE, RANGE, TREND, RegimeState
@@ -374,6 +380,134 @@ def test_execution_persistence_is_atomic_idempotent_and_encrypts_token(
     assert confirmation_cipher.decrypt(capability_row["token_ciphertext"]) == "never-persist-this"
     assert order_row["status"] == "AWAITING_CONFIRMATION"
     assert order_row["state_version"] == 1
+
+
+def _broker_batch(snapshot: Any) -> Any:
+    raw = snapshot.SerializeToString(deterministic=True)
+    return execution_pb2.BrokerReconciliationBatch(
+        schema_version="1.0",
+        broker_id=execution_pb2.BROKER_ID_IBKR,
+        snapshot_sequence=snapshot.snapshot_sequence,
+        snapshot_hash=sha256(raw).hexdigest(),
+        snapshot_protobuf=raw,
+        expires_at_utc="2099-07-21T14:31:00Z",
+    )
+
+
+def test_broker_fact_ledger_persists_exact_snapshot_and_is_idempotent(
+    engine: Engine, confirmation_cipher: ConfirmationCipher
+) -> None:
+    plan, result = _staged_models()
+    persist_staged_candidate(engine, plan, result, confirmation_cipher)
+    assert result.order is not None
+    working = result.order.model_copy(
+        update={
+            "state": "WORKING",
+            "state_version": 4,
+            "broker_order_id": "900",
+            "updated_at_utc": "2026-07-21T14:30:00Z",
+            "residual_exposure": True,
+        }
+    )
+    persist_order_projection(engine, working, action="WORKING", actor="gateway")
+    snapshot = broker_pb2.BrokerSnapshot(
+        schema_version="1.0",
+        snapshot_sequence=12,
+        account=broker_pb2.AccountSnapshot(
+            broker_id=broker_pb2.BROKER_ID_IBKR,
+            occurred_at_utc="2026-07-21T14:30:01Z",
+            health=broker_pb2.BROKER_HEALTH_HEALTHY,
+            reconciled=True,
+            buying_power="10000",
+            net_liquidation="25000",
+            currency="USD",
+        ),
+        positions=[
+            broker_pb2.PositionSnapshot(contract_id="101", quantity=1, average_price="1.25")
+        ],
+        orders=[
+            broker_pb2.BrokerOrderSnapshot(
+                broker_order_id="900",
+                idempotency_key=plan.idempotency_key,
+                plan_hash=plan.plan_hash,
+                status=broker_pb2.BROKER_ORDER_STATUS_WORKING,
+                total_quantity=1,
+                filled_quantity=0,
+                submitted_price=plan.limit_price,
+                side=broker_pb2.ORDER_SIDE_BUY,
+                order_type=broker_pb2.BROKER_ORDER_TYPE_LIMIT,
+                residual_exposure=True,
+            )
+        ],
+        fills=[
+            broker_pb2.FillSnapshot(
+                fill_id="exec-1",
+                broker_order_id="900",
+                contract_id="101",
+                side=broker_pb2.ORDER_SIDE_BUY,
+                quantity=1,
+                price="1.25",
+                occurred_at_utc="2026-07-21T14:30:00Z",
+            )
+        ],
+    )
+    batch = _broker_batch(snapshot)
+    assert persist_broker_reconciliation(engine, batch) == []
+    assert persist_broker_reconciliation(engine, batch) == []
+
+    with engine.connect() as conn:
+        broker_row = conn.execute(select(broker_snapshots)).mappings().one()
+        position_rows = conn.execute(select(position_snapshots)).mappings().all()
+        fill_rows = conn.execute(select(fills)).mappings().all()
+    assert broker_row["snapshot_hash"] == batch.snapshot_hash
+    assert broker_row["reconciled"] is True
+    assert len(position_rows) == len(fill_rows) == 1
+    assert fill_rows[0]["order_id"] == working.order_id
+
+    changed = broker_pb2.BrokerSnapshot()
+    changed.CopyFrom(snapshot)
+    changed.snapshot_sequence = 14
+    changed.fills[0].price = "1.30"
+    assert persist_broker_reconciliation(engine, _broker_batch(changed)) == [
+        "BROKER_FILL_IDENTITY_CONFLICT"
+    ]
+
+
+def test_broker_fact_ledger_detects_unknown_order_and_fill(engine: Engine) -> None:
+    snapshot = broker_pb2.BrokerSnapshot(
+        schema_version="1.0",
+        snapshot_sequence=13,
+        account=broker_pb2.AccountSnapshot(
+            broker_id=broker_pb2.BROKER_ID_IBKR,
+            occurred_at_utc="2026-07-21T14:30:01Z",
+            health=broker_pb2.BROKER_HEALTH_HEALTHY,
+            reconciled=True,
+            buying_power="10000",
+            net_liquidation="25000",
+            currency="USD",
+        ),
+        orders=[
+            broker_pb2.BrokerOrderSnapshot(
+                broker_order_id="external-1",
+                status=broker_pb2.BROKER_ORDER_STATUS_WORKING,
+            )
+        ],
+        fills=[
+            broker_pb2.FillSnapshot(
+                fill_id="exec-external",
+                broker_order_id="historical-external",
+                contract_id="101",
+                side=broker_pb2.ORDER_SIDE_BUY,
+                quantity=1,
+                price="1.25",
+                occurred_at_utc="2026-07-21T14:30:00Z",
+            )
+        ],
+    )
+    assert persist_broker_reconciliation(engine, _broker_batch(snapshot)) == [
+        "UNKNOWN_ACTIVE_BROKER_ORDER",
+        "UNKNOWN_BROKER_FILL",
+    ]
 
 
 def test_workflow_restore_only_decrypts_unclaimed_unexpired_capability(

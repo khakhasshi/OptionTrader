@@ -305,6 +305,39 @@ message RestoreWorkflowResponse {
   repeated string reconciliation_order_ids = 2;
 }
 
+// Full-account reconciliation is a two-phase, fail-closed handshake. Begin
+// closes Rust broker authority before returning the exact adapter snapshot.
+// Commit may reopen it only for the same fresh sequence/hash after durable
+// persistence reports no mismatch.
+message BeginBrokerReconciliationRequest {
+  BrokerId broker_id = 1;
+}
+
+message BrokerReconciliationBatch {
+  string schema_version = 1;
+  BrokerId broker_id = 2;
+  uint64 snapshot_sequence = 3;
+  string snapshot_hash = 4;
+  // Exact deterministic optiontrader.broker.v1.BrokerSnapshot protobuf bytes.
+  // Bytes avoid a generated-code package-layout dependency and are hash-bound.
+  bytes snapshot_protobuf = 5;
+  string expires_at_utc = 6;
+}
+
+message CommitBrokerReconciliationRequest {
+  BrokerId broker_id = 1;
+  uint64 snapshot_sequence = 2;
+  string snapshot_hash = 3;
+  bool persistence_succeeded = 4;
+  repeated string mismatch_codes = 5;
+}
+
+message CommitBrokerReconciliationResponse {
+  bool accepted = 1;
+  bool broker_reconciled = 2;
+  repeated string reason_codes = 3;
+}
+
 service RiskExecutionService {
   rpc EvaluateCandidate(EvaluateCandidateRequest) returns (RiskDecision);
   rpc StageCandidate(EvaluateCandidateRequest) returns (StageCandidateResponse);
@@ -313,4 +346,6 @@ service RiskExecutionService {
   rpc GetOrder(GetOrderRequest) returns (ExecutionOrder);
   rpc ReconcileExecutionOrder(ReconcileExecutionOrderRequest) returns (ExecutionOrder);
   rpc RestoreWorkflow(RestoreWorkflowRequest) returns (RestoreWorkflowResponse);
+  rpc BeginBrokerReconciliation(BeginBrokerReconciliationRequest) returns (BrokerReconciliationBatch);
+  rpc CommitBrokerReconciliation(CommitBrokerReconciliationRequest) returns (CommitBrokerReconciliationResponse);
 }

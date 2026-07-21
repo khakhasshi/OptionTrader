@@ -12,9 +12,12 @@ row already exists (replay re-runs must not duplicate or error).
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from hashlib import sha256
 from typing import Any
+from uuid import uuid4
 
+from google.protobuf.json_format import MessageToDict
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -23,14 +26,18 @@ from sqlalchemy.engine import Engine
 from app.persistence.serialize import SignalContext, build_signal_rows
 from app.persistence.tables import (
     audit_events,
+    broker_snapshots,
     candidate_trade_plans,
     confirmation_capabilities,
     event_contexts,
+    fills,
     order_events,
     orders,
+    position_snapshots,
     risk_decisions,
     signals,
 )
+from app.grpc_gen import broker_pb2
 from app.events import EventContext
 from app.regime import RegimeState
 from app.strategy import StrategyDecision
@@ -160,6 +167,289 @@ def persist_event_context(engine: Engine, session_id: str, context: EventContext
             return False
         conn.execute(audit_events.insert().values(**audit))
     return True
+
+
+def _broker_name(value: int) -> str:
+    names = {
+        int(broker_pb2.BROKER_ID_LONGBRIDGE): "longbridge",
+        int(broker_pb2.BROKER_ID_IBKR): "ibkr",
+    }
+    try:
+        return names[value]
+    except KeyError as exc:
+        raise ValueError("broker reconciliation has an invalid broker id") from exc
+
+
+def persist_broker_reconciliation(engine: Engine, batch: Any) -> list[str]:
+    """Atomically persist and compare one Rust-issued full broker snapshot.
+
+    The returned stable mismatch codes are sent back to Rust. An empty list is
+    the only result that may reopen broker authority. The snapshot hash is
+    independently recomputed from protobuf bytes before any database write.
+    """
+    if batch.schema_version != "1.0" or not batch.snapshot_protobuf:
+        raise ValueError("broker reconciliation batch is incomplete")
+    snapshot = broker_pb2.BrokerSnapshot.FromString(batch.snapshot_protobuf)
+    broker = _broker_name(int(batch.broker_id))
+    if (
+        int(snapshot.account.broker_id) != int(batch.broker_id)
+        or snapshot.snapshot_sequence != batch.snapshot_sequence
+    ):
+        raise ValueError("broker reconciliation identity is inconsistent")
+    snapshot_hash = sha256(batch.snapshot_protobuf).hexdigest()
+    if snapshot_hash != batch.snapshot_hash:
+        raise ValueError("broker reconciliation snapshot hash mismatch")
+    occurred = datetime.fromisoformat(snapshot.account.occurred_at_utc.replace("Z", "+00:00"))
+    expires = datetime.fromisoformat(batch.expires_at_utc.replace("Z", "+00:00"))
+    if occurred.tzinfo is None or expires.tzinfo is None or expires <= _now_utc():
+        raise ValueError("broker reconciliation batch is expired or has naive time")
+
+    payload = MessageToDict(snapshot, preserving_proto_field_name=True)
+    created = _now_utc()
+    mismatch_codes: set[str] = set()
+    remote_order_ids = [
+        broker_order_id
+        for item in snapshot.orders
+        for broker_order_id in [
+            item.broker_order_id,
+            *(child.broker_order_id for child in item.child_orders),
+        ]
+    ]
+    remote_fill_ids = [item.fill_id for item in snapshot.fills]
+    remote_position_ids = [item.contract_id for item in snapshot.positions]
+    if len(remote_order_ids) != len(set(remote_order_ids)):
+        mismatch_codes.add("DUPLICATE_BROKER_ORDER_ID")
+    if len(remote_fill_ids) != len(set(remote_fill_ids)):
+        mismatch_codes.add("DUPLICATE_BROKER_FILL_ID")
+    if len(remote_position_ids) != len(set(remote_position_ids)):
+        mismatch_codes.add("DUPLICATE_BROKER_POSITION_ID")
+
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(broker_snapshots.c.payload).where(
+                broker_snapshots.c.broker_id == broker,
+                broker_snapshots.c.snapshot_sequence == batch.snapshot_sequence,
+                broker_snapshots.c.snapshot_hash == snapshot_hash,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if existing.get("snapshot") != payload:
+                raise ValueError("persisted broker snapshot identity conflicts")
+            return [str(code) for code in existing.get("mismatch_codes", [])]
+
+        local_rows = conn.execute(
+            select(
+                orders.c.order_id,
+                orders.c.session_id,
+                orders.c.status,
+                orders.c.broker_order_id,
+                orders.c.payload,
+            )
+        ).mappings()
+        local_by_broker_id: dict[str, tuple[str, str]] = {}
+        active_local_ids: set[str] = set()
+        active_states = {
+            "SUBMITTING",
+            "WORKING",
+            "PARTIAL_FILL",
+            "CANCEL_PENDING",
+            "RECONCILE_PENDING",
+        }
+        for row in local_rows:
+            order_payload = row["payload"] if isinstance(row["payload"], dict) else {}
+            if order_payload.get("broker_id") != broker:
+                continue
+            ids = [str(row["broker_order_id"] or "")]
+            child_ids = order_payload.get("broker_child_order_ids", [])
+            if isinstance(child_ids, list):
+                ids.extend(str(value) for value in child_ids)
+            for broker_order_id in {value for value in ids if value}:
+                existing_identity = local_by_broker_id.get(broker_order_id)
+                if existing_identity is not None and existing_identity[0] != str(row["order_id"]):
+                    mismatch_codes.add("LOCAL_BROKER_ORDER_ID_CONFLICT")
+                local_by_broker_id[broker_order_id] = (
+                    str(row["order_id"]),
+                    str(row["session_id"]),
+                )
+                if str(row["status"]) in active_states:
+                    active_local_ids.add(broker_order_id)
+
+        remote_ids = set(remote_order_ids)
+        if active_local_ids - remote_ids:
+            mismatch_codes.add("LOCAL_ACTIVE_ORDER_MISSING_AT_BROKER")
+        if remote_ids - set(local_by_broker_id):
+            mismatch_codes.add("UNKNOWN_ACTIVE_BROKER_ORDER")
+        if any(
+            fill.broker_order_id not in local_by_broker_id
+            and fill.broker_order_id not in remote_ids
+            for fill in snapshot.fills
+        ):
+            mismatch_codes.add("UNKNOWN_BROKER_FILL")
+        if snapshot.fills:
+            persisted_fills = {
+                str(row["fill_id"]): row
+                for row in conn.execute(
+                    select(fills).where(
+                        fills.c.fill_id.in_([f"{broker}:{fill.fill_id}" for fill in snapshot.fills])
+                    )
+                ).mappings()
+            }
+            for fill in snapshot.fills:
+                existing_fill = persisted_fills.get(f"{broker}:{fill.fill_id}")
+                if existing_fill is None:
+                    continue
+                existing_time = existing_fill["occurred_at_utc"]
+                if existing_time.tzinfo is None:
+                    existing_time = existing_time.replace(tzinfo=timezone.utc)
+                incoming_time = datetime.fromisoformat(fill.occurred_at_utc.replace("Z", "+00:00"))
+                incoming_side = broker_pb2.OrderSide.Name(fill.side).removeprefix("ORDER_SIDE_")
+                if (
+                    str(existing_fill["broker_order_id"]) != fill.broker_order_id
+                    or str(existing_fill["contract_id"]) != fill.contract_id
+                    or str(existing_fill["side"]) != incoming_side
+                    or Decimal(str(existing_fill["quantity"])) != Decimal(fill.quantity)
+                    or Decimal(str(existing_fill["price"])) != Decimal(fill.price)
+                    or existing_time != incoming_time
+                ):
+                    mismatch_codes.add("BROKER_FILL_IDENTITY_CONFLICT")
+
+        mismatches = sorted(mismatch_codes)
+        sessions = {session_id for _, session_id in local_by_broker_id.values()}
+        session_id = next(iter(sessions)) if len(sessions) == 1 else None
+        snapshot_payload = {"snapshot": payload, "mismatch_codes": mismatches}
+        conn.execute(
+            broker_snapshots.insert().values(
+                session_id=session_id,
+                occurred_at_utc=occurred,
+                broker_health=broker_pb2.BrokerHealth.Name(snapshot.account.health).removeprefix(
+                    "BROKER_HEALTH_"
+                ),
+                buying_power=snapshot.account.buying_power,
+                payload=snapshot_payload,
+                created_at_utc=created,
+                broker_id=broker,
+                snapshot_sequence=batch.snapshot_sequence,
+                snapshot_hash=snapshot_hash,
+                net_liquidation=snapshot.account.net_liquidation,
+                reconciled=not mismatches,
+                mismatch_codes=mismatches,
+            )
+        )
+        for position in snapshot.positions:
+            conn.execute(
+                position_snapshots.insert().values(
+                    session_id=session_id,
+                    occurred_at_utc=occurred,
+                    symbol=position.contract_id,
+                    quantity=position.quantity,
+                    avg_price=position.average_price,
+                    unrealized_pnl=None,
+                    payload=MessageToDict(position, preserving_proto_field_name=True),
+                    created_at_utc=created,
+                    broker_id=broker,
+                    snapshot_sequence=batch.snapshot_sequence,
+                    snapshot_hash=snapshot_hash,
+                    contract_id=position.contract_id,
+                )
+            )
+        for fill in snapshot.fills:
+            identity = local_by_broker_id.get(fill.broker_order_id)
+            fill_row = {
+                "fill_id": f"{broker}:{fill.fill_id}",
+                "order_id": identity[0] if identity else None,
+                "session_id": identity[1] if identity else None,
+                "occurred_at_utc": datetime.fromisoformat(
+                    fill.occurred_at_utc.replace("Z", "+00:00")
+                ),
+                "quantity": fill.quantity,
+                "price": fill.price,
+                "payload": MessageToDict(fill, preserving_proto_field_name=True),
+                "created_at_utc": created,
+                "broker_id": broker,
+                "broker_order_id": fill.broker_order_id,
+                "contract_id": fill.contract_id,
+                "side": broker_pb2.OrderSide.Name(fill.side).removeprefix("ORDER_SIDE_"),
+                "snapshot_hash": snapshot_hash,
+            }
+            if conn.dialect.name == "postgresql":
+                conn.execute(
+                    postgresql_insert(fills)
+                    .values(**fill_row)
+                    .on_conflict_do_nothing(index_elements=[fills.c.fill_id])
+                )
+            elif conn.dialect.name == "sqlite":
+                conn.execute(
+                    sqlite_insert(fills)
+                    .values(**fill_row)
+                    .on_conflict_do_nothing(index_elements=[fills.c.fill_id])
+                )
+            else:
+                if (
+                    conn.execute(
+                        select(fills.c.fill_id).where(fills.c.fill_id == fill_row["fill_id"])
+                    ).first()
+                    is None
+                ):
+                    conn.execute(fills.insert().values(**fill_row))
+        conn.execute(
+            audit_events.insert().values(
+                event_id=f"broker_reconcile_{broker}_{snapshot_hash[:24]}",
+                session_id=session_id,
+                occurred_at_utc=occurred,
+                actor="broker-reconciliation-supervisor",
+                action="BROKER_SNAPSHOT_RECONCILED" if not mismatches else "BROKER_SNAPSHOT_DIFF",
+                entity_type="BrokerSnapshot",
+                entity_id=f"{broker}:{batch.snapshot_sequence}",
+                from_status="RECONCILING",
+                to_status="HEALTHY" if not mismatches else "RECONCILING",
+                payload={"snapshot_hash": snapshot_hash, "mismatch_codes": mismatches},
+                created_at_utc=created,
+            )
+        )
+    return sorted(mismatch_codes)
+
+
+def persist_broker_reconciliation_failure(
+    engine: Engine, broker: str, reason_code: str, *, order_id: str | None = None
+) -> None:
+    """Append a sanitized failed-attempt record without storing exception text."""
+    if broker not in {"ibkr", "longbridge"} or not reason_code.isupper():
+        raise ValueError("broker reconciliation failure code is invalid")
+    occurred = _now_utc()
+    with engine.begin() as conn:
+        conn.execute(
+            audit_events.insert().values(
+                event_id=f"broker_reconcile_failure_{uuid4().hex}",
+                session_id=None,
+                occurred_at_utc=occurred,
+                actor="broker-reconciliation-supervisor",
+                action="BROKER_RECONCILIATION_FAILED",
+                entity_type="ExecutionOrder" if order_id else "BrokerAccount",
+                entity_id=order_id or broker,
+                from_status="RECONCILING",
+                to_status="RECONCILING",
+                payload={"broker_id": broker, "reason_code": reason_code},
+                created_at_utc=occurred,
+            )
+        )
+
+
+def pending_reconciliation_orders(engine: Engine) -> list[tuple[str, str]]:
+    """Return durable unresolved order/broker identities deterministically."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(orders.c.order_id, orders.c.payload)
+            .where(orders.c.status == "RECONCILE_PENDING")
+            .order_by(orders.c.order_id)
+        ).mappings()
+        result: list[tuple[str, str]] = []
+        for row in rows:
+            payload = row["payload"] if isinstance(row["payload"], dict) else {}
+            broker = payload.get("broker_id")
+            if broker not in {"ibkr", "longbridge"}:
+                raise ValueError("pending order has no valid durable broker route")
+            result.append((str(row["order_id"]), str(broker)))
+        return result
 
 
 def persist_staged_candidate(

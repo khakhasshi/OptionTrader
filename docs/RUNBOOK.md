@@ -92,6 +92,12 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
    确认安全边界。实时 SessionHub 仍是每进程实例，完整横向扩展尚未认证，paper soak 前
    仍建议单 worker。若 Confirm 的 gRPC 已成功但投影写入失败，claim 不得自动释放；先调用
    GetOrder 对账并回填投影，确认 Rust 已停留在非 `AWAITING_CONFIRMATION` 状态。
+9. 配置数据库与 Fernet key 后，持续 Broker 对账默认启用；可设置
+   `OPTIONTRADER_BROKER_RECONCILIATION_INTERVAL_SECONDS=30`（仅允许 5–300 秒）。每轮先由
+   Rust `BeginBrokerReconciliation` 关闭 Broker 闸门并签发 15 秒快照，再由 Application API
+   原子写入 PostgreSQL，最后以同 sequence/hash 回执。查看
+   `GET /api/v1/trading/reconciliation`；任何 failure/mismatch/unresolved 都必须保持 false。
+   `OPTIONTRADER_BROKER_RECONCILIATION_ENABLED=false` 仅供本地非交易开发，不能作为 paper 配置。
 
 ## Broker SDK 认证前启动
 
