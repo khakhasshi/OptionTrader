@@ -136,6 +136,49 @@ message ThetaSdkBarBatch {
   string session_date = 5; // YYYY-MM-DD in America/New_York
 }
 
+enum ThetaOptionRight {
+  THETA_OPTION_RIGHT_UNSPECIFIED = 0;
+  THETA_OPTION_RIGHT_CALL = 1;
+  THETA_OPTION_RIGHT_PUT = 2;
+}
+
+message ThetaOptionContractRequest {
+  string contract_id = 1;
+  string symbol = 2;
+  string expiration = 3;
+  string strike = 4;
+  ThetaOptionRight right = 5;
+}
+
+message ThetaOptionSnapshotRequest {
+  repeated ThetaOptionContractRequest contracts = 1;
+}
+
+message ThetaOptionSnapshot {
+  string contract_id = 1;
+  string symbol = 2;
+  string expiration = 3;
+  string strike = 4;
+  ThetaOptionRight right = 5;
+  string bid = 6;
+  string ask = 7;
+  uint32 bid_size = 8;
+  uint32 ask_size = 9;
+  string occurred_at_utc = 10;
+  string delta = 11;
+  string gamma = 12;
+  string theta = 13;
+  string vega = 14;
+  string provider = 15; // const THETADATA
+}
+
+message ThetaOptionSnapshotBatch {
+  string chain_snapshot_id = 1;
+  string fetched_at_utc = 2;
+  repeated ThetaOptionSnapshot snapshots = 3;
+  string provider = 4; // const THETADATA
+}
+
 service MarketService {
   // Server-streaming tick feed in deterministic occurred_at_utc order. Each
   // tick carries both the aggregate snapshot and its raw per-minute bar.
@@ -148,4 +191,7 @@ service MarketService {
 // Rust consumes this service and remains authoritative for market health.
 service ThetaDataSdkService {
   rpc StreamCompletedBars(ThetaSdkStreamRequest) returns (stream ThetaSdkBarBatch);
+  // Exact-contract quote + first-order Greeks proof. The bridge derives the
+  // batch id from deterministic protobuf bytes; credentials never cross it.
+  rpc GetOptionSnapshots(ThetaOptionSnapshotRequest) returns (ThetaOptionSnapshotBatch);
 }

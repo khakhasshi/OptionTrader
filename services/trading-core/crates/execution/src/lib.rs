@@ -75,9 +75,61 @@ pub struct OrderRecord {
     pub residual_exposure: bool,
     pub confirmation_id: Option<String>,
     pub events: Vec<OrderEvent>,
+    base_state_version: u64,
+    restored_updated_at: Option<DateTime<Utc>>,
 }
 
 impl OrderRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn restored(
+        order_id: String,
+        plan_id: String,
+        plan_hash: String,
+        idempotency_key: String,
+        state: OrderState,
+        expires_at: DateTime<Utc>,
+        total_quantity: u32,
+        filled_quantity: u32,
+        broker_order_id: Option<String>,
+        broker_child_orders: Vec<BrokerChildOrder>,
+        residual_exposure: bool,
+        state_version: u64,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Self, ExecutionError> {
+        if order_id.is_empty()
+            || plan_id.is_empty()
+            || plan_hash.len() != 64
+            || idempotency_key.is_empty()
+            || total_quantity == 0
+            || filled_quantity > total_quantity
+            || state_version == 0
+        {
+            return Err(ExecutionError::DuplicateConflict);
+        }
+        let broker_child_order_ids = broker_child_orders
+            .iter()
+            .map(|child| child.broker_order_id.clone())
+            .collect();
+        Ok(Self {
+            order_id,
+            plan_id,
+            plan_hash,
+            idempotency_key,
+            state,
+            expires_at,
+            total_quantity,
+            filled_quantity,
+            broker_order_id,
+            broker_child_order_ids,
+            broker_child_orders,
+            residual_exposure,
+            confirmation_id: None,
+            events: Vec::new(),
+            base_state_version: state_version,
+            restored_updated_at: Some(updated_at),
+        })
+    }
+
     pub fn proposed(
         order_id: String,
         plan_id: String,
@@ -104,7 +156,20 @@ impl OrderRecord {
             residual_exposure: false,
             confirmation_id: None,
             events: Vec::new(),
+            base_state_version: 0,
+            restored_updated_at: None,
         })
+    }
+
+    pub fn state_version(&self) -> u64 {
+        self.base_state_version + self.events.len() as u64
+    }
+
+    pub fn updated_at(&self, fallback: DateTime<Utc>) -> DateTime<Utc> {
+        self.events.last().map_or_else(
+            || self.restored_updated_at.unwrap_or(fallback),
+            |event| event.occurred_at,
+        )
     }
 
     fn transition(
@@ -119,7 +184,7 @@ impl OrderRecord {
         let from = self.state;
         self.state = to;
         self.events.push(OrderEvent {
-            sequence: self.events.len() as u64 + 1,
+            sequence: self.state_version() + 1,
             from,
             to,
             kind,
@@ -249,7 +314,7 @@ impl OrderRecord {
                 return Ok(());
             }
             self.events.push(OrderEvent {
-                sequence: self.events.len() as u64 + 1,
+                sequence: self.state_version() + 1,
                 from: target,
                 to: target,
                 kind: if order.filled_quantity != previous_filled_quantity {

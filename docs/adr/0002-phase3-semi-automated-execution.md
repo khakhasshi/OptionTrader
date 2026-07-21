@@ -1,6 +1,6 @@
 # ADR 0002：Phase 3 半自动执行边界
 
-- 状态：Accepted（首个切片；真实 Broker 适配与恢复仍在进行）
+- 状态：Accepted（Phase 3 开发基线；真实 Broker 现场认证仍在进行）
 - 日期：2026-07-21
 
 ## 背景
@@ -46,19 +46,28 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
 13. ExecutionOrder 1.1 携带完整子单投影。任何部分成交或 active/unknown 子单都必须显式
     形成残余敞口；持久化层禁止成交量回退、子单消失，以及没有 FILLED 或零成交终态证明的
     residual true→false。操作响应复用同一 state_version 但内容冲突时，前端要求对账。
+14. ThetaData SDK bridge 为 exact-contract quote/size/Greeks 生成内容寻址的 chain snapshot id。
+    Rust 持有可信 registry，在 Stage 与 Confirm 对候选 proof 做逐字段复核。Standard entitlement
+    的 first-order 端点没有 Gamma，二阶端点需要 Professional；因此 Gamma 只能从同一 ThetaData
+    first-order Delta/IV/underlying/time 确定性推导，时间不同步时拒绝，不允许 Broker 数据回填。
+15. PostgreSQL 是 workflow 重启真相。Rust `RestoreWorkflow` 原子校验全部 identity/hash/version：
+    未 claim 且未过期的确认能力可恢复；终态保持；其余非终态提升为 ReconcilePending 并增加版本。
+    恢复不触发提交，且返回明确的 Broker 对账清单。
+16. IBKR sidecar 只绑定 loopback，并在账户、持仓、未结订单、成交四个 snapshot end callback
+    全部完成前保持未对账。未知活动订单会使账户对账失败。Longbridge reconcile 同步读取账户、
+    持仓、全部活动订单和当日成交；未知活动订单或无法归属的成交 fail closed。
 
 ## 当前限制
 
-- Rust workflow 和 PaperBroker 仍为进程内状态。重启后保留 PostgreSQL 投影但不自动
-  重建执行事实，系统会闭锁并要求对账。
+- PaperBroker 和真实 Broker 连接仍为进程内状态。PostgreSQL workflow 已自动重建，但所有
+  可能已提交的订单只恢复为 `RECONCILE_PENDING`；当前不会自动替操作者完成 Broker 对账。
 - capability 密文只有持有同一 Fernet 密钥的 API 实例可解密；缺失、错误或轮换不当均
   fail closed。密钥轮换与多密钥解密尚未实现。
 - Broker snapshot 尚未成为账户风险字段的动态来源；首个切片仍由启动配置注入。
-- Candidate 1.2 强制声明 ThetaData 来源并由 Rust 校验，但证明仍来自候选输入；受信任的
-  ThetaData option snapshot registry 尚未进入 Rust 权威状态，因此不能把来源字符串视为
-  paper/live Gate，真实提交继续禁用。
-- Longbridge/IBKR SDK 映射已开始，订单/成交全量流、sidecar gRPC、自动重启对账、持仓管理
-  和保护性退出仍待后续切片。
+- ThetaData Standard 的二阶/all-Greeks entitlement 不可用。derived Gamma 已有确定性实现和
+  时间同步闸门，但完整 RTH option soak 仍是 paper Gate。
+- IBKR sidecar gRPC 与四类快照代码已完成，Longbridge 当日成交与未知活动订单闭锁已完成；
+  尚未完成真实 TWS/Gateway/Longbridge paper 账户的全天现场认证，也未启用 live 提交。
 
 ## 后果
 

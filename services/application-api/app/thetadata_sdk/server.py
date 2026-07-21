@@ -8,14 +8,20 @@ import os
 import grpc
 
 from app.grpc_gen import market_pb2_grpc
-from app.thetadata_sdk.service import ThetaDataBarSource, ThetaDataSdkService, create_sdk_client
+from app.thetadata_sdk.service import (
+    ThetaDataBarSource,
+    ThetaDataOptionSource,
+    ThetaDataSdkService,
+    create_sdk_client,
+)
 
 
 async def serve() -> None:
     bind = os.getenv("THETADATA_SDK_BIND", "127.0.0.1:50052")
     server = grpc.aio.server()
+    client = create_sdk_client()
     market_pb2_grpc.add_ThetaDataSdkServiceServicer_to_server(
-        ThetaDataSdkService(ThetaDataBarSource(create_sdk_client())), server
+        ThetaDataSdkService(ThetaDataBarSource(client), ThetaDataOptionSource(client)), server
     )
     if server.add_insecure_port(bind) == 0:
         raise RuntimeError(f"cannot bind ThetaData SDK bridge to {bind}")

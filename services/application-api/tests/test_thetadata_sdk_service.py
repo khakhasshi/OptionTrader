@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, date, datetime
-from typing import Any
+from decimal import Decimal
+from typing import Any, cast
 
 import pandas as pd
 import pytest
 
 from app.grpc_gen import market_pb2
-from app.thetadata_sdk.service import ThetaDataBarSource, ThetaDataSdkService, normalize_ohlc_frame
+from app.thetadata_sdk.service import (
+    ThetaDataBarSource,
+    ThetaDataOptionSource,
+    ThetaDataSdkService,
+    normalize_ohlc_frame,
+    normalize_option_snapshot,
+)
 
 
 def frame() -> pd.DataFrame:
@@ -61,6 +68,30 @@ class FakeClient:
         self.calls.append(kwargs)
         return frame()
 
+    def option_snapshot_quote(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-07-20 10:29:59.800-04:00"]),
+                "bid": [2.4],
+                "ask": [2.5],
+                "bid_size": [20],
+                "ask_size": [25],
+            }
+        )
+
+    def option_snapshot_greeks_first_order(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-07-20 10:30:00-04:00"]),
+                "delta": [0.52],
+                "gamma": [0.08],
+                "theta": [-0.12],
+                "vega": [0.05],
+            }
+        )
+
 
 class AbortContext:
     async def abort(self, code: Any, details: str) -> None:
@@ -104,3 +135,68 @@ def test_invalid_contract_fails_closed_before_sdk_call() -> None:
     with pytest.raises(RuntimeError, match="INVALID_ARGUMENT"):
         asyncio.run(first())
     assert client.calls == []
+
+
+def option_contract() -> Any:
+    return market_pb2.ThetaOptionContractRequest(
+        contract_id="QQQ-20260720-500-C",
+        symbol="QQQ",
+        expiration="2026-07-20",
+        strike="500",
+        right=market_pb2.THETA_OPTION_RIGHT_CALL,
+    )
+
+
+def test_option_quote_and_greeks_form_deterministic_thetadata_proof() -> None:
+    client = FakeClient()
+    service = ThetaDataSdkService(
+        ThetaDataBarSource(client),
+        ThetaDataOptionSource(client),
+        clock=lambda: datetime(2026, 7, 20, 14, 30, 1, tzinfo=UTC),
+    )
+
+    async def fetch() -> Any:
+        return await service.GetOptionSnapshots(
+            market_pb2.ThetaOptionSnapshotRequest(contracts=[option_contract()]), AbortContext()
+        )
+
+    first = asyncio.run(fetch())
+    second = asyncio.run(fetch())
+    assert first.chain_snapshot_id == second.chain_snapshot_id
+    assert first.provider == "THETADATA"
+    assert first.snapshots[0].occurred_at_utc == "2026-07-20T14:29:59.800Z"
+    assert first.snapshots[0].bid == "2.4"
+    assert first.snapshots[0].delta == "0.52"
+    assert client.calls[0]["right"] == "call"
+
+
+def test_option_normalization_rejects_duplicate_crossed_or_unsynchronized_rows() -> None:
+    client = FakeClient()
+    quote = cast(pd.DataFrame, client.option_snapshot_quote())
+    greeks = cast(pd.DataFrame, client.option_snapshot_greeks_first_order())
+    duplicate = pd.concat([quote, quote], ignore_index=True)
+    with pytest.raises(ValueError, match="exactly one"):
+        normalize_option_snapshot(duplicate, greeks, option_contract())
+    crossed = quote.copy()
+    crossed.loc[0, "bid"] = 3.0
+    with pytest.raises(ValueError, match="crossed"):
+        normalize_option_snapshot(crossed, greeks, option_contract())
+    delayed = greeks.copy()
+    delayed.loc[0, "timestamp"] = pd.Timestamp("2026-07-20 10:31:00-04:00")
+    with pytest.raises(ValueError, match="synchronized"):
+        normalize_option_snapshot(quote, delayed, option_contract())
+
+
+def test_standard_tier_first_order_inputs_derive_gamma_without_broker_data() -> None:
+    client = FakeClient()
+    quote = cast(pd.DataFrame, client.option_snapshot_quote())
+    greeks = cast(pd.DataFrame, client.option_snapshot_greeks_first_order()).drop(columns=["gamma"])
+    greeks["implied_vol"] = [0.20]
+    greeks["underlying_price"] = [500.0]
+    greeks["underlying_timestamp"] = greeks["timestamp"]
+    snapshot = normalize_option_snapshot(quote, greeks, option_contract())
+    assert Decimal(snapshot.gamma) > 0
+
+    greeks.loc[0, "underlying_timestamp"] = pd.Timestamp("2026-07-20 10:31:00-04:00")
+    with pytest.raises(ValueError, match="underlying timestamps"):
+        normalize_option_snapshot(quote, greeks, option_contract())

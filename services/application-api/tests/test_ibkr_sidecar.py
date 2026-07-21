@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from app.grpc_gen import broker_pb2
 from app.ibkr_sidecar.config import IbkrEndpointConfig
 from app.ibkr_sidecar.mapping import map_submit_request
 from app.ibkr_sidecar.native import IbkrSocketClient
+from app.ibkr_sidecar.service import IbkrBrokerService, NativeIbkrBackend
+from app.grpc_gen import broker_pb2_grpc
+import grpc
 import pytest
+from types import SimpleNamespace
 
 
 def _request(
@@ -118,3 +123,125 @@ def test_native_client_cannot_submit_before_explicit_enable_and_handshake() -> N
     contract, order = map_submit_request(_request(), account=config.account)
     with pytest.raises(PermissionError, match="disabled"):
         client.place_order(contract, order)
+
+
+class _FakeNativeClient:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(account="DU123")
+        self.placed = 0
+        self.cancelled: list[int] = []
+
+    def refresh_snapshot(self) -> None:
+        return
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "sequence": 7,
+            "reconciled": True,
+            "account": {"BuyingPower": "10000", "NetLiquidation": "25000", "Currency": "USD"},
+            "positions": [{"contract_id": "101", "quantity": 2, "average_price": "1.25"}],
+            "orders": [
+                {
+                    "broker_order_id": "901",
+                    "contract_id": "999",
+                    "quantity": 1,
+                    "filled": 0,
+                    "status": "Submitted",
+                    "side": "BUY",
+                    "order_type": "LMT",
+                    "submitted_price": "1.00",
+                }
+            ],
+            "fills": [
+                {
+                    "fill_id": "fill-1",
+                    "broker_order_id": "900",
+                    "contract_id": "101",
+                    "side": "BOT",
+                    "quantity": 1,
+                    "price": "1.2",
+                    "occurred_at_utc": "20260721 10:30:00",
+                }
+            ],
+        }
+
+    def place_order(self, _contract: object, _order: object) -> int:
+        self.placed += 1
+        return 900
+
+    def cancel_order(self, order_id: int) -> None:
+        self.cancelled.append(order_id)
+
+
+def test_native_backend_projects_full_snapshot_and_idempotent_mutations() -> None:
+    client = _FakeNativeClient()
+    backend = NativeIbkrBackend(client)  # type: ignore[arg-type]
+    submitted = backend.submit(_request())
+    repeated = backend.submit(_request())
+    assert submitted.broker_order_id == repeated.broker_order_id == "900"
+    assert client.placed == 1
+    snapshot = backend.snapshot()
+    assert snapshot.account.buying_power == "10000"
+    assert snapshot.positions[0].average_price == "1.25"
+    assert snapshot.fills[0].fill_id == "fill-1"
+    assert snapshot.orders[0].plan_hash == "a" * 64
+    assert snapshot.orders[1].idempotency_key == "external:901"
+    assert snapshot.account.reconciled is False
+    backend.cancel("900")
+    assert client.cancelled == [900]
+
+
+class _GrpcBackend:
+    def snapshot(self) -> broker_pb2.BrokerSnapshot:
+        return broker_pb2.BrokerSnapshot(
+            schema_version="1.0",
+            snapshot_sequence=3,
+            account=broker_pb2.AccountSnapshot(
+                broker_id=broker_pb2.BROKER_ID_IBKR,
+                health=broker_pb2.BROKER_HEALTH_HEALTHY,
+                reconciled=True,
+                buying_power="1",
+                net_liquidation="1",
+                currency="USD",
+            ),
+        )
+
+    def submit(
+        self, request: broker_pb2.SubmitBrokerOrderRequest
+    ) -> broker_pb2.BrokerOrderSnapshot:
+        return broker_pb2.BrokerOrderSnapshot(
+            broker_order_id="1",
+            idempotency_key=request.idempotency_key,
+            plan_hash=request.plan_hash,
+        )
+
+    def cancel(self, broker_order_id: str) -> broker_pb2.BrokerOrderSnapshot:
+        return broker_pb2.BrokerOrderSnapshot(broker_order_id=broker_order_id)
+
+
+def test_ibkr_loopback_grpc_snapshot_and_reconcile_contract() -> None:
+    async def scenario() -> None:
+        server = grpc.aio.server()
+        broker_pb2_grpc.add_BrokerAdapterServiceServicer_to_server(
+            IbkrBrokerService(_GrpcBackend()), server
+        )
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+        try:
+            stub = broker_pb2_grpc.BrokerAdapterServiceStub(channel)
+            snapshot = await stub.GetBrokerSnapshot(
+                broker_pb2.GetBrokerSnapshotRequest(broker_id=broker_pb2.BROKER_ID_IBKR)
+            )
+            assert snapshot.snapshot_sequence == 3
+            reconciled = await stub.ReconcileBroker(
+                broker_pb2.ReconcileBrokerRequest(
+                    broker_id=broker_pb2.BROKER_ID_IBKR, expected_snapshot_sequence=3
+                )
+            )
+            assert reconciled.matched is True
+        finally:
+            await channel.close()
+            await server.stop(None)
+
+    asyncio.run(scenario())

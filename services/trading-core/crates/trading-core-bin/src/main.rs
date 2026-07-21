@@ -7,6 +7,7 @@
 //! from the selected source; broker reconciliation remains a Phase 3 concern.
 
 mod grpc;
+mod option_registry;
 mod risk_grpc;
 mod theta_live;
 

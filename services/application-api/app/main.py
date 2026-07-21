@@ -14,6 +14,8 @@ SnapshotUnavailable body with HTTP 503 (never a partial fake MarketSnapshot).
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Annotated, Literal
@@ -39,6 +41,7 @@ from app.persistence import (
     latest_execution_ticket,
     persist_order_projection,
     persist_staged_candidate,
+    restorable_execution_workflow,
     staged_plan_projection,
 )
 from app.realtime.projector import ProjectorConfig
@@ -47,6 +50,7 @@ from app.trading.grpc_client import (
     cancel_order as grpc_cancel_order,
     confirm_candidate as grpc_confirm_candidate,
     get_order as grpc_get_order,
+    restore_workflow as grpc_restore_workflow,
     stage_candidate as grpc_stage_candidate,
 )
 from app.trading.capability import ConfirmationCipher
@@ -54,8 +58,6 @@ from app.trading.models import CandidateTradePlan, ExecutionOrder, RiskDecision
 
 __all__ = ["app", "httpx"]
 
-
-app = FastAPI(title="OptionTrader Application API", version="0.0.0")
 
 TRADING_CORE_URL = os.getenv("TRADING_CORE_URL", "http://localhost:8080")
 _TIMEOUT = 1.5
@@ -91,6 +93,36 @@ def _require_confirmation_cipher() -> ConfirmationCipher:
         return _confirmation_cipher(key)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail="confirmation_store_unavailable") from exc
+
+
+def restore_durable_execution_workflow() -> tuple[int, int]:
+    """Rebuild Rust's volatile workflow before serving execution requests."""
+    engine = _require_execution_engine()
+    cipher = _require_confirmation_cipher()
+    entries = restorable_execution_workflow(engine, cipher)
+    restored, reconciliation_ids = grpc_restore_workflow(entries)
+    for order in restored:
+        persist_order_projection(
+            engine,
+            order,
+            action=(
+                "PROCESS_RESTART_RECONCILIATION"
+                if order.order_id in reconciliation_ids
+                else "PROCESS_RESTART_RESTORED"
+            ),
+            actor="rust-execution-gateway",
+        )
+    return len(restored), len(reconciliation_ids)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    if os.getenv("DATABASE_URL") and os.getenv("OPTIONTRADER_CONFIRMATION_FERNET_KEY"):
+        restore_durable_execution_workflow()
+    yield
+
+
+app = FastAPI(title="OptionTrader Application API", version="0.0.0", lifespan=lifespan)
 
 
 def _grpc_http_error(exc: grpc.RpcError) -> HTTPException:

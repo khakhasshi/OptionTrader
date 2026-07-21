@@ -13,8 +13,8 @@ use std::{
 use longbridge::{
     blocking::TradeContextSync,
     trade::{
-        GetTodayOrdersOptions, Order as LbOrder, OrderSide as LbSide, OrderStatus as LbStatus,
-        OrderType as LbOrderType, SubmitOrderOptions, TimeInForceType,
+        GetTodayExecutionsOptions, GetTodayOrdersOptions, Order as LbOrder, OrderSide as LbSide,
+        OrderStatus as LbStatus, OrderType as LbOrderType, SubmitOrderOptions, TimeInForceType,
     },
     Config,
 };
@@ -32,6 +32,7 @@ pub struct LongbridgeBroker {
     account: AccountSnapshot,
     positions: Vec<PositionSnapshot>,
     orders: BTreeMap<String, BrokerOrder>,
+    fills: Vec<Fill>,
     order_by_key: BTreeMap<String, String>,
     sequential_config: SequentialExecutionConfig,
 }
@@ -154,6 +155,7 @@ impl LongbridgeBroker {
             account: disconnected_account(),
             positions: Vec::new(),
             orders: BTreeMap::new(),
+            fills: Vec::new(),
             order_by_key: BTreeMap::new(),
             sequential_config,
         })
@@ -427,7 +429,7 @@ impl BrokerAdapter for LongbridgeBroker {
     }
 
     fn fills(&self) -> Vec<Fill> {
-        Vec::new()
+        self.fills.clone()
     }
 
     fn submit(&mut self, request: BrokerOrderRequest) -> Result<BrokerOrder, BrokerError> {
@@ -526,11 +528,96 @@ impl BrokerAdapter for LongbridgeBroker {
                         .quantity
                         .to_i32()
                         .ok_or(BrokerError::NotReconciled)?,
+                    average_price: position.cost_price,
                 });
             }
         }
         self.account.buying_power = balances[0].buy_power;
+        self.account.net_liquidation = balances[0].net_assets;
+        self.account.currency = balances[0].currency.clone();
         self.positions = positions;
+        let known_native_ids = self
+            .orders
+            .values()
+            .flat_map(|order| {
+                if order.child_orders.is_empty() {
+                    vec![order.broker_order_id.clone()]
+                } else {
+                    order
+                        .child_orders
+                        .iter()
+                        .map(|child| child.broker_order_id.clone())
+                        .collect()
+                }
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let has_unknown_active_order = self
+            .context
+            .today_orders(GetTodayOrdersOptions::new())
+            .map_err(|_| {
+                self.mark_disconnected();
+                BrokerError::Disconnected
+            })?
+            .into_iter()
+            .any(|order| {
+                !known_native_ids.contains(&order.order_id)
+                    && map_status(order.status).is_ok_and(|status| {
+                        matches!(
+                            status,
+                            BrokerOrderStatus::Working | BrokerOrderStatus::PartialFill
+                        )
+                    })
+            });
+        if has_unknown_active_order {
+            self.mark_reconciliation_required();
+            return Err(BrokerError::NotReconciled);
+        }
+        self.fills = self
+            .context
+            .today_executions(GetTodayExecutionsOptions::new())
+            .map_err(|_| {
+                self.mark_disconnected();
+                BrokerError::Disconnected
+            })?
+            .into_iter()
+            .map(|execution| {
+                let order = self
+                    .orders
+                    .values()
+                    .find(|order| {
+                        order.broker_order_id == execution.order_id
+                            || order
+                                .child_orders
+                                .iter()
+                                .any(|child| child.broker_order_id == execution.order_id)
+                    })
+                    .ok_or(BrokerError::NotReconciled)?;
+                let leg = order
+                    .child_orders
+                    .iter()
+                    .find(|child| child.broker_order_id == execution.order_id)
+                    .and_then(|child| order.legs.get(child.leg_index))
+                    .or_else(|| {
+                        order.legs.iter().find(|leg| {
+                            leg.broker_contract_id.as_deref() == Some(&execution.symbol)
+                        })
+                    })
+                    .ok_or(BrokerError::NotReconciled)?;
+                Ok(Fill {
+                    fill_id: execution.trade_id,
+                    broker_order_id: execution.order_id,
+                    contract_id: leg.contract_id.clone(),
+                    side: leg.side,
+                    quantity: decimal_quantity(execution.quantity)?,
+                    price: execution.price,
+                    occurred_at_utc: chrono::DateTime::from_timestamp(
+                        execution.trade_done_at.unix_timestamp(),
+                        execution.trade_done_at.nanosecond(),
+                    )
+                    .ok_or(BrokerError::NotReconciled)?,
+                })
+            })
+            .collect::<Result<Vec<_>, BrokerError>>()?;
         let order_ids: Vec<String> = self.orders.keys().cloned().collect();
         for order_id in order_ids {
             self.update_known_order(&order_id)?;
@@ -652,6 +739,8 @@ fn disconnected_account() -> AccountSnapshot {
         health: BrokerHealth::Disconnected,
         reconciled: false,
         buying_power: Decimal::ZERO,
+        net_liquidation: Decimal::ZERO,
+        currency: "USD".into(),
     }
 }
 

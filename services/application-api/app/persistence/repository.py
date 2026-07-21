@@ -563,12 +563,62 @@ def staged_plan_projection(
     return str(status), order
 
 
+def restorable_execution_workflow(
+    engine: Engine, cipher: ConfirmationCipher
+) -> list[tuple[CandidateTradePlan, ExecutionOrder, str]]:
+    """Load the durable workflow needed to rebuild Rust after a process restart.
+
+    Only an unclaimed, unexpired confirmation capability is decrypted. Every
+    other non-terminal order is restored without a capability and Rust forces
+    it into reconciliation before any further action.
+    """
+    now = _now_utc()
+    query = (
+        select(
+            candidate_trade_plans.c.payload.label("plan_payload"),
+            orders.c.payload.label("order_payload"),
+            confirmation_capabilities.c.token_ciphertext,
+            confirmation_capabilities.c.expires_at_utc.label("capability_expires_at"),
+            confirmation_capabilities.c.claimed_at_utc,
+        )
+        .join(orders, orders.c.plan_id == candidate_trade_plans.c.plan_id)
+        .outerjoin(
+            confirmation_capabilities,
+            confirmation_capabilities.c.order_id == orders.c.order_id,
+        )
+        .order_by(orders.c.created_at_utc, orders.c.order_id)
+    )
+    restored: list[tuple[CandidateTradePlan, ExecutionOrder, str]] = []
+    with engine.connect() as conn:
+        rows = conn.execute(query).mappings().all()
+    for row in rows:
+        plan = CandidateTradePlan.model_validate(row["plan_payload"])
+        order = ExecutionOrder.model_validate(row["order_payload"])
+        token = ""
+        expires_at = row["capability_expires_at"]
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if (
+            order.state == "AWAITING_CONFIRMATION"
+            and row["token_ciphertext"] is not None
+            and row["claimed_at_utc"] is None
+            and isinstance(expires_at, datetime)
+            and expires_at > now
+        ):
+            token = cipher.decrypt(str(row["token_ciphertext"]))
+        restored.append((plan, order, token))
+    return restored
+
+
 __all__ = [
     "claim_confirmation_intent",
     "persist_event_context",
     "persist_order_projection",
     "persist_signal",
     "persist_staged_candidate",
+    "restorable_execution_workflow",
     "latest_order_projection",
     "latest_execution_ticket",
     "staged_plan_projection",

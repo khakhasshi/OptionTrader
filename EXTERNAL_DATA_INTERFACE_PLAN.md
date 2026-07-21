@@ -387,6 +387,12 @@ ThetaData:
 - VIX price/history
 - market calendar
 
+ThetaData Standard 能提供 snapshot quote 和 first-order Delta/Theta/Vega/IV，但二阶/all-Greeks
+端点需要 Professional。系统不得从 Broker 补 Gamma；当前使用同步的 ThetaData Delta、IV、
+underlying price、underlying timestamp 与到期时间确定性推导 Gamma。option/underlying 时间差
+超过 5 秒、quote 陈旧或字段缺失时整批拒绝。升级 Professional 后仍需保留该边界的对拍测试，
+不得静默改变交易口径。
+
 Broker:
 - Longbridge adapter：account/assets/positions/orders/fills
 - IBKR adapter：account/positions/orders/fills/margin

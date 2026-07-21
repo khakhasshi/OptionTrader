@@ -51,20 +51,26 @@ pub struct AccountSnapshot {
     pub health: BrokerHealth,
     pub reconciled: bool,
     pub buying_power: Decimal,
+    pub net_liquidation: Decimal,
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionSnapshot {
     pub contract_id: String,
     pub quantity: i32,
+    pub average_price: Decimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fill {
     pub fill_id: String,
     pub broker_order_id: String,
+    pub contract_id: String,
+    pub side: OrderSide,
     pub quantity: u32,
     pub price: Decimal,
+    pub occurred_at_utc: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +212,8 @@ impl PaperBroker {
                 health: BrokerHealth::Healthy,
                 reconciled: true,
                 buying_power: Decimal::new(100_000, 0),
+                net_liquidation: Decimal::new(100_000, 0),
+                currency: "USD".into(),
             },
             orders: BTreeMap::new(),
             order_by_key: BTreeMap::new(),
@@ -252,8 +260,14 @@ impl PaperBroker {
         let fill = Fill {
             fill_id: format!("paper-fill-{}", self.next_fill),
             broker_order_id: broker_order_id.to_owned(),
+            contract_id: order
+                .legs
+                .first()
+                .map_or_else(String::new, |leg| leg.contract_id.clone()),
+            side: order.side,
             quantity,
             price,
+            occurred_at_utc: Utc::now(),
         };
         self.next_fill += 1;
         self.fills.push(fill);
@@ -433,6 +447,8 @@ impl BrokerAdapter for DisabledLiveBroker {
             health: BrokerHealth::Disconnected,
             reconciled: false,
             buying_power: Decimal::ZERO,
+            net_liquidation: Decimal::ZERO,
+            currency: "USD".into(),
         }
     }
 

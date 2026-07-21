@@ -4,12 +4,20 @@ from datetime import datetime, timezone
 from dataclasses import replace
 import json
 from pathlib import Path
+from hashlib import sha256
 
 from jsonschema import Draft202012Validator
 import pytest
 from referencing import Registry, Resource
 
-from app.trading import CandidateInputs, QuotedLeg, build_candidate_plan
+from app.grpc_gen import market_pb2
+from app.trading import (
+    CandidateInputs,
+    OptionContractSelection,
+    QuotedLeg,
+    build_candidate_plan,
+    fetch_quoted_legs,
+)
 from app.trading.candidate import canonical_plan_hash
 
 UTC = timezone.utc
@@ -223,3 +231,68 @@ def test_non_thetadata_market_or_option_proof_fails_closed() -> None:
     leg = replace(_inputs().quoted_legs[0], quote_provider="BROKER")
     with pytest.raises(ValueError, match="quote and Greeks provider"):
         build_candidate_plan(_inputs(quoted_legs=(leg,)))
+
+
+def test_candidate_legs_are_built_from_verified_thetadata_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = market_pb2.ThetaOptionSnapshot(
+        contract_id="QQQ-20260720-500-C",
+        symbol="QQQ",
+        expiration="2026-07-20",
+        strike="500",
+        right=market_pb2.THETA_OPTION_RIGHT_CALL,
+        bid="2.4",
+        ask="2.5",
+        bid_size=20,
+        ask_size=25,
+        occurred_at_utc="2026-07-20T14:29:59.800Z",
+        delta="0.52",
+        gamma="0.08",
+        theta="-0.12",
+        vega="0.05",
+        provider="THETADATA",
+    )
+    batch_id = f"thetaopt_{sha256(snapshot.SerializeToString(deterministic=True)).hexdigest()}"
+    batch = market_pb2.ThetaOptionSnapshotBatch(
+        chain_snapshot_id=batch_id,
+        fetched_at_utc="2026-07-20T14:30:00.000Z",
+        snapshots=[snapshot],
+        provider="THETADATA",
+    )
+
+    class Channel:
+        def close(self) -> None:
+            return
+
+    class Stub:
+        def __init__(self, _channel: object) -> None:
+            pass
+
+        def GetOptionSnapshots(self, request: object, timeout: int) -> object:  # noqa: N802
+            assert timeout == 3
+            assert len(request.contracts) == 1  # type: ignore[attr-defined]
+            return batch
+
+    monkeypatch.setattr(
+        "app.trading.thetadata_options.grpc.insecure_channel", lambda _target: Channel()
+    )
+    monkeypatch.setattr(
+        "app.trading.thetadata_options.market_pb2_grpc.ThetaDataSdkServiceStub", Stub
+    )
+    returned_id, legs = fetch_quoted_legs(
+        (
+            OptionContractSelection(
+                side="BUY",
+                option_right="CALL",
+                contract_id="QQQ-20260720-500-C",
+                expiry="2026-07-20",
+                strike="500",
+                broker_contract_id="123456",
+                exchange="SMART",
+            ),
+        )
+    )
+    assert returned_id == batch_id
+    assert legs[0].chain_snapshot_id == batch_id
+    assert legs[0].quote_provider == "THETADATA"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from hashlib import sha256
-from typing import Any
+from typing import Any, cast
 
 import grpc
 
@@ -99,6 +99,11 @@ _SIDE_NAME: dict[int, str] = {
     int(execution_pb2.ORDER_SIDE_BUY): "BUY",
     int(execution_pb2.ORDER_SIDE_SELL): "SELL",
 }
+_BROKER_PROTO = {value: key for key, value in _BROKER_NAME.items()}
+_MODE_PROTO = {value: key for key, value in _MODE_NAME.items()}
+_ORDER_STATE_PROTO = {value: key for key, value in _ORDER_STATE_NAME.items()}
+_CHILD_STATE_PROTO = {value: key for key, value in _CHILD_STATE_NAME.items()}
+_SIDE_PROTO = {value: key for key, value in _SIDE_NAME.items()}
 
 
 def event_context_proto(context: EventContext) -> execution_pb2.EventRiskContext:
@@ -206,6 +211,48 @@ def order_from_proto(raw: Any) -> ExecutionOrder:
     )
 
 
+def order_proto(order: ExecutionOrder) -> execution_pb2.ExecutionOrder:
+    return execution_pb2.ExecutionOrder(
+        schema_version=order.schema_version,
+        order_id=order.order_id,
+        plan_id=order.plan_id,
+        plan_hash=order.plan_hash,
+        idempotency_key=order.idempotency_key,
+        session_id=order.session_id,
+        broker_id=cast(Any, _BROKER_PROTO[order.broker_id]),
+        execution_mode=cast(Any, _MODE_PROTO[order.execution_mode]),
+        state=cast(Any, _ORDER_STATE_PROTO[order.state]),
+        total_quantity=order.total_quantity,
+        filled_quantity=order.filled_quantity,
+        broker_order_id=order.broker_order_id or "",
+        expires_at_utc=order.expires_at_utc,
+        updated_at_utc=order.updated_at_utc,
+        risk_reason_codes=cast(
+            Any,
+            [
+                next(code for code, name in _REASON_NAME.items() if name == reason)
+                for reason in order.risk_reason_codes
+            ],
+        ),
+        state_version=order.state_version,
+        broker_child_order_ids=order.broker_child_order_ids,
+        residual_exposure=order.residual_exposure,
+        broker_child_orders=[
+            execution_pb2.ExecutionChildOrder(
+                broker_order_id=child.broker_order_id,
+                leg_index=child.leg_index,
+                contract_id=child.contract_id,
+                side=cast(Any, _SIDE_PROTO[child.side]),
+                quantity=child.quantity,
+                filled_quantity=child.filled_quantity,
+                state=cast(Any, _CHILD_STATE_PROTO[child.state]),
+                submitted_price=child.submitted_price or "",
+            )
+            for child in order.broker_child_orders
+        ],
+    )
+
+
 def evaluate_candidate(
     plan: CandidateTradePlan,
     event_context: EventContext,
@@ -301,6 +348,32 @@ def get_order(order_id: str, *, target: str | None = None) -> ExecutionOrder:
     try:
         stub = execution_pb2_grpc.RiskExecutionServiceStub(channel)
         return order_from_proto(stub.GetOrder(execution_pb2.GetOrderRequest(order_id=order_id)))
+    finally:
+        channel.close()
+
+
+def restore_workflow(
+    entries: list[tuple[CandidateTradePlan, ExecutionOrder, str]],
+    *,
+    target: str | None = None,
+) -> tuple[list[ExecutionOrder], list[str]]:
+    """Atomically rebuild Rust's process-local mirror from durable PostgreSQL truth."""
+    channel = grpc.insecure_channel(target or TRADING_CORE_GRPC)
+    try:
+        raw = execution_pb2_grpc.RiskExecutionServiceStub(channel).RestoreWorkflow(
+            execution_pb2.RestoreWorkflowRequest(
+                entries=[
+                    execution_pb2.RestorableExecutionOrder(
+                        plan=plan_proto(plan),
+                        order=order_proto(order),
+                        confirmation_token=token,
+                    )
+                    for plan, order, token in entries
+                ]
+            ),
+            timeout=10,
+        )
+        return [order_from_proto(order) for order in raw.orders], list(raw.reconciliation_order_ids)
     finally:
         channel.close()
 

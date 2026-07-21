@@ -40,6 +40,7 @@ from app.persistence import (
     persist_signal,
     persist_event_context,
     persist_staged_candidate,
+    restorable_execution_workflow,
     risk_decisions,
     signals,
 )
@@ -373,6 +374,31 @@ def test_execution_persistence_is_atomic_idempotent_and_encrypts_token(
     assert confirmation_cipher.decrypt(capability_row["token_ciphertext"]) == "never-persist-this"
     assert order_row["status"] == "AWAITING_CONFIRMATION"
     assert order_row["state_version"] == 1
+
+
+def test_workflow_restore_only_decrypts_unclaimed_unexpired_capability(
+    engine: Engine,
+    confirmation_cipher: ConfirmationCipher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(repository, "_now_utc", lambda: datetime(2026, 7, 20, 14, 30, tzinfo=UTC))
+    plan, result = _staged_models()
+    assert result.order is not None
+    persist_staged_candidate(engine, plan, result, confirmation_cipher)
+
+    restored = restorable_execution_workflow(engine, confirmation_cipher)
+    assert len(restored) == 1
+    assert restored[0][0].plan_hash == plan.plan_hash
+    assert restored[0][1].order_id == result.order.order_id
+    assert restored[0][2] == "never-persist-this"
+
+    with engine.begin() as conn:
+        conn.execute(
+            update(confirmation_capabilities).values(
+                claimed_at_utc=datetime(2026, 7, 20, 14, 30, 1, tzinfo=UTC)
+            )
+        )
+    assert restorable_execution_workflow(engine, confirmation_cipher)[0][2] == ""
 
 
 def test_execution_persistence_rejects_combo_quantity_mismatch(

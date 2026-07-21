@@ -379,6 +379,16 @@ mod tests {
             });
             Ok(Response::new(ReceiverStream::new(rx)))
         }
+
+        async fn get_option_snapshots(
+            &self,
+            _request: Request<optiontrader_proto::market_v1::ThetaOptionSnapshotRequest>,
+        ) -> Result<Response<optiontrader_proto::market_v1::ThetaOptionSnapshotBatch>, Status>
+        {
+            Err(Status::unimplemented(
+                "option snapshots are not used by this fixture",
+            ))
+        }
     }
 
     #[tokio::test]

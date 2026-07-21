@@ -13,9 +13,11 @@ import os
 import stat
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
@@ -32,6 +34,10 @@ _REQUIRED_COLUMNS = frozenset({"timestamp", "open", "high", "low", "close", "vol
 
 class ThetaDataClient(Protocol):
     def stock_history_ohlc(self, **kwargs: object) -> object: ...
+
+    def option_snapshot_quote(self, **kwargs: object) -> object: ...
+
+    def option_snapshot_greeks_first_order(self, **kwargs: object) -> object: ...
 
 
 def _decimal_text(value: object, field: str, *, positive: bool = True) -> str:
@@ -60,6 +66,114 @@ def _volume(value: object) -> int:
     if volume > 2**64 - 1:
         raise ValueError("ThetaData volume exceeds uint64")
     return volume
+
+
+def _positive_size(value: object, field: str) -> int:
+    size = _volume(value)
+    if size == 0 or size > 2**32 - 1:
+        raise ValueError(f"ThetaData {field} must be a positive uint32")
+    return size
+
+
+def _column(row: pd.Series, *names: str) -> object:
+    for name in names:
+        if name in row.index:
+            return row[name]
+    raise ValueError(f"ThetaData option response missing one of columns: {list(names)}")
+
+
+def _utc_timestamp(value: object, field: str) -> datetime:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        raise ValueError(f"ThetaData {field} must be timezone-aware")
+    return cast(datetime, timestamp.to_pydatetime()).astimezone(UTC)
+
+
+def _gamma_from_first_order(
+    greeks: pd.Series, contract: Any, quote_at: datetime, delta: Decimal
+) -> str:
+    """Derive Gamma only from Standard-tier ThetaData first-order inputs."""
+    underlying_at = _utc_timestamp(_column(greeks, "underlying_timestamp"), "underlying timestamp")
+    if abs((quote_at - underlying_at).total_seconds()) > 5:
+        raise ValueError("ThetaData option and underlying timestamps are not synchronized")
+    implied_vol = Decimal(
+        _decimal_text(_column(greeks, "implied_vol"), "implied_vol", positive=True)
+    )
+    underlying = Decimal(
+        _decimal_text(_column(greeks, "underlying_price"), "underlying_price", positive=True)
+    )
+    expiration = date.fromisoformat(str(contract.expiration))
+    close_et = datetime.combine(expiration, time(16), tzinfo=NEW_YORK)
+    years = Decimal(str((close_et - quote_at.astimezone(NEW_YORK)).total_seconds())) / Decimal(
+        str(365.25 * 24 * 60 * 60)
+    )
+    if years <= 0:
+        raise ValueError("ThetaData option has no positive time to expiration")
+    probability = delta if contract.right == market_pb2.THETA_OPTION_RIGHT_CALL else delta + 1
+    if not Decimal("0") < probability < Decimal("1"):
+        raise ValueError("ThetaData delta cannot derive a finite Gamma")
+    d1 = NormalDist().inv_cdf(float(probability))
+    density = math.exp(-(d1**2) / 2) / math.sqrt(2 * math.pi)
+    gamma = Decimal(str(density)) / (underlying * implied_vol * years.sqrt())
+    return _decimal_text(gamma, "derived gamma", positive=False)
+
+
+def normalize_option_snapshot(
+    quote_frame: object,
+    greeks_frame: object,
+    contract: Any,
+) -> Any:
+    """Merge one exact-contract ThetaData quote and first-order Greeks row."""
+    if not isinstance(quote_frame, pd.DataFrame) or not isinstance(greeks_frame, pd.DataFrame):
+        raise TypeError("ThetaData option responses must be pandas DataFrames")
+    if len(quote_frame.index) != 1 or len(greeks_frame.index) != 1:
+        raise ValueError("ThetaData exact option request must return exactly one row")
+    quote = quote_frame.iloc[0]
+    greeks = greeks_frame.iloc[0]
+    bid = _decimal_text(_column(quote, "bid", "bid_price"), "option bid")
+    ask = _decimal_text(_column(quote, "ask", "ask_price"), "option ask")
+    if Decimal(bid) > Decimal(ask):
+        raise ValueError("ThetaData option quote is crossed")
+    quote_at = _utc_timestamp(
+        _column(quote, "timestamp", "quote_timestamp", "occurred_at"), "option quote timestamp"
+    )
+    greek_at = _utc_timestamp(
+        _column(greeks, "timestamp", "greeks_timestamp", "occurred_at"),
+        "option Greeks timestamp",
+    )
+    if abs((quote_at - greek_at).total_seconds()) > 5:
+        raise ValueError("ThetaData quote and Greeks timestamps are not synchronized")
+    values = {
+        name: _decimal_text(_column(greeks, name), name, positive=False)
+        for name in ("delta", "theta", "vega")
+    }
+    delta = Decimal(values["delta"])
+    if not Decimal("-1") <= delta <= Decimal("1"):
+        raise ValueError("ThetaData delta is outside [-1, 1]")
+    values["gamma"] = (
+        _decimal_text(_column(greeks, "gamma"), "gamma", positive=False)
+        if "gamma" in greeks.index
+        else _gamma_from_first_order(greeks, contract, quote_at, delta)
+    )
+    if Decimal(values["gamma"]) < 0 or Decimal(values["vega"]) < 0:
+        raise ValueError("ThetaData gamma and vega must be non-negative")
+    return market_pb2.ThetaOptionSnapshot(
+        contract_id=str(contract.contract_id),
+        symbol=str(contract.symbol).upper(),
+        expiration=str(contract.expiration),
+        strike=_decimal_text(contract.strike, "option strike"),
+        right=contract.right,
+        bid=bid,
+        ask=ask,
+        bid_size=_positive_size(_column(quote, "bid_size", "bid_sz"), "option bid_size"),
+        ask_size=_positive_size(_column(quote, "ask_size", "ask_sz"), "option ask_size"),
+        occurred_at_utc=quote_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        delta=values["delta"],
+        gamma=values["gamma"],
+        theta=values["theta"],
+        vega=values["vega"],
+        provider="THETADATA",
+    )
 
 
 def normalize_ohlc_frame(frame: object, expected_date: date) -> list[Any]:
@@ -190,14 +304,38 @@ class ThetaDataBarSource:
         return normalize_ohlc_frame(frame, session_date)
 
 
+@dataclass
+class ThetaDataOptionSource:
+    client: ThetaDataClient
+
+    def fetch(self, contract: Any) -> Any:
+        right: str | None = {
+            market_pb2.THETA_OPTION_RIGHT_CALL: "call",
+            market_pb2.THETA_OPTION_RIGHT_PUT: "put",
+        }.get(contract.right)
+        if right is None:
+            raise ValueError("ThetaData option right is unspecified")
+        arguments = {
+            "symbol": str(contract.symbol).upper(),
+            "expiration": str(contract.expiration),
+            "strike": str(contract.strike),
+            "right": right,
+        }
+        quote = self.client.option_snapshot_quote(**arguments)
+        greeks = self.client.option_snapshot_greeks_first_order(**arguments)
+        return normalize_option_snapshot(quote, greeks, contract)
+
+
 class ThetaDataSdkService:
     def __init__(
         self,
         source: ThetaDataBarSource,
+        option_source: ThetaDataOptionSource | None = None,
         *,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._source = source
+        self._option_source = option_source
         self._clock = clock or (lambda: datetime.now(tz=UTC))
 
     async def StreamCompletedBars(
@@ -268,3 +406,57 @@ class ThetaDataSdkService:
                 )
                 first_batch = False
             await asyncio.sleep(poll_ms / 1_000)
+
+    async def GetOptionSnapshots(
+        self, request: Any, context: grpc.aio.ServicerContext[Any, Any]
+    ) -> Any:
+        option_source = self._option_source
+        if option_source is None:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "option source unavailable")
+            raise AssertionError("gRPC abort must raise")
+        contracts = list(request.contracts)
+        identities = [str(contract.contract_id) for contract in contracts]
+        try:
+            strikes_valid = all(
+                (strike := Decimal(str(contract.strike))).is_finite() and strike > 0
+                for contract in contracts
+            )
+        except (InvalidOperation, ValueError):
+            strikes_valid = False
+        if (
+            not 1 <= len(contracts) <= 4
+            or len(set(identities)) != len(identities)
+            or not strikes_valid
+            or any(
+                not contract.contract_id
+                or str(contract.symbol).upper() != "QQQ"
+                or not contract.expiration
+                or contract.right
+                not in {
+                    market_pb2.THETA_OPTION_RIGHT_CALL,
+                    market_pb2.THETA_OPTION_RIGHT_PUT,
+                }
+                for contract in contracts
+            )
+        ):
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid option contract request")
+        try:
+            snapshots = [
+                await asyncio.to_thread(option_source.fetch, contract) for contract in contracts
+            ]
+        except Exception as exc:
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                f"ThetaData option fetch failed ({type(exc).__name__})",
+            )
+            raise AssertionError("gRPC abort must raise") from exc
+        digest = sha256()
+        for snapshot in snapshots:
+            digest.update(snapshot.SerializeToString(deterministic=True))
+        fetched_at = self._clock().astimezone(UTC)
+        return market_pb2.ThetaOptionSnapshotBatch(
+            chain_snapshot_id=f"thetaopt_{digest.hexdigest()}",
+            fetched_at_utc=fetched_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            snapshots=snapshots,
+            provider="THETADATA",
+        )

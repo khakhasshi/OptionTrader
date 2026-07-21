@@ -284,10 +284,28 @@ message GetOrderRequest {
   string order_id = 1;
 }
 
+message RestorableExecutionOrder {
+  CandidateTradePlan plan = 1;
+  ExecutionOrder order = 2;
+  // Present only for an unclaimed AWAITING_CONFIRMATION capability. Submitted
+  // orders restore fail-closed and must reconcile against Broker truth.
+  string confirmation_token = 3;
+}
+
+message RestoreWorkflowRequest {
+  repeated RestorableExecutionOrder entries = 1;
+}
+
+message RestoreWorkflowResponse {
+  repeated ExecutionOrder orders = 1;
+  repeated string reconciliation_order_ids = 2;
+}
+
 service RiskExecutionService {
   rpc EvaluateCandidate(EvaluateCandidateRequest) returns (RiskDecision);
   rpc StageCandidate(EvaluateCandidateRequest) returns (StageCandidateResponse);
   rpc ConfirmCandidate(ConfirmCandidateRequest) returns (ExecutionOrder);
   rpc CancelOrder(CancelOrderRequest) returns (ExecutionOrder);
   rpc GetOrder(GetOrderRequest) returns (ExecutionOrder);
+  rpc RestoreWorkflow(RestoreWorkflowRequest) returns (RestoreWorkflowResponse);
 }

@@ -14,6 +14,7 @@ from app.persistence.repository import (
     persist_order_projection,
     persist_signal,
     persist_staged_candidate,
+    restorable_execution_workflow,
     staged_plan_projection,
 )
 from app.persistence.serialize import SignalContext, build_signal_contract, build_signal_rows
@@ -47,6 +48,7 @@ __all__ = [
     "persist_order_projection",
     "persist_signal",
     "persist_staged_candidate",
+    "restorable_execution_workflow",
     "risk_decisions",
     "staged_plan_projection",
     "signals",

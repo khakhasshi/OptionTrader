@@ -2,7 +2,7 @@
 # JS: npm workspaces | Python: uv | Rust: cargo | DB: PostgreSQL + Alembic
 
 .DEFAULT_GOAL := help
-.PHONY: help setup setup-web setup-api setup-core dev dev-web dev-api dev-core dev-thetadata-sdk dev-core-theta-sdk \
+.PHONY: help setup setup-web setup-api setup-core dev dev-web dev-api dev-core dev-thetadata-sdk dev-ibkr-sidecar dev-core-theta-sdk \
         health build-core test test-contracts test-web test-api test-core test-integration \
         lint lint-web lint-api lint-core \
         contracts gen-py-grpc events-context migrate migrate-down up down clean
@@ -45,6 +45,9 @@ dev-core: ## 启动 Rust trading-core (HTTP :8080 + gRPC :50051)
 
 dev-thetadata-sdk: gen-py-grpc ## 启动官方 ThetaData Python SDK 桥接服务 (:50052)
 	cd $(API_DIR) && uv run python -m app.thetadata_sdk.server
+
+dev-ibkr-sidecar: gen-py-grpc ## 启动本机 IBKR TWS/Gateway sidecar (:50053)
+	cd $(API_DIR) && uv run python -m app.ibkr_sidecar.server
 
 dev-core-theta-sdk: ## 以 ThetaData Python SDK 实时源启动 trading-core
 	cd $(CORE_DIR) && OPTIONTRADER_MARKET_SOURCE=theta-sdk cargo run

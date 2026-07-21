@@ -74,12 +74,16 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
 4. 确认后 Rust 重新执行 Final Risk Check。市场、事件、账户、限额、规则版本、快照或
    TTL 任一变化都可否决，不得通过再次点击或修改前端状态覆盖。
    Candidate 1.2 的计划级和每腿 provider 必须均为 `THETADATA`；Broker quote 不得进入
-   计划或自适应定价。受信任 option snapshot registry 上线前不得启用真实提交。
+   计划或自适应定价。Python 必须先通过 `GetOptionSnapshots` 获取批次 hash，Rust 在 Stage
+   与 Confirm 都向同一 Theta SDK bridge 验证 exact-contract quote/size/Greeks。
+   Standard 订阅只提供 first-order Greeks：Gamma 由 ThetaData 的 Delta、IV、underlying price
+   和到期时间确定性推导；option/underlying 时间差超过 5 秒即拒绝，不能用 Broker Gamma 回填。
 5. 当前 PAPER/MANUAL_CONFIRM 只进入内存 PaperBroker；真实 Longbridge/IBKR adapter
    未启用，`LIVE_TRADING_ENABLED=false` 必须保持不变。Broker sidecar 仅绑定本机。
-6. Trading Core 重启会丢失 workflow；Application API 重启后可读取共享密文 capability，
-   但 Rust 返回 NotFound 时仍应返回 `execution_reconciliation_required` 并保持 No Trade。
-   当前版本不支持自动恢复，禁止删除数据库行或重建同一计划来绕过。
+6. Application API 启动时会从 PostgreSQL 读取 plan/order/capability 并调用 Rust
+   `RestoreWorkflow`：未 claim 且未过期的确认能力原样恢复；终态保持终态；已提交、已 claim、
+   过期但结果不明的订单统一进入 `RECONCILE_PENDING`，版本号加一且残余敞口置 true。返回的
+   `reconciliation_order_ids` 必须逐个对 Broker truth；不得删除数据库行或重建计划绕过。
 7. 订单进入 `RECONCILE_PENDING`、BrokerHealth 非 HEALTHY、账本不一致或 kill switch
    激活时，禁止新开仓；撤单/减仓恢复路径不得依赖 LLM。
 8. capability claim 使用 PostgreSQL 行锁，可跨 API worker 仲裁；CLI worker 参数不再是
@@ -114,5 +118,7 @@ OPTIONTRADER_IBKR_CLIENT_ID=37
 OPTIONTRADER_IBKR_SUBMISSION_ENABLED=false
 ```
 
-必须观察到 `nextValidId` 与 managed account 匹配后才能进行只读对账。只有 paper Gate
+执行 `make dev-ibkr-sidecar` 后，必须同时观察到 `nextValidId`、managed account，以及
+account summary / positions / open orders / executions 四个 end callback；缺任一项时 sidecar
+保持 RECONCILING。发现不属于本进程幂等账本的活动订单时 `account.reconciled=false`。只有 paper Gate
 逐项签收时，才可在该认证进程把 submission 开关改为 true；主系统继续保持 false。

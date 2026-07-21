@@ -20,7 +20,7 @@ Rust 是价格权威。Broker adapter 只接收已经确定的订单级方向、
 
 - 使用官方 Rust SDK `longbridge 4.3.3` 的 blocking TradeContext。
 - 凭证仅由 SDK 从 `LONGBRIDGE_*`（兼容 `LONGPORT_*`）环境变量读取。
-- 支持账户购买力、持仓、期权市价/限价/自适应限价映射、撤单。
+- 支持账户购买力/净资产/币种、持仓数量/均价、当日订单/成交、期权市价/限价/自适应限价映射、撤单。
 - Longbridge OpenAPI 当前不支持原生多腿组合，因此由 Rust 执行受控拆腿：按 Candidate
   原始腿保存审计顺序，但提交顺序固定为全部 BUY 腿在前、SELL 腿在后。每条 BUY 腿必须
   查询到完整成交后才允许下一条腿；partial/unfilled/rejected/unknown 立即停止，不再提交卖腿。
@@ -40,19 +40,32 @@ Rust 是价格权威。Broker adapter 只接收已经确定的订单级方向、
   `OPTIONTRADER_LONGBRIDGE_LEG_POLL_INTERVAL_MS` 默认 250（50-1000）；非法配置拒绝启动。
 - `broker_contract_id` 必须是 Longbridge SDK 原生期权 symbol；`contract_id` 仅作跨数据源审计标识。
 - SDK error 不写入日志正文，连接或未知提交结果使 adapter 进入未对账状态。
+- reconcile 会扫描全部当日活动订单和成交；发现无法归属到当前幂等账本的活动订单，或成交
+  无法映射到已知 plan/leg 时返回 `NotReconciled`，不会只对账“本进程记得的订单”。
 
 ## IBKR TWS / Gateway
 
 - 使用官方 TWS API socket 模型。`OPTIONTRADER_IBKR_MODE=TWS|GATEWAY` 选择端点；paper
   默认端口分别为 7497 / 4002，live 默认端口分别为 7496 / 4001。
 - 只允许连接 `127.0.0.1`、`localhost` 或 `::1`；账户和独立 `client_id` 必填。
-- 必须收到 `nextValidId` 且配置账户出现在 managed accounts 后才算连接完成。
+- 必须收到 `nextValidId` 且配置账户出现在 managed accounts 后才开始只读快照；随后账户汇总、
+  持仓、未结订单、成交四个 end callback 必须全部完成才令 `reconciled=true`。
 - 每条腿必须携带数字 `conId`。多腿订单构造一个 `BAG`；SELL parent 会反转 BAG 内部
   canonical leg action，使最终成交方向仍与 Candidate 每条腿一致。
 - `ADAPTIVE_LIMIT` 映射为受保护的 `LMT` + IB Adaptive algo，priority 为
   Patient/Normal/Urgent；不设置 `NonGuaranteed`，避免主动接受拆腿成交语义。
 - `OPTIONTRADER_IBKR_SUBMISSION_ENABLED` 默认 false，且必须精确写为 true 才允许调用
   `placeOrder` / `cancelOrder`。
+- `make dev-ibkr-sidecar` 启动 loopback `BrokerAdapterService`，提供完整 snapshot、幂等 submit、
+  cancel 和 sequence-bound reconcile。未知活动订单也进入 snapshot，并强制 account 未对账。
+
+## 进程恢复
+
+Application API 启动时从 PostgreSQL 重建 Rust workflow。只有未 claim 且未过期的确认能力
+可以继续确认；终态只读恢复；任何可能已经跨过 Broker 提交边界的订单都提升为
+`RECONCILE_PENDING`、版本加一并保留残余敞口。恢复 RPC 从不提交或撤单，返回的订单清单必须
+随后与所选 Broker snapshot 对账。当前 reconciliation worker 尚未接入，因此真实 adapter
+仍不得进入主确认路径。
 
 ## 现场认证 Gate
 

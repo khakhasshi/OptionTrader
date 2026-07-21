@@ -20,7 +20,8 @@ use optiontrader_proto::execution_v1::{
     EventRiskFlag as ProtoEventFlag, ExecutionChildOrder as ProtoChildOrder,
     ExecutionChildOrderState as ProtoChildState, ExecutionMode as ProtoMode,
     ExecutionOrder as ProtoOrder, ExecutionOrderState as ProtoOrderState, GetOrderRequest,
-    OptionRight as ProtoRight, OrderSide as ProtoSide, RiskDecision as ProtoDecision,
+    OptionRight as ProtoRight, OrderSide as ProtoSide, RestorableExecutionOrder,
+    RestoreWorkflowRequest, RestoreWorkflowResponse, RiskDecision as ProtoDecision,
     RiskDecisionKind, RiskReasonCode as ProtoReason, StageCandidateResponse,
     StrategyKind as ProtoStrategy,
 };
@@ -37,6 +38,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::grpc::{LiveMarketServiceImpl, MarketServiceImpl};
+use crate::option_registry::OptionRegistryAuthority;
 
 fn parse_boolean(name: &str, value: Option<&str>, default: bool) -> Result<bool, String> {
     match value {
@@ -225,6 +227,7 @@ pub struct RiskExecutionServiceImpl {
     broker: Arc<RwLock<BrokerAuthority>>,
     workflow: Arc<Mutex<Workflow>>,
     clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    options: OptionRegistryAuthority,
 }
 
 struct StagedOrder {
@@ -259,6 +262,10 @@ impl RiskExecutionServiceImpl {
             broker: Arc::new(RwLock::new(broker)),
             workflow: Arc::new(Mutex::new(Workflow::default())),
             clock: Arc::new(Utc::now),
+            options: OptionRegistryAuthority::from_endpoint(
+                std::env::var("THETADATA_SDK_GRPC")
+                    .unwrap_or_else(|_| "http://127.0.0.1:50052".into()),
+            ),
         }
     }
 
@@ -273,6 +280,7 @@ impl RiskExecutionServiceImpl {
             broker: Arc::new(RwLock::new(broker)),
             workflow: Arc::new(Mutex::new(Workflow::default())),
             clock: Arc::new(clock),
+            options: OptionRegistryAuthority::Fixture,
         }
     }
 
@@ -289,6 +297,13 @@ impl RiskExecutionServiceImpl {
             Ok(value) => value,
             Err(_) => return Ok(rejected(Some(raw_plan), now, ProtoReason::PlanInvalid)),
         };
+        if !self.options.verify(raw_plan, now).await {
+            return Ok(rejected(
+                Some(raw_plan),
+                now,
+                ProtoReason::SnapshotNotCurrent,
+            ));
+        }
         let Some(raw_event) = raw_event else {
             return Ok(rejected(
                 Some(raw_plan),
@@ -876,12 +891,162 @@ fn proto_adapter_side(side: AdapterOrderSide) -> ProtoSide {
     }
 }
 
+fn restored_order_state(state: i32) -> Result<(OrderState, bool), &'static str> {
+    match ProtoOrderState::try_from(state).ok() {
+        Some(ProtoOrderState::AwaitingConfirmation) => {
+            Ok((OrderState::AwaitingConfirmation, false))
+        }
+        Some(ProtoOrderState::RiskRejected) => Ok((OrderState::RiskRejected, false)),
+        Some(ProtoOrderState::Filled) => Ok((OrderState::Filled, false)),
+        Some(ProtoOrderState::Cancelled) => Ok((OrderState::Cancelled, false)),
+        Some(ProtoOrderState::Rejected) => Ok((OrderState::Rejected, false)),
+        Some(ProtoOrderState::Expired) => Ok((OrderState::Expired, false)),
+        Some(ProtoOrderState::Shadowed) => Ok((OrderState::Shadowed, false)),
+        Some(
+            ProtoOrderState::Approved
+            | ProtoOrderState::Submitting
+            | ProtoOrderState::Working
+            | ProtoOrderState::PartialFill
+            | ProtoOrderState::CancelPending
+            | ProtoOrderState::ReconcilePending,
+        ) => Ok((OrderState::ReconcilePending, true)),
+        _ => Err("order state"),
+    }
+}
+
+fn restored_child_state(state: i32) -> Result<AdapterOrderStatus, &'static str> {
+    match ProtoChildState::try_from(state).ok() {
+        Some(ProtoChildState::Working) => Ok(AdapterOrderStatus::Working),
+        Some(ProtoChildState::PartialFill) => Ok(AdapterOrderStatus::PartialFill),
+        Some(ProtoChildState::Filled) => Ok(AdapterOrderStatus::Filled),
+        Some(ProtoChildState::Cancelled) => Ok(AdapterOrderStatus::Cancelled),
+        Some(ProtoChildState::Rejected) => Ok(AdapterOrderStatus::Rejected),
+        Some(ProtoChildState::ReconcilePending) => Ok(AdapterOrderStatus::ReconcilePending),
+        _ => Err("child state"),
+    }
+}
+
+fn restore_entry(
+    entry: RestorableExecutionOrder,
+    now: DateTime<Utc>,
+) -> Result<(StagedOrder, bool), &'static str> {
+    let raw_plan = entry.plan.ok_or("missing plan")?;
+    let raw_order = entry.order.ok_or("missing order")?;
+    let domain_plan = plan(&raw_plan)?;
+    if raw_order.schema_version != "1.1"
+        || raw_order.order_id.is_empty()
+        || raw_order.plan_id != raw_plan.plan_id
+        || raw_order.plan_hash != raw_plan.plan_hash
+        || raw_order.idempotency_key != raw_plan.idempotency_key
+        || raw_order.session_id != raw_plan.session_id
+        || raw_order.broker_id != raw_plan.broker_id
+        || raw_order.execution_mode != raw_plan.execution_mode
+        || raw_order.total_quantity == 0
+        || raw_order.state_version == 0
+        || raw_order.broker_child_order_ids.len() != raw_order.broker_child_orders.len()
+        || raw_order.broker_child_order_ids
+            != raw_order
+                .broker_child_orders
+                .iter()
+                .map(|child| child.broker_order_id.clone())
+                .collect::<Vec<_>>()
+        || domain_plan
+            .legs
+            .iter()
+            .any(|leg| leg.quantity != raw_order.total_quantity)
+    {
+        return Err("order identity");
+    }
+    let (mut state, mut reconciliation_required) = restored_order_state(raw_order.state)?;
+    if state == OrderState::AwaitingConfirmation
+        && (entry.confirmation_token.is_empty() || domain_plan.expires_at <= now)
+    {
+        state = OrderState::ReconcilePending;
+        reconciliation_required = true;
+    } else if state != OrderState::AwaitingConfirmation && !entry.confirmation_token.is_empty() {
+        return Err("confirmation capability");
+    }
+    let child_orders = raw_order
+        .broker_child_orders
+        .iter()
+        .map(|child| {
+            let leg_index = usize::try_from(child.leg_index).map_err(|_| "leg index")?;
+            let leg = raw_plan.legs.get(leg_index).ok_or("leg index")?;
+            let side = match ProtoSide::try_from(child.side).ok() {
+                Some(ProtoSide::Buy) => AdapterOrderSide::Buy,
+                Some(ProtoSide::Sell) => AdapterOrderSide::Sell,
+                _ => return Err("child side"),
+            };
+            if child.broker_order_id.is_empty()
+                || child.contract_id != leg.contract_id
+                || child.side != leg.side
+                || child.quantity != leg.quantity
+                || child.filled_quantity > child.quantity
+            {
+                return Err("child projection");
+            }
+            Ok(broker::BrokerChildOrder {
+                broker_order_id: child.broker_order_id.clone(),
+                leg_index,
+                contract_id: child.contract_id.clone(),
+                side,
+                quantity: child.quantity,
+                filled_quantity: child.filled_quantity,
+                status: restored_child_state(child.state)?,
+                submitted_price: if child.submitted_price.is_empty() {
+                    None
+                } else {
+                    Some(decimal(&child.submitted_price, "child price")?)
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let restored_updated_at = utc(&raw_order.updated_at_utc, "updated_at")?;
+    let state_version = if reconciliation_required {
+        raw_order
+            .state_version
+            .checked_add(1)
+            .ok_or("state version")?
+    } else {
+        raw_order.state_version
+    };
+    let updated_at = if reconciliation_required {
+        now
+    } else {
+        restored_updated_at
+    };
+    let mut record = OrderRecord::restored(
+        raw_order.order_id,
+        raw_order.plan_id,
+        raw_order.plan_hash,
+        raw_order.idempotency_key,
+        state,
+        domain_plan.expires_at,
+        raw_order.total_quantity,
+        raw_order.filled_quantity,
+        (!raw_order.broker_order_id.is_empty()).then_some(raw_order.broker_order_id),
+        child_orders,
+        raw_order.residual_exposure || reconciliation_required,
+        state_version,
+        updated_at,
+    )
+    .map_err(|_| "order record")?;
+    if reconciliation_required {
+        record.residual_exposure = true;
+    }
+    Ok((
+        StagedOrder {
+            raw_plan,
+            record,
+            confirmation_token: entry.confirmation_token,
+            risk_reasons: raw_order.risk_reason_codes,
+        },
+        reconciliation_required,
+    ))
+}
+
 fn order_proto(staged: &StagedOrder, now: DateTime<Utc>) -> ProtoOrder {
-    let updated_at = staged
-        .record
-        .events
-        .last()
-        .map_or(now, |event| event.occurred_at);
+    let updated_at = staged.record.updated_at(now);
     ProtoOrder {
         schema_version: "1.1".into(),
         order_id: staged.record.order_id.clone(),
@@ -901,7 +1066,7 @@ fn order_proto(staged: &StagedOrder, now: DateTime<Utc>) -> ProtoOrder {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         updated_at_utc: updated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         risk_reason_codes: staged.risk_reasons.clone(),
-        state_version: staged.record.events.len() as u64,
+        state_version: staged.record.state_version(),
         broker_child_order_ids: staged.record.broker_child_order_ids.clone(),
         residual_exposure: staged.record.residual_exposure,
         broker_child_orders: staged
@@ -1224,6 +1389,80 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
             .get(&order_id)
             .ok_or_else(|| Status::not_found("order not found"))?;
         Ok(Response::new(order_proto(staged, now)))
+    }
+
+    async fn restore_workflow(
+        &self,
+        request: Request<RestoreWorkflowRequest>,
+    ) -> Result<Response<RestoreWorkflowResponse>, Status> {
+        let now = (self.clock)();
+        let entries = request.into_inner().entries;
+        if entries.len() > 10_000 {
+            return Err(Status::invalid_argument("restore batch is too large"));
+        }
+        let mut restored = Vec::with_capacity(entries.len());
+        let mut batch_order_ids = BTreeSet::new();
+        let mut batch_keys = BTreeSet::new();
+        for entry in entries {
+            let (staged, reconciliation_required) =
+                restore_entry(entry, now).map_err(|reason| {
+                    Status::invalid_argument(format!("invalid restore entry: {reason}"))
+                })?;
+            if !batch_order_ids.insert(staged.record.order_id.clone())
+                || !batch_keys.insert(staged.record.idempotency_key.clone())
+            {
+                return Err(Status::invalid_argument("duplicate restore identity"));
+            }
+            restored.push((staged, reconciliation_required));
+        }
+
+        let mut workflow = workflow_lock(self)
+            .map_err(|()| Status::internal("execution workflow lock poisoned"))?;
+        for (staged, _) in &restored {
+            let existing_order = workflow.orders.get(&staged.record.order_id);
+            let existing_key = workflow.order_by_key.get(&staged.record.idempotency_key);
+            if existing_order.is_some() || existing_key.is_some() {
+                let compatible = existing_order.is_some_and(|existing| {
+                    existing.record.plan_hash == staged.record.plan_hash
+                        && existing.record.idempotency_key == staged.record.idempotency_key
+                        && (existing.record.state_version() >= staged.record.state_version()
+                            || (existing.record.state == OrderState::ReconcilePending
+                                && staged.record.state == OrderState::ReconcilePending
+                                && existing.record.state_version().checked_add(1)
+                                    == Some(staged.record.state_version())))
+                }) && existing_key.is_some_and(|(hash, order_id)| {
+                    hash == &staged.record.plan_hash && order_id == &staged.record.order_id
+                });
+                if !compatible {
+                    return Err(Status::already_exists("workflow identity conflicts"));
+                }
+            }
+        }
+        let mut orders = Vec::with_capacity(restored.len());
+        let mut reconciliation_order_ids = Vec::new();
+        for (staged, reconciliation_required) in restored {
+            let order_id = staged.record.order_id.clone();
+            if let Some(existing) = workflow.orders.get(&order_id) {
+                if existing.record.state == OrderState::ReconcilePending {
+                    reconciliation_order_ids.push(order_id);
+                }
+                orders.push(order_proto(existing, now));
+                continue;
+            }
+            workflow.order_by_key.insert(
+                staged.record.idempotency_key.clone(),
+                (staged.record.plan_hash.clone(), order_id.clone()),
+            );
+            if reconciliation_required {
+                reconciliation_order_ids.push(order_id.clone());
+            }
+            orders.push(order_proto(&staged, now));
+            workflow.orders.insert(order_id, staged);
+        }
+        Ok(Response::new(RestoreWorkflowResponse {
+            orders,
+            reconciliation_order_ids,
+        }))
     }
 }
 
@@ -1620,5 +1859,190 @@ mod tests {
             ProtoOrderState::try_from(preserved.state).unwrap(),
             ProtoOrderState::ReconcilePending
         );
+    }
+
+    #[tokio::test]
+    async fn restart_restores_unclaimed_confirmation_capability_without_restage() {
+        let original = service();
+        let staged = stage(&original, ProtoMode::Shadow).await;
+        let durable = staged.order.unwrap();
+        let restarted = service();
+        let response = restarted
+            .restore_workflow(Request::new(RestoreWorkflowRequest {
+                entries: vec![RestorableExecutionOrder {
+                    plan: Some(candidate(ProtoMode::Shadow)),
+                    order: Some(durable.clone()),
+                    confirmation_token: staged.confirmation_token.clone(),
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.reconciliation_order_ids.is_empty());
+        assert_eq!(response.orders[0].state_version, durable.state_version);
+
+        let confirmed = restarted
+            .confirm_candidate(Request::new(ConfirmCandidateRequest {
+                order_id: durable.order_id,
+                confirmed_plan_hash: durable.plan_hash,
+                confirmation_token: staged.confirmation_token,
+                event_context: Some(context()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            ProtoOrderState::try_from(confirmed.state).unwrap(),
+            ProtoOrderState::Shadowed
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_forces_submitted_or_claimed_order_into_reconciliation() {
+        let original = service();
+        let staged = stage(&original, ProtoMode::Paper).await;
+        let awaiting = staged.order.unwrap();
+        let working = original
+            .confirm_candidate(Request::new(ConfirmCandidateRequest {
+                order_id: awaiting.order_id,
+                confirmed_plan_hash: awaiting.plan_hash,
+                confirmation_token: staged.confirmation_token,
+                event_context: Some(context()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let restarted = service();
+        let response = restarted
+            .restore_workflow(Request::new(RestoreWorkflowRequest {
+                entries: vec![RestorableExecutionOrder {
+                    plan: Some(candidate(ProtoMode::Paper)),
+                    order: Some(working.clone()),
+                    confirmation_token: String::new(),
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.reconciliation_order_ids, vec![working.order_id]);
+        assert_eq!(
+            ProtoOrderState::try_from(response.orders[0].state).unwrap(),
+            ProtoOrderState::ReconcilePending
+        );
+        assert!(response.orders[0].residual_exposure);
+        assert_eq!(response.orders[0].state_version, working.state_version + 1);
+
+        let repeated = restarted
+            .restore_workflow(Request::new(RestoreWorkflowRequest {
+                entries: vec![RestorableExecutionOrder {
+                    plan: Some(candidate(ProtoMode::Paper)),
+                    order: Some(response.orders[0].clone()),
+                    confirmation_token: String::new(),
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            repeated.orders[0].state_version,
+            response.orders[0].state_version
+        );
+    }
+
+    #[tokio::test]
+    async fn paper_fault_drill_preserves_partial_fill_across_disconnect_and_restart() {
+        let original = service();
+        let staged = stage(&original, ProtoMode::Paper).await;
+        let awaiting = staged.order.unwrap();
+        original
+            .confirm_candidate(Request::new(ConfirmCandidateRequest {
+                order_id: awaiting.order_id.clone(),
+                confirmed_plan_hash: awaiting.plan_hash,
+                confirmation_token: staged.confirmation_token,
+                event_context: Some(context()),
+            }))
+            .await
+            .unwrap();
+        let disconnected = {
+            let mut workflow = workflow_lock(&original).unwrap();
+            let Workflow {
+                orders, ibkr_paper, ..
+            } = &mut *workflow;
+            let record = &mut orders.get_mut(&awaiting.order_id).unwrap().record;
+            let broker_order_id = record.broker_order_id.clone().unwrap();
+            let partial = ibkr_paper
+                .apply_fill(&broker_order_id, 1, Decimal::new(245, 2))
+                .unwrap();
+            record.apply_broker_order(&partial, now()).unwrap();
+            record.broker_disconnected(now()).unwrap();
+            order_proto(orders.get(&awaiting.order_id).unwrap(), now())
+        };
+        assert_eq!(disconnected.filled_quantity, 1);
+        assert!(disconnected.residual_exposure);
+        assert_eq!(
+            ProtoOrderState::try_from(disconnected.state).unwrap(),
+            ProtoOrderState::ReconcilePending
+        );
+
+        let restarted = service();
+        let restored = restarted
+            .restore_workflow(Request::new(RestoreWorkflowRequest {
+                entries: vec![RestorableExecutionOrder {
+                    plan: Some(candidate(ProtoMode::Paper)),
+                    order: Some(disconnected.clone()),
+                    confirmation_token: String::new(),
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(restored.orders[0].filled_quantity, 1);
+        assert!(restored.orders[0].residual_exposure);
+        assert_eq!(
+            restored.orders[0].state_version,
+            disconnected.state_version + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn paper_broker_rejection_is_terminal_and_restart_does_not_resubmit() {
+        let original = service();
+        let staged = stage(&original, ProtoMode::Paper).await;
+        let awaiting = staged.order.unwrap();
+        original
+            .confirm_candidate(Request::new(ConfirmCandidateRequest {
+                order_id: awaiting.order_id.clone(),
+                confirmed_plan_hash: awaiting.plan_hash,
+                confirmation_token: staged.confirmation_token,
+                event_context: Some(context()),
+            }))
+            .await
+            .unwrap();
+        let rejected = {
+            let mut workflow = workflow_lock(&original).unwrap();
+            let Workflow {
+                orders, ibkr_paper, ..
+            } = &mut *workflow;
+            let record = &mut orders.get_mut(&awaiting.order_id).unwrap().record;
+            let broker_order_id = record.broker_order_id.clone().unwrap();
+            let broker_rejected = ibkr_paper.reject(&broker_order_id).unwrap();
+            record.apply_broker_order(&broker_rejected, now()).unwrap();
+            order_proto(orders.get(&awaiting.order_id).unwrap(), now())
+        };
+        let restarted = service();
+        let response = restarted
+            .restore_workflow(Request::new(RestoreWorkflowRequest {
+                entries: vec![RestorableExecutionOrder {
+                    plan: Some(candidate(ProtoMode::Paper)),
+                    order: Some(rejected.clone()),
+                    confirmation_token: String::new(),
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.reconciliation_order_ids.is_empty());
+        assert_eq!(response.orders[0].state, rejected.state);
+        assert_eq!(response.orders[0].state_version, rejected.state_version);
     }
 }
