@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDate, Offset, Timelike};
+use chrono::{DateTime, NaiveDate, Offset, Timelike, Utc};
 use chrono_tz::America::New_York;
 use market_core::ReplayBar;
 use optiontrader_proto::market_v1::{
@@ -18,6 +18,7 @@ pub struct ThetaLiveConfig {
     pub symbol: String,
     pub venue: String,
     pub poll_interval_ms: u32,
+    pub max_batch_age: Duration,
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
 }
@@ -29,6 +30,7 @@ impl Default for ThetaLiveConfig {
             symbol: "QQQ".into(),
             venue: "nqb".into(),
             poll_interval_ms: 2_000,
+            max_batch_age: Duration::from_secs(30),
             reconnect_base: Duration::from_millis(250),
             reconnect_max: Duration::from_secs(10),
         }
@@ -106,12 +108,21 @@ fn validate_batch(
     batch: ThetaSdkBarBatch,
     first_batch: bool,
     last_minute: Option<u16>,
+    received_at: DateTime<Utc>,
+    max_batch_age: Duration,
 ) -> Result<Vec<ReplayBar>, String> {
     if !batch.fetched_at_utc.ends_with('Z') {
         return Err("invalid SDK batch fetched_at_utc".into());
     }
     let fetched_at = DateTime::parse_from_rfc3339(&batch.fetched_at_utc)
         .map_err(|_| "invalid SDK batch fetched_at_utc")?;
+    let age_ms = received_at.timestamp_millis() - fetched_at.timestamp_millis();
+    if age_ms < -5_000 {
+        return Err("SDK batch fetched_at_utc is in the future".into());
+    }
+    if age_ms.max(0) as u128 > max_batch_age.as_millis() {
+        return Err("SDK batch is stale".into());
+    }
     let session_date = NaiveDate::parse_from_str(&batch.session_date, "%Y-%m-%d")
         .map_err(|_| "invalid SDK batch session_date")?;
     if fetched_at.with_timezone(&New_York).date_naive() != session_date {
@@ -189,7 +200,13 @@ async fn connect_once(
         .map_err(|error| format!("SDK bridge receive: {error}"))?
     {
         let is_backfill = batch.backfill;
-        let bars = validate_batch(batch, first_batch, last_minute)?;
+        let bars = validate_batch(
+            batch,
+            first_batch,
+            last_minute,
+            Utc::now(),
+            config.max_batch_age,
+        )?;
         let batch_last_minute = bars.last().map(|bar| bar.minute_et);
         if first_batch && tx.send(ThetaLiveEvent::Connected).await.is_err() {
             return Ok(());
@@ -265,20 +282,63 @@ mod tests {
         }
     }
 
+    fn received_at() -> DateTime<Utc> {
+        "2026-07-20T13:32:05Z".parse().unwrap()
+    }
+
     #[test]
     fn validates_backfill_and_incremental_sequence() {
         let initial = validate_batch(
             batch(true, vec![proto_bar(570), proto_bar(571)]),
             true,
             None,
+            received_at(),
+            Duration::from_secs(30),
         )
         .unwrap();
         assert_eq!(initial.len(), 2);
-        assert!(validate_batch(batch(false, vec![proto_bar(573)]), false, Some(571)).is_err());
-        assert!(validate_batch(batch(true, vec![]), false, Some(571)).is_err());
+        assert!(validate_batch(
+            batch(false, vec![proto_bar(573)]),
+            false,
+            Some(571),
+            received_at(),
+            Duration::from_secs(30),
+        )
+        .is_err());
+        assert!(validate_batch(
+            batch(true, vec![]),
+            false,
+            Some(571),
+            received_at(),
+            Duration::from_secs(30),
+        )
+        .is_err());
         let mut partial = batch(true, vec![proto_bar(570), proto_bar(571)]);
         partial.complete_through_minute_et = 572;
-        assert!(validate_batch(partial, true, None).is_err());
+        assert!(
+            validate_batch(partial, true, None, received_at(), Duration::from_secs(30),).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_stale_or_future_sdk_batches() {
+        let current = batch(true, vec![proto_bar(570), proto_bar(571)]);
+        assert!(validate_batch(
+            current.clone(),
+            true,
+            None,
+            "2026-07-20T13:33:00Z".parse().unwrap(),
+            Duration::from_secs(30),
+        )
+        .is_err());
+        assert!(validate_batch(
+            current,
+            true,
+            None,
+            "2026-07-20T13:31:50Z".parse().unwrap(),
+            Duration::from_secs(30),
+        )
+        .is_err());
     }
 
     #[test]
@@ -335,6 +395,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let config = ThetaLiveConfig {
             endpoint: format!("http://{addr}"),
+            max_batch_age: Duration::from_secs(2 * 24 * 60 * 60),
             ..ThetaLiveConfig::default()
         };
 
