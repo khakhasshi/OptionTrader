@@ -319,7 +319,7 @@ def _staged_models() -> tuple[CandidateTradePlan, StageCandidateResult]:
         json.loads((fixture_dir / "risk_decision.sample.json").read_text())
     )
     order = ExecutionOrder(
-        schema_version="1.0",
+        schema_version="1.1",
         order_id="order_demo_001",
         plan_id=plan.plan_id,
         plan_hash=plan.plan_hash,
@@ -335,6 +335,7 @@ def _staged_models() -> tuple[CandidateTradePlan, StageCandidateResult]:
         updated_at_utc="2026-07-20T14:30:01Z",
         state_version=1,
         broker_child_order_ids=[],
+        broker_child_orders=[],
         residual_exposure=False,
         risk_reason_codes=[],
     )
@@ -445,9 +446,14 @@ def test_order_projection_rejects_stale_or_conflicting_versions(
     engine: Engine, confirmation_cipher: ConfirmationCipher
 ) -> None:
     plan, result = _staged_models()
-    persist_staged_candidate(engine, plan, result, confirmation_cipher)
     assert result.order is not None
-    working = result.order.model_copy(
+    plan = plan.model_copy(
+        update={"legs": [leg.model_copy(update={"quantity": 3}) for leg in plan.legs]}
+    )
+    staged_order = result.order.model_copy(update={"total_quantity": 3})
+    result = result.model_copy(update={"order": staged_order})
+    persist_staged_candidate(engine, plan, result, confirmation_cipher)
+    working = staged_order.model_copy(
         update={
             "state": "WORKING",
             "state_version": 4,
@@ -459,7 +465,7 @@ def test_order_projection_rejects_stale_or_conflicting_versions(
 
     assert not persist_order_projection(
         engine,
-        result.order,
+        staged_order,
         action="STALE_STAGE",
         actor="gateway",
     )
@@ -472,6 +478,7 @@ def test_order_projection_rejects_stale_or_conflicting_versions(
             "state": "PARTIAL_FILL",
             "state_version": 5,
             "filled_quantity": 1,
+            "residual_exposure": True,
             "updated_at_utc": "2026-07-20T14:30:05Z",
         }
     )
@@ -492,6 +499,34 @@ def test_order_projection_rejects_stale_or_conflicting_versions(
     assert row["filled_quantity"] == 2
     assert row["state_version"] == 6
     assert row["payload"]["state_version"] == 6
+
+
+def test_order_projection_cannot_clear_unreconciled_residual_exposure(
+    engine: Engine, confirmation_cipher: ConfirmationCipher
+) -> None:
+    plan, result = _staged_models()
+    persist_staged_candidate(engine, plan, result, confirmation_cipher)
+    assert result.order is not None
+    uncertain = result.order.model_copy(
+        update={
+            "state": "RECONCILE_PENDING",
+            "state_version": 4,
+            "broker_order_id": "lb-split-1",
+            "residual_exposure": True,
+            "updated_at_utc": "2026-07-20T14:30:04Z",
+        }
+    )
+    assert persist_order_projection(engine, uncertain, action="BROKER_UNKNOWN", actor="gateway")
+    falsely_cleared = uncertain.model_copy(
+        update={
+            "state": "CANCEL_PENDING",
+            "state_version": 5,
+            "residual_exposure": False,
+            "updated_at_utc": "2026-07-20T14:30:05Z",
+        }
+    )
+    with pytest.raises(ValueError, match="terminal flat proof"):
+        persist_order_projection(engine, falsely_cleared, action="FALSE_CLEAR", actor="gateway")
 
 
 def test_persist_writes_signal_and_audit(engine: Engine) -> None:

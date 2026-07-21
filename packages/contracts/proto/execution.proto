@@ -214,6 +214,27 @@ message RiskDecision {
   string rule_version = 10;
 }
 
+enum ExecutionChildOrderState {
+  EXECUTION_CHILD_ORDER_STATE_UNSPECIFIED = 0;
+  EXECUTION_CHILD_ORDER_STATE_WORKING = 1;
+  EXECUTION_CHILD_ORDER_STATE_PARTIAL_FILL = 2;
+  EXECUTION_CHILD_ORDER_STATE_FILLED = 3;
+  EXECUTION_CHILD_ORDER_STATE_CANCELLED = 4;
+  EXECUTION_CHILD_ORDER_STATE_REJECTED = 5;
+  EXECUTION_CHILD_ORDER_STATE_RECONCILE_PENDING = 6;
+}
+
+message ExecutionChildOrder {
+  string broker_order_id = 1;
+  uint32 leg_index = 2;
+  string contract_id = 3;
+  OrderSide side = 4;
+  uint32 quantity = 5;
+  uint32 filled_quantity = 6;
+  ExecutionChildOrderState state = 7;
+  string submitted_price = 8;
+}
+
 message ExecutionOrder {
   string schema_version = 1;
   string order_id = 2;
@@ -236,6 +257,8 @@ message ExecutionOrder {
   uint64 state_version = 16;
   repeated string broker_child_order_ids = 17;
   bool residual_exposure = 18;
+  // Full child projections make residual exposure independently auditable.
+  repeated ExecutionChildOrder broker_child_orders = 19;
 }
 
 message StageCandidateResponse {

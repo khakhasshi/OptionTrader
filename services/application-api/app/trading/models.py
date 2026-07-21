@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -177,8 +178,43 @@ class RiskDecision(StrictModel):
     rule_version: str
 
 
+ChildOrderState = Literal[
+    "WORKING",
+    "PARTIAL_FILL",
+    "FILLED",
+    "CANCELLED",
+    "REJECTED",
+    "RECONCILE_PENDING",
+]
+
+
+class ExecutionChildOrder(StrictModel):
+    broker_order_id: str = Field(min_length=1)
+    leg_index: int = Field(ge=0)
+    contract_id: str = Field(min_length=1)
+    side: Literal["BUY", "SELL"]
+    quantity: int = Field(ge=1)
+    filled_quantity: int = Field(ge=0)
+    state: ChildOrderState
+    submitted_price: DecimalString | None
+
+    @model_validator(mode="after")
+    def quantity_matches_state(self) -> ExecutionChildOrder:
+        if self.filled_quantity > self.quantity:
+            raise ValueError("child filled quantity exceeds order quantity")
+        if self.state == "FILLED" and self.filled_quantity != self.quantity:
+            raise ValueError("filled child must report its full quantity")
+        if self.state == "PARTIAL_FILL" and not 0 < self.filled_quantity < self.quantity:
+            raise ValueError("partial child must report a partial quantity")
+        if self.state == "REJECTED" and self.filled_quantity != 0:
+            raise ValueError("rejected child cannot report a fill")
+        if self.submitted_price is not None and Decimal(self.submitted_price) <= 0:
+            raise ValueError("child submitted price must be positive")
+        return self
+
+
 class ExecutionOrder(StrictModel):
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.1"]
     order_id: str = Field(min_length=1)
     plan_id: str = Field(min_length=1)
     plan_hash: Hash
@@ -194,6 +230,7 @@ class ExecutionOrder(StrictModel):
     updated_at_utc: UtcTimestamp
     state_version: int = Field(ge=1)
     broker_child_order_ids: list[str]
+    broker_child_orders: list[ExecutionChildOrder]
     residual_exposure: bool
     risk_reason_codes: list[RiskReason]
 
@@ -205,13 +242,46 @@ class ExecutionOrder(StrictModel):
             raise ValueError("risk reason codes must be unique")
         if len(set(self.broker_child_order_ids)) != len(self.broker_child_order_ids):
             raise ValueError("broker child order ids must be unique")
+        child_ids = [child.broker_order_id for child in self.broker_child_orders]
+        if len(set(child_ids)) != len(child_ids):
+            raise ValueError("broker child order projections must be unique")
+        if len({child.leg_index for child in self.broker_child_orders}) != len(
+            self.broker_child_orders
+        ):
+            raise ValueError("broker child leg indices must be unique")
+        if child_ids != self.broker_child_order_ids:
+            raise ValueError("broker child ids must match child projections")
+        if self.broker_child_orders:
+            all_filled = all(
+                child.state == "FILLED" and child.filled_quantity == child.quantity
+                for child in self.broker_child_orders
+            )
+            possible_fill = any(
+                child.state in {"WORKING", "RECONCILE_PENDING"}
+                for child in self.broker_child_orders
+            )
+            incomplete_fill = (
+                any(child.filled_quantity > 0 for child in self.broker_child_orders)
+                and not all_filled
+            )
+            if self.residual_exposure != (possible_fill or incomplete_fill):
+                raise ValueError("residual exposure conflicts with child projections")
         if self.residual_exposure and self.state not in {
+            "WORKING",
             "PARTIAL_FILL",
             "RECONCILE_PENDING",
             "CANCEL_PENDING",
             "CANCELLED",
         }:
             raise ValueError("residual exposure requires a non-flat execution state")
+        if self.state == "PARTIAL_FILL" and not self.residual_exposure:
+            raise ValueError("partial fill requires residual exposure")
+        if (
+            self.broker_child_orders
+            and self.state in {"WORKING", "RECONCILE_PENDING"}
+            and not self.residual_exposure
+        ):
+            raise ValueError("active child projection requires residual exposure")
         return self
 
 
@@ -233,6 +303,7 @@ __all__ = [
     "CandidateLeg",
     "CandidateTradePlan",
     "ExecutionOrder",
+    "ExecutionChildOrder",
     "RiskDecision",
     "StageCandidateResult",
 ]

@@ -33,7 +33,7 @@ def _result(state: str = "AWAITING_CONFIRMATION") -> StageCandidateResult:
     )
     order = ExecutionOrder.model_validate(
         {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "order_id": "order_demo_001",
             "plan_id": plan.plan_id,
             "plan_hash": plan.plan_hash,
@@ -49,6 +49,7 @@ def _result(state: str = "AWAITING_CONFIRMATION") -> StageCandidateResult:
             "updated_at_utc": "2026-07-20T14:30:02Z",
             "state_version": 1,
             "broker_child_order_ids": [],
+            "broker_child_orders": [],
             "residual_exposure": False,
             "risk_reason_codes": [],
         }

@@ -43,6 +43,9 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
 12. 自适应限价由 Rust 计算并受原计划保护价约束。adapter 只做确定性映射，不得用坏报价
     退化到 touch/market。IBKR 多腿使用 BAG；Longbridge 按 Rust 计算的每腿价格受控拆腿，
     所有 BUY 腿完整成交后才允许 SELL，partial/unknown 停止并投影残仓或要求对账。
+13. ExecutionOrder 1.1 携带完整子单投影。任何部分成交或 active/unknown 子单都必须显式
+    形成残余敞口；持久化层禁止成交量回退、子单消失，以及没有 FILLED 或零成交终态证明的
+    residual true→false。操作响应复用同一 state_version 但内容冲突时，前端要求对账。
 
 ## 当前限制
 

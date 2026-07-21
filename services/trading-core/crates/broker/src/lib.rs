@@ -148,7 +148,7 @@ pub struct BrokerOrder {
     pub submitted_price: Option<Decimal>,
     pub legs: Vec<BrokerOrderLeg>,
     pub child_orders: Vec<BrokerChildOrder>,
-    /// True when at least one child fill exists but the intended package is
+    /// True when a fill or an uncertain child can leave the intended package
     /// incomplete. New risk must remain closed until broker reconciliation.
     pub residual_exposure: bool,
 }
@@ -248,6 +248,7 @@ impl PaperBroker {
         } else {
             BrokerOrderStatus::PartialFill
         };
+        order.residual_exposure = order.status == BrokerOrderStatus::PartialFill;
         let fill = Fill {
             fill_id: format!("paper-fill-{}", self.next_fill),
             broker_order_id: broker_order_id.to_owned(),

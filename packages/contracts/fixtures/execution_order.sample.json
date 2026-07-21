@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "order_id": "order_0123456789abcdef01234567",
   "plan_id": "plan_0123456789abcdef01234567",
   "plan_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -15,6 +15,7 @@
   "updated_at_utc": "2026-07-21T14:30:01Z",
   "state_version": 1,
   "broker_child_order_ids": [],
+  "broker_child_orders": [],
   "residual_exposure": false,
   "risk_reason_codes": []
 }

@@ -178,3 +178,29 @@ def test_execution_order_contract_excludes_confirmation_secret_and_unknown_state
     fixture["state"] = "UNKNOWN"
     validator = Draft202012Validator(res["execution_order.json"].contents, registry=reg)
     assert len(list(validator.iter_errors(fixture))) >= 1
+
+
+def test_execution_order_requires_visible_residual_for_working_child():
+    reg, res = _registry()
+    fixture = json.load(open(os.path.join(FIXTURE_DIR, "execution_order.sample.json")))
+    fixture.update(
+        {
+            "state": "WORKING",
+            "broker_child_order_ids": ["child-1"],
+            "broker_child_orders": [
+                {
+                    "broker_order_id": "child-1",
+                    "leg_index": 0,
+                    "contract_id": "QQQ-20260721-C-500",
+                    "side": "BUY",
+                    "quantity": 1,
+                    "filled_quantity": 0,
+                    "state": "WORKING",
+                    "submitted_price": "1.25",
+                }
+            ],
+            "residual_exposure": False,
+        }
+    )
+    validator = Draft202012Validator(res["execution_order.json"].contents, registry=reg)
+    assert list(validator.iter_errors(fixture))

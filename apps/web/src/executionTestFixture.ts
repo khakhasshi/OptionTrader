@@ -28,7 +28,7 @@ export const EXECUTION_TICKET_FIXTURE = {
     market_data_provider: "THETADATA",
   },
   order: {
-    schema_version: "1.0",
+    schema_version: "1.1",
     order_id: "order-1",
     plan_id: "plan-1",
     plan_hash: "a".repeat(64),
@@ -44,6 +44,7 @@ export const EXECUTION_TICKET_FIXTURE = {
     updated_at_utc: "2099-07-21T14:30:01Z",
     state_version: 1,
     broker_child_order_ids: [],
+    broker_child_orders: [],
     residual_exposure: false,
     risk_reason_codes: [],
   },

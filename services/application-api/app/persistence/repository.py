@@ -387,6 +387,7 @@ def persist_order_projection(
     actor: str,
 ) -> bool:
     """Update one Rust order projection and append matching order/audit events."""
+    order = ExecutionOrder.model_validate(order.model_dump(mode="json"))
     occurred = datetime.fromisoformat(order.updated_at_utc.replace("Z", "+00:00"))
     created = _now_utc()
     payload = order.model_dump(mode="json")
@@ -426,6 +427,29 @@ def persist_order_projection(
             return False
         if order.filled_quantity < current_order.filled_quantity:
             raise ValueError("Rust order projection reduced filled quantity")
+        incoming_children = {child.broker_order_id: child for child in order.broker_child_orders}
+        for child in current_order.broker_child_orders:
+            incoming = incoming_children.get(child.broker_order_id)
+            if incoming is None:
+                raise ValueError("Rust order projection removed a broker child order")
+            if incoming.filled_quantity < child.filled_quantity:
+                raise ValueError("Rust order projection reduced child filled quantity")
+        if current_order.residual_exposure and not order.residual_exposure:
+            resolved_flat = (
+                order.state == "FILLED"
+                and order.filled_quantity == order.total_quantity
+                and bool(order.broker_child_orders)
+                and all(
+                    child.state == "FILLED" and child.filled_quantity == child.quantity
+                    for child in order.broker_child_orders
+                )
+            ) or (
+                order.state in {"CANCELLED", "REJECTED"}
+                and order.filled_quantity == 0
+                and all(child.filled_quantity == 0 for child in order.broker_child_orders)
+            )
+            if not resolved_flat:
+                raise ValueError("Rust cleared residual exposure without terminal flat proof")
         from_status = str(current["status"])
         updated = conn.execute(
             update(orders)

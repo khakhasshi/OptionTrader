@@ -131,4 +131,26 @@ describe("ExecutionPanel", () => {
     expect(screen.queryByText("AWAITING_CONFIRMATION")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
   });
+
+  it("surfaces a same-version action conflict instead of silently keeping stale state", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, options?: RequestInit) => {
+        if (options?.method === "POST") {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ ...TICKET.order, state: "WORKING" }),
+          } as Response;
+        }
+        return { ok: true, status: 200, json: async () => TICKET } as Response;
+      }),
+    );
+    render(<ExecutionPanel sessionId="live" canTrade />);
+    fireEvent.click(await screen.findByRole("button", { name: "Confirm" }));
+    fireEvent.click(screen.getByRole("checkbox"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Confirm exact hash" })));
+    expect(await screen.findByText("RECONCILIATION REQUIRED")).toBeInTheDocument();
+    expect(screen.getByText("AWAITING_CONFIRMATION")).toBeInTheDocument();
+  });
 });

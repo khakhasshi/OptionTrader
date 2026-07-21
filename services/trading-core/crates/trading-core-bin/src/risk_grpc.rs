@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use broker::{
     price_adaptive_limit, AdaptiveLimitPolicy as AdapterAdaptivePolicy, AdaptivePriceError,
     BrokerAdapter, BrokerError, BrokerId as AdapterBrokerId, BrokerOrderLeg,
-    BrokerOrderType as AdapterOrderType, OrderSide as AdapterOrderSide, PaperBroker, QuoteProof,
+    BrokerOrderStatus as AdapterOrderStatus, BrokerOrderType as AdapterOrderType,
+    OrderSide as AdapterOrderSide, PaperBroker, QuoteProof,
 };
 use chrono::{DateTime, Utc};
 use execution::{submit_to_broker, OrderRecord, OrderState};
@@ -16,10 +17,12 @@ use optiontrader_proto::execution_v1::{
     risk_execution_service_server::RiskExecutionService, BrokerId as ProtoBrokerId,
     BrokerOrderType as ProtoOrderType, CancelOrderRequest, CandidateTradePlan as ProtoPlan,
     ConfirmCandidateRequest, EvaluateCandidateRequest, EventRiskContext as ProtoEventContext,
-    EventRiskFlag as ProtoEventFlag, ExecutionMode as ProtoMode, ExecutionOrder as ProtoOrder,
-    ExecutionOrderState as ProtoOrderState, GetOrderRequest, OptionRight as ProtoRight,
-    OrderSide as ProtoSide, RiskDecision as ProtoDecision, RiskDecisionKind,
-    RiskReasonCode as ProtoReason, StageCandidateResponse, StrategyKind as ProtoStrategy,
+    EventRiskFlag as ProtoEventFlag, ExecutionChildOrder as ProtoChildOrder,
+    ExecutionChildOrderState as ProtoChildState, ExecutionMode as ProtoMode,
+    ExecutionOrder as ProtoOrder, ExecutionOrderState as ProtoOrderState, GetOrderRequest,
+    OptionRight as ProtoRight, OrderSide as ProtoSide, RiskDecision as ProtoDecision,
+    RiskDecisionKind, RiskReasonCode as ProtoReason, StageCandidateResponse,
+    StrategyKind as ProtoStrategy,
 };
 use prost::Message;
 use risk_gateway::{
@@ -660,6 +663,9 @@ fn plan(raw: &ProtoPlan) -> Result<CandidatePlan, &'static str> {
                 return Err("expiry");
             }
             let quote = leg.quote.as_ref().ok_or("option quote proof")?;
+            if quote.provider != "THETADATA" {
+                return Err("option quote provider");
+            }
             Ok(CandidateLeg {
                 side: map_side(leg.side)?,
                 option_right: map_right(leg.option_right)?,
@@ -852,6 +858,24 @@ fn proto_order_state(state: OrderState) -> ProtoOrderState {
     }
 }
 
+fn proto_child_state(state: AdapterOrderStatus) -> ProtoChildState {
+    match state {
+        AdapterOrderStatus::Working => ProtoChildState::Working,
+        AdapterOrderStatus::PartialFill => ProtoChildState::PartialFill,
+        AdapterOrderStatus::Filled => ProtoChildState::Filled,
+        AdapterOrderStatus::Cancelled => ProtoChildState::Cancelled,
+        AdapterOrderStatus::Rejected => ProtoChildState::Rejected,
+        AdapterOrderStatus::ReconcilePending => ProtoChildState::ReconcilePending,
+    }
+}
+
+fn proto_adapter_side(side: AdapterOrderSide) -> ProtoSide {
+    match side {
+        AdapterOrderSide::Buy => ProtoSide::Buy,
+        AdapterOrderSide::Sell => ProtoSide::Sell,
+    }
+}
+
 fn order_proto(staged: &StagedOrder, now: DateTime<Utc>) -> ProtoOrder {
     let updated_at = staged
         .record
@@ -859,7 +883,7 @@ fn order_proto(staged: &StagedOrder, now: DateTime<Utc>) -> ProtoOrder {
         .last()
         .map_or(now, |event| event.occurred_at);
     ProtoOrder {
-        schema_version: "1.0".into(),
+        schema_version: "1.1".into(),
         order_id: staged.record.order_id.clone(),
         plan_id: staged.record.plan_id.clone(),
         plan_hash: staged.record.plan_hash.clone(),
@@ -880,6 +904,24 @@ fn order_proto(staged: &StagedOrder, now: DateTime<Utc>) -> ProtoOrder {
         state_version: staged.record.events.len() as u64,
         broker_child_order_ids: staged.record.broker_child_order_ids.clone(),
         residual_exposure: staged.record.residual_exposure,
+        broker_child_orders: staged
+            .record
+            .broker_child_orders
+            .iter()
+            .map(|child| ProtoChildOrder {
+                broker_order_id: child.broker_order_id.clone(),
+                leg_index: child.leg_index as u32,
+                contract_id: child.contract_id.clone(),
+                side: proto_adapter_side(child.side) as i32,
+                quantity: child.quantity,
+                filled_quantity: child.filled_quantity,
+                state: proto_child_state(child.status) as i32,
+                submitted_price: child
+                    .submitted_price
+                    .map(|price| price.to_string())
+                    .unwrap_or_default(),
+            })
+            .collect(),
     }
 }
 
@@ -1390,6 +1432,13 @@ mod tests {
         };
         value.context_hash = digest(&value, |context| context.context_hash.clear());
         value
+    }
+
+    #[test]
+    fn proto_parser_rejects_non_thetadata_leg_before_domain_risk() {
+        let mut raw = candidate(ProtoMode::Paper);
+        raw.legs[0].quote.as_mut().unwrap().provider = "BROKER".into();
+        assert!(matches!(super::plan(&raw), Err("option quote provider")));
     }
 
     async fn stage(service: &RiskExecutionServiceImpl, mode: ProtoMode) -> StageCandidateResponse {

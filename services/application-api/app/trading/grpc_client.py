@@ -87,6 +87,18 @@ _ORDER_STATE_NAME: dict[int, str] = {
     int(execution_pb2.EXECUTION_ORDER_STATE_RECONCILE_PENDING): "RECONCILE_PENDING",
     int(execution_pb2.EXECUTION_ORDER_STATE_SHADOWED): "SHADOWED",
 }
+_CHILD_STATE_NAME: dict[int, str] = {
+    int(execution_pb2.EXECUTION_CHILD_ORDER_STATE_WORKING): "WORKING",
+    int(execution_pb2.EXECUTION_CHILD_ORDER_STATE_PARTIAL_FILL): "PARTIAL_FILL",
+    int(execution_pb2.EXECUTION_CHILD_ORDER_STATE_FILLED): "FILLED",
+    int(execution_pb2.EXECUTION_CHILD_ORDER_STATE_CANCELLED): "CANCELLED",
+    int(execution_pb2.EXECUTION_CHILD_ORDER_STATE_REJECTED): "REJECTED",
+    int(execution_pb2.EXECUTION_CHILD_ORDER_STATE_RECONCILE_PENDING): "RECONCILE_PENDING",
+}
+_SIDE_NAME: dict[int, str] = {
+    int(execution_pb2.ORDER_SIDE_BUY): "BUY",
+    int(execution_pb2.ORDER_SIDE_SELL): "SELL",
+}
 
 
 def event_context_proto(context: EventContext) -> execution_pb2.EventRiskContext:
@@ -154,6 +166,19 @@ def order_from_proto(raw: Any) -> ExecutionOrder:
         mode = _MODE_NAME[int(raw.execution_mode)]
         state = _ORDER_STATE_NAME[int(raw.state)]
         reasons = [_REASON_NAME[int(reason)] for reason in raw.risk_reason_codes]
+        child_orders = [
+            {
+                "broker_order_id": child.broker_order_id,
+                "leg_index": child.leg_index,
+                "contract_id": child.contract_id,
+                "side": _SIDE_NAME[int(child.side)],
+                "quantity": child.quantity,
+                "filled_quantity": child.filled_quantity,
+                "state": _CHILD_STATE_NAME[int(child.state)],
+                "submitted_price": child.submitted_price or None,
+            }
+            for child in raw.broker_child_orders
+        ]
     except KeyError as exc:
         raise ValueError(f"Rust returned an unknown execution enum: {exc.args[0]}") from exc
     return ExecutionOrder.model_validate(
@@ -174,6 +199,7 @@ def order_from_proto(raw: Any) -> ExecutionOrder:
             "updated_at_utc": raw.updated_at_utc,
             "state_version": raw.state_version,
             "broker_child_order_ids": list(raw.broker_child_order_ids),
+            "broker_child_orders": child_orders,
             "residual_exposure": raw.residual_exposure,
             "risk_reason_codes": reasons,
         }

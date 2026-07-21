@@ -1,10 +1,10 @@
 //! Fail-closed order lifecycle, confirmation, idempotency and reconciliation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use broker::{
-    BrokerAdapter, BrokerError, BrokerOrder, BrokerOrderLeg, BrokerOrderRequest, BrokerOrderStatus,
-    BrokerOrderType, OrderSide,
+    BrokerAdapter, BrokerChildOrder, BrokerError, BrokerOrder, BrokerOrderLeg, BrokerOrderRequest,
+    BrokerOrderStatus, BrokerOrderType, OrderSide,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -71,6 +71,7 @@ pub struct OrderRecord {
     pub filled_quantity: u32,
     pub broker_order_id: Option<String>,
     pub broker_child_order_ids: Vec<String>,
+    pub broker_child_orders: Vec<BrokerChildOrder>,
     pub residual_exposure: bool,
     pub confirmation_id: Option<String>,
     pub events: Vec<OrderEvent>,
@@ -99,6 +100,7 @@ impl OrderRecord {
             filled_quantity: 0,
             broker_order_id: None,
             broker_child_order_ids: Vec::new(),
+            broker_child_orders: Vec::new(),
             residual_exposure: false,
             confirmation_id: None,
             events: Vec::new(),
@@ -208,7 +210,12 @@ impl OrderRecord {
         {
             return Err(ExecutionError::DuplicateConflict);
         }
+        if !child_projection_valid(order) {
+            return Err(ExecutionError::DuplicateConflict);
+        }
         let previous_filled_quantity = self.filled_quantity;
+        let previous_child_orders = self.broker_child_orders.clone();
+        let previous_residual_exposure = self.residual_exposure;
         let (target, kind) = match order.status {
             BrokerOrderStatus::Working => (OrderState::Working, "BROKER_WORKING"),
             BrokerOrderStatus::PartialFill => (OrderState::PartialFill, "BROKER_PARTIAL_FILL"),
@@ -231,13 +238,28 @@ impl OrderRecord {
             .iter()
             .map(|child| child.broker_order_id.clone())
             .collect();
+        self.broker_child_orders = order.child_orders.clone();
         self.residual_exposure = order.residual_exposure;
         self.filled_quantity = order.filled_quantity;
         if self.state == target {
-            if order.filled_quantity == previous_filled_quantity {
+            if order.filled_quantity == previous_filled_quantity
+                && order.child_orders == previous_child_orders
+                && order.residual_exposure == previous_residual_exposure
+            {
                 return Ok(());
             }
-            return self.transition(target, "BROKER_PARTIAL_FILL_PROGRESS", at);
+            self.events.push(OrderEvent {
+                sequence: self.events.len() as u64 + 1,
+                from: target,
+                to: target,
+                kind: if order.filled_quantity != previous_filled_quantity {
+                    "BROKER_PARTIAL_FILL_PROGRESS"
+                } else {
+                    "BROKER_CHILD_PROJECTION_PROGRESS"
+                },
+                occurred_at: at,
+            });
+            return Ok(());
         }
         self.transition(target, kind, at)
     }
@@ -252,6 +274,57 @@ impl OrderRecord {
         }
         self.transition(OrderState::ReconcilePending, "BROKER_DISCONNECTED", at)
     }
+}
+
+fn child_projection_valid(order: &BrokerOrder) -> bool {
+    if order.status == BrokerOrderStatus::PartialFill && !order.residual_exposure {
+        return false;
+    }
+    if order.status == BrokerOrderStatus::Filled && order.residual_exposure {
+        return false;
+    }
+    if order.child_orders.is_empty() {
+        // A split submit can become ambiguous before a broker child id is
+        // returned. In that case residual=true is deliberately allowed.
+        return true;
+    }
+    let mut ids = BTreeSet::new();
+    let mut leg_indices = BTreeSet::new();
+    for child in &order.child_orders {
+        let Some(leg) = order.legs.get(child.leg_index) else {
+            return false;
+        };
+        if !ids.insert(child.broker_order_id.as_str())
+            || !leg_indices.insert(child.leg_index)
+            || child.contract_id != leg.contract_id
+            || child.side != leg.side
+            || child.quantity != leg.quantity
+            || child.filled_quantity > child.quantity
+            || (child.status == BrokerOrderStatus::Filled
+                && child.filled_quantity != child.quantity)
+            || (child.status == BrokerOrderStatus::PartialFill
+                && !(0 < child.filled_quantity && child.filled_quantity < child.quantity))
+            || (child.status == BrokerOrderStatus::Rejected && child.filled_quantity != 0)
+        {
+            return false;
+        }
+    }
+    let all_filled = order.child_orders.len() == order.legs.len()
+        && order.child_orders.iter().all(|child| {
+            child.status == BrokerOrderStatus::Filled && child.filled_quantity == child.quantity
+        });
+    let possible_fill = order.child_orders.iter().any(|child| {
+        matches!(
+            child.status,
+            BrokerOrderStatus::Working | BrokerOrderStatus::ReconcilePending
+        )
+    });
+    let incomplete_fill = order
+        .child_orders
+        .iter()
+        .any(|child| child.filled_quantity > 0)
+        && !all_filled;
+    order.residual_exposure == (possible_fill || incomplete_fill)
 }
 
 fn allowed(from: OrderState, to: OrderState) -> bool {
@@ -501,7 +574,7 @@ mod tests {
                 submitted_price: Some(Decimal::ONE),
             }],
             child_orders: Vec::new(),
-            residual_exposure: false,
+            residual_exposure: true,
         };
         record.apply_broker_order(&partial, now()).unwrap();
         let first_version = record.events.len();
@@ -525,6 +598,61 @@ mod tests {
             Err(ExecutionError::DuplicateConflict)
         );
         assert_eq!(record.filled_quantity, 2);
+    }
+
+    #[test]
+    fn child_projection_cannot_hide_possible_residual_exposure() {
+        let mut record = OrderRecord::proposed(
+            "order-child".into(),
+            "plan-child".into(),
+            "a".repeat(64),
+            "key-child".into(),
+            now() + Duration::minutes(1),
+            1,
+        )
+        .unwrap();
+        record.initial_risk(true, now()).unwrap();
+        record
+            .confirm("confirm-child".into(), &"a".repeat(64), now())
+            .unwrap();
+        record.begin_submit(now()).unwrap();
+        let leg = BrokerOrderLeg {
+            contract_id: "QQQ-20260721-C-500".into(),
+            side: OrderSide::Buy,
+            quantity: 1,
+            broker_contract_id: None,
+            symbol: Some("QQQ".into()),
+            exchange: None,
+            submitted_price: Some(Decimal::ONE),
+        };
+        let hidden = BrokerOrder {
+            broker_order_id: "broker-child".into(),
+            idempotency_key: "key-child".into(),
+            plan_hash: "a".repeat(64),
+            status: BrokerOrderStatus::Working,
+            side: OrderSide::Buy,
+            order_type: BrokerOrderType::Limit,
+            total_quantity: 1,
+            filled_quantity: 0,
+            submitted_price: Some(Decimal::ONE),
+            legs: vec![leg.clone()],
+            child_orders: vec![BrokerChildOrder {
+                broker_order_id: "child-1".into(),
+                leg_index: 0,
+                contract_id: leg.contract_id,
+                side: leg.side,
+                quantity: 1,
+                filled_quantity: 0,
+                status: BrokerOrderStatus::Working,
+                submitted_price: leg.submitted_price,
+            }],
+            residual_exposure: false,
+        };
+        assert_eq!(
+            record.apply_broker_order(&hidden, now()),
+            Err(ExecutionError::DuplicateConflict)
+        );
+        assert!(record.broker_child_orders.is_empty());
     }
 
     #[test]

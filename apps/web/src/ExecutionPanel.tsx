@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, Clock3, RefreshCw, ShieldAlert, XCircle } from "lucide-react";
 import {
+  classifyExecutionProjection,
   isNewerExecutionOrder,
   parseExecutionTicket,
   type ExecutionOrder,
@@ -74,14 +75,17 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
     ["AWAITING_CONFIRMATION", "WORKING", "PARTIAL_FILL"].includes(ticket.order.state) &&
     pending === null;
 
-  const updateOrder = (order: ExecutionOrder) => {
+  const updateActionOrder = (order: ExecutionOrder): boolean => {
     requestGeneration.current += 1;
     const current = ticketAnchor.current;
-    if (current && isNewerExecutionOrder(current.order, order)) {
+    if (!current) return false;
+    const relation = classifyExecutionProjection(current.order, order);
+    if (relation === "NEWER") {
       const next = { ...current, order };
       ticketAnchor.current = next;
       setTicket(next);
     }
+    return relation === "NEWER" || relation === "DUPLICATE";
   };
 
   const confirm = async () => {
@@ -97,7 +101,7 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
       if (!response.ok) throw new Error(response.status === 409 ? "RECONCILIATION REQUIRED" : "CONFIRM FAILED");
       const parsed = parseExecutionTicket({ plan: ticket.plan, order: await response.json() });
       if (!parsed) throw new Error("INVALID GATEWAY RESPONSE");
-      updateOrder(parsed.order);
+      if (!updateActionOrder(parsed.order)) throw new Error("RECONCILIATION REQUIRED");
       setReviewOpen(false);
       setAcknowledged(false);
     } catch (cause) {
@@ -118,7 +122,7 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
       if (!response.ok) throw new Error("CANCEL FAILED");
       const parsed = parseExecutionTicket({ plan: ticket.plan, order: await response.json() });
       if (!parsed) throw new Error("INVALID GATEWAY RESPONSE");
-      updateOrder(parsed.order);
+      if (!updateActionOrder(parsed.order)) throw new Error("RECONCILIATION REQUIRED");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "CANCEL FAILED");
     } finally {
@@ -173,8 +177,21 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
             <code>Data {ticket.plan.market_data_provider}</code>
             {ticket.order.broker_order_id && <code>Broker {ticket.order.broker_order_id}</code>}
           </div>
+          {ticket.order.broker_child_orders.length > 0 && (
+            <div className="legs-table" role="table" aria-label="Broker child orders">
+              <div className="legs-head" role="row"><span>Child</span><span>Side</span><span>Filled</span><span>State</span></div>
+              {ticket.order.broker_child_orders.map((child) => (
+                <div className="legs-row" role="row" key={child.broker_order_id}>
+                  <span title={child.broker_order_id}>{child.broker_order_id.slice(0, 12)}</span>
+                  <span className={child.side === "BUY" ? "buy-text" : "sell-text"}>{child.side}</span>
+                  <span>{child.filled_quantity} / {child.quantity}</span>
+                  <span>{child.state}</span>
+                </div>
+              ))}
+            </div>
+          )}
           {ticket.order.residual_exposure && (
-            <p className="alert-line" role="alert"><ShieldAlert size={16} aria-hidden="true" /> Residual exposure · reconciliation required</p>
+            <p className="alert-line" role="alert"><ShieldAlert size={16} aria-hidden="true" /> Residual exposure · {ticket.order.broker_child_orders.reduce((sum, child) => sum + child.filled_quantity, 0)} child contracts filled · reconciliation required</p>
           )}
           {ticket.order.risk_reason_codes.length > 0 && (
             <p className="alert-line"><ShieldAlert size={16} aria-hidden="true" /> {ticket.order.risk_reason_codes.join(" · ")}</p>

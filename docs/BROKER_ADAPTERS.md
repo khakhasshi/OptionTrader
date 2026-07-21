@@ -32,6 +32,10 @@ Rust 是价格权威。Broker adapter 只接收已经确定的订单级方向、
   标记 `residual_exposure=true`；提交结果未知也按“可能有残仓”处理。重连时按精确 remark、
   symbol、side、quantity 扫描当日订单恢复 child ID；零匹配或多匹配均保持闭锁。系统保留
   受保护的多头残仓并要求对账，不自动市价砍仓。
+- `ExecutionOrder 1.1` 同时投影每个子单的腿序号、方向、委托量、成交量、状态和提交价；
+  Rust、Python 和 React 必须能从明细独立核对 residual，界面不得只显示父单布尔值。
+- SDK submit/order/cancel 被限制在窄 I/O 适配层；脚本化测试覆盖部分成交后撤单、撤单失败、
+  轮询超时、终态回报和恢复时重复匹配。生产实现仍只使用官方 Rust SDK。
 - `OPTIONTRADER_LONGBRIDGE_LEG_FILL_TIMEOUT_MS` 默认 8000（1000-60000），轮询间隔
   `OPTIONTRADER_LONGBRIDGE_LEG_POLL_INTERVAL_MS` 默认 250（50-1000）；非法配置拒绝启动。
 - `broker_contract_id` 必须是 Longbridge SDK 原生期权 symbol；`contract_id` 仅作跨数据源审计标识。

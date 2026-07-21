@@ -72,7 +72,7 @@ export interface CandidateTradePlan {
 }
 
 export interface ExecutionOrder {
-  schema_version: "1.0";
+  schema_version: "1.1";
   order_id: string;
   plan_id: string;
   plan_hash: string;
@@ -88,8 +88,20 @@ export interface ExecutionOrder {
   updated_at_utc: string;
   state_version: number;
   broker_child_order_ids: string[];
+  broker_child_orders: ExecutionChildOrder[];
   residual_exposure: boolean;
   risk_reason_codes: string[];
+}
+
+export interface ExecutionChildOrder {
+  broker_order_id: string;
+  leg_index: number;
+  contract_id: string;
+  side: "BUY" | "SELL";
+  quantity: number;
+  filled_quantity: number;
+  state: "WORKING" | "PARTIAL_FILL" | "FILLED" | "CANCELLED" | "REJECTED" | "RECONCILE_PENDING";
+  submitted_price: string | null;
 }
 
 export interface ExecutionTicket {
@@ -266,8 +278,30 @@ function parsePlan(value: unknown): CandidateTradePlan | null {
   };
 }
 
+function parseChildOrder(value: unknown): ExecutionChildOrder | null {
+  if (!record(value)) return null;
+  if (
+    typeof value.broker_order_id !== "string" || value.broker_order_id.length === 0 ||
+    !Number.isInteger(value.leg_index) || Number(value.leg_index) < 0 ||
+    typeof value.contract_id !== "string" || value.contract_id.length === 0 ||
+    (value.side !== "BUY" && value.side !== "SELL") ||
+    !Number.isInteger(value.quantity) || Number(value.quantity) < 1 ||
+    !Number.isInteger(value.filled_quantity) || Number(value.filled_quantity) < 0 ||
+    Number(value.filled_quantity) > Number(value.quantity) ||
+    !["WORKING", "PARTIAL_FILL", "FILLED", "CANCELLED", "REJECTED", "RECONCILE_PENDING"].includes(String(value.state)) ||
+    (value.submitted_price !== null && (!decimal(value.submitted_price) || Number(value.submitted_price) <= 0))
+  ) return null;
+  if (value.state === "FILLED" && value.filled_quantity !== value.quantity) return null;
+  if (value.state === "PARTIAL_FILL" && !(Number(value.filled_quantity) > 0 && Number(value.filled_quantity) < Number(value.quantity))) return null;
+  if (value.state === "REJECTED" && value.filled_quantity !== 0) return null;
+  return value as unknown as ExecutionChildOrder;
+}
+
 function parseOrder(value: unknown): ExecutionOrder | null {
-  if (!record(value) || value.schema_version !== "1.0") return null;
+  if (!record(value) || value.schema_version !== "1.1") return null;
+  const childOrders = Array.isArray(value.broker_child_orders)
+    ? value.broker_child_orders.map(parseChildOrder)
+    : [];
   if (
     typeof value.order_id !== "string" ||
     typeof value.plan_id !== "string" ||
@@ -290,12 +324,30 @@ function parseOrder(value: unknown): ExecutionOrder | null {
     !Array.isArray(value.broker_child_order_ids) ||
     !value.broker_child_order_ids.every((item) => typeof item === "string" && item.length > 0) ||
     new Set(value.broker_child_order_ids).size !== value.broker_child_order_ids.length ||
+    !Array.isArray(value.broker_child_orders) ||
+    childOrders.some((child) => child === null) ||
     typeof value.residual_exposure !== "boolean" ||
     !Array.isArray(value.risk_reason_codes) ||
     !value.risk_reason_codes.every((item) => typeof item === "string")
   )
     return null;
-  return value as unknown as ExecutionOrder;
+  const children = childOrders as ExecutionChildOrder[];
+  const childIds = children.map((child) => child.broker_order_id);
+  if (
+    new Set(childIds).size !== childIds.length ||
+    new Set(children.map((child) => child.leg_index)).size !== children.length ||
+    childIds.join("\u0000") !== value.broker_child_order_ids.join("\u0000")
+  ) return null;
+  if (children.length > 0) {
+    const allFilled = children.every((child) => child.state === "FILLED" && child.filled_quantity === child.quantity);
+    const possibleFill = children.some((child) => child.state === "WORKING" || child.state === "RECONCILE_PENDING");
+    const incompleteFill = children.some((child) => child.filled_quantity > 0) && !allFilled;
+    if (value.residual_exposure !== (possibleFill || incompleteFill)) return null;
+  }
+  if (value.residual_exposure && !["WORKING", "PARTIAL_FILL", "RECONCILE_PENDING", "CANCEL_PENDING", "CANCELLED"].includes(String(value.state))) return null;
+  if (value.state === "PARTIAL_FILL" && !value.residual_exposure) return null;
+  if (children.length > 0 && (value.state === "WORKING" || value.state === "RECONCILE_PENDING") && !value.residual_exposure) return null;
+  return { ...(value as unknown as ExecutionOrder), broker_child_orders: children };
 }
 
 export function parseExecutionTicket(value: unknown): ExecutionTicket | null {
@@ -313,6 +365,10 @@ export function parseExecutionTicket(value: unknown): ExecutionTicket | null {
     plan.legs[0]?.quantity !== order.total_quantity
   )
     return null;
+  if (order.broker_child_orders.some((child) => {
+    const leg = plan.legs[child.leg_index];
+    return !leg || leg.contract_id !== child.contract_id || leg.side !== child.side || leg.quantity !== child.quantity;
+  })) return null;
   return { plan, order };
 }
 
@@ -334,6 +390,30 @@ export function isNewerExecutionOrder(current: ExecutionOrder, incoming: Executi
     incoming.filled_quantity >= current.filled_quantity &&
     incoming.residual_exposure === current.residual_exposure &&
     incoming.broker_child_order_ids.join("\u0000") === current.broker_child_order_ids.join("\u0000") &&
+    JSON.stringify(incoming.broker_child_orders) === JSON.stringify(current.broker_child_orders) &&
     Date.parse(incoming.updated_at_utc) >= Date.parse(current.updated_at_utc)
   );
+}
+
+export type ProjectionRelation = "NEWER" | "DUPLICATE" | "STALE" | "CONFLICT";
+
+/** Classify an action response so same-version conflicts cannot be silently ignored. */
+export function classifyExecutionProjection(
+  current: ExecutionOrder,
+  incoming: ExecutionOrder,
+): ProjectionRelation {
+  if (incoming.order_id !== current.order_id) return "CONFLICT";
+  if (incoming.state_version < current.state_version) return "STALE";
+  if (incoming.state_version > current.state_version) {
+    return isNewerExecutionOrder(current, incoming) ? "NEWER" : "CONFLICT";
+  }
+  const sameContent =
+    incoming.state === current.state &&
+    incoming.filled_quantity === current.filled_quantity &&
+    incoming.broker_order_id === current.broker_order_id &&
+    incoming.residual_exposure === current.residual_exposure &&
+    incoming.broker_child_order_ids.join("\u0000") === current.broker_child_order_ids.join("\u0000") &&
+    JSON.stringify(incoming.broker_child_orders) === JSON.stringify(current.broker_child_orders) &&
+    incoming.risk_reason_codes.join("\u0000") === current.risk_reason_codes.join("\u0000");
+  return sameContent ? "DUPLICATE" : "CONFLICT";
 }

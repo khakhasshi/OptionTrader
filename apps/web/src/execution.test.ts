@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isNewerExecutionOrder, parseExecutionTicket } from "./execution";
+import { classifyExecutionProjection, isNewerExecutionOrder, parseExecutionTicket } from "./execution";
 import { EXECUTION_TICKET_FIXTURE as TICKET } from "./executionTestFixture";
 
 describe("parseExecutionTicket", () => {
@@ -110,5 +110,46 @@ describe("parseExecutionTicket", () => {
         updated_at_utc: "2099-07-21T14:30:02Z",
       }),
     ).toBe(false);
+  });
+
+  it("derives residual exposure from full child projections", () => {
+    const child = {
+      broker_order_id: "child-1",
+      leg_index: 0,
+      contract_id: TICKET.plan.legs[0].contract_id,
+      side: "BUY" as const,
+      quantity: 1,
+      filled_quantity: 0,
+      state: "WORKING" as const,
+      submitted_price: "1.25",
+    };
+    const invalid = {
+      ...TICKET,
+      order: {
+        ...TICKET.order,
+        state: "WORKING",
+        broker_child_order_ids: ["child-1"],
+        broker_child_orders: [child],
+        residual_exposure: false,
+      },
+    };
+    expect(parseExecutionTicket(invalid)).toBeNull();
+    expect(
+      parseExecutionTicket({
+        ...invalid,
+        order: { ...invalid.order, residual_exposure: true },
+      })?.order.broker_child_orders[0]?.filled_quantity,
+    ).toBe(0);
+  });
+
+  it("classifies same-version action conflicts for reconciliation", () => {
+    const current = { ...TICKET.order, state: "WORKING" as const, state_version: 4 };
+    expect(classifyExecutionProjection(current, { ...current })).toBe("DUPLICATE");
+    expect(
+      classifyExecutionProjection(current, { ...current, state: "FILLED" }),
+    ).toBe("CONFLICT");
+    expect(
+      classifyExecutionProjection(current, { ...current, state_version: 3 }),
+    ).toBe("STALE");
   });
 });
