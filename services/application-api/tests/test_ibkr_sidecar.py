@@ -70,6 +70,16 @@ def test_tws_and_gateway_defaults_are_distinct_and_loopback(
     assert gateway.port == 4002
 
 
+def test_phase3_config_never_enables_ibkr_live_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPTIONTRADER_IBKR_ACCOUNT", "DU123")
+    monkeypatch.setenv("OPTIONTRADER_IBKR_PAPER", "false")
+    monkeypatch.setenv("OPTIONTRADER_IBKR_SUBMISSION_ENABLED", "true")
+    with pytest.raises(ValueError, match="restricted to paper"):
+        IbkrEndpointConfig.from_env()
+
+
 def test_sell_combo_normalizes_bag_legs_without_changing_intended_execution() -> None:
     contract, order = map_submit_request(_request(), account="DU123")
     assert contract.sec_type == "BAG"

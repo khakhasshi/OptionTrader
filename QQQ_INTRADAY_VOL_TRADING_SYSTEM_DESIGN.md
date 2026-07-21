@@ -143,6 +143,8 @@ React Trading Cockpit
 14. 一个 CandidateTradePlan 只能提交给其指定的唯一 broker_id。
 15. 行情、期权报价、Greeks、期权链及执行定价证明不是 ThetaData，禁止提交。
 16. Longbridge 拆腿时，所有 BUY 保护腿未确认完整成交前，禁止提交任何 SELL 腿；partial 或 unknown 立即进入残仓/对账状态。
+17. 保护性 CLOSE 必须由最新已提交 Broker native 持仓证明方向相反且数量不超限；没有持仓证明不得提交。
+18. 市价单只允许单腿保护性 CLOSE；市价新开仓和多腿市价平仓固定禁止。
 ```
 
 风控必须执行两次：
@@ -406,7 +408,8 @@ Long strike 用于限定最大亏损。
 
 ### 4.6 Rust Risk & Execution Gateway / Execution Engine
 
-第一阶段只生成 `CandidateTradePlan`，不连接实盘下单。后续模式必须显式区分：
+Phase 3 默认只进入确定性 simulated-paper；隔离的真实 paper adapter 需要多重服务端 opt-in，
+live 不存在可达路由。模式必须显式区分：
 
 ```text
 REPLAY/SHADOW：不连接 Broker。
@@ -421,6 +424,7 @@ Strategy Type
 Plan ID / Signal ID / Session ID
 Plan Hash / Idempotency Key
 Broker ID
+Position Effect（OPEN / CLOSE）
 Symbol
 Expiry
 Legs
@@ -903,7 +907,7 @@ Preliminary Regime
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.3",
   "snapshot_id": "mkt_20260720_094500_000123",
   "occurred_at_utc": "2026-07-20T13:45:00Z",
   "timestamp_et": "2026-07-20T09:45:00-04:00",
@@ -988,6 +992,7 @@ Preliminary Regime
     {
       "side": "BUY",
       "type": "CALL",
+      "contract_id": "QQQ|2026-07-20|500|CALL",
       "expiry": "2026-07-20",
       "strike": "500",
       "quantity": 1,
@@ -1021,7 +1026,8 @@ Preliminary Regime
   "manual_confirmation_required": true,
   "order_side": "BUY",
   "order_type": "LIMIT",
-  "market_data_provider": "THETADATA"
+  "market_data_provider": "THETADATA",
+  "position_effect": "OPEN"
 }
 ```
 

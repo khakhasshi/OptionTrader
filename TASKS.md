@@ -11,12 +11,13 @@
 - ✅ 阅读并理解全部项目文档（4 份）
 - ✅ 探查环境：Git 干净、工具链齐全（Node22/uv/cargo/protoc/psql16/compose v5）
 - ✅ 创建治理文档：CLAUDE.md / PROJECT_PLAN.md / ASSUMPTIONS.md / TASKS.md
+- ✅ Phase 3 代码闭环：候选计划、权威风控、人工确认、Broker 事实账本、受控 paper 路由、事务审计与保护性减仓
 
 ---
 
 ## 进行中
 
-- 🔄 Phase 3：候选交易与半自动闭环。可信 ThetaData 期权证明、IBKR/Longbridge 动态账户事实账本与重启只读对账已实现；真实 Broker 提交、outbox/密钥轮换及 paper 现场认证仍待完成。
+- 🔄 Phase 3 现场 Gate：完整 RTH option soak、IBKR TWS/Gateway 与 Longbridge 真实 paper 故障演练、Q3 参数书面批准。该 Gate 不阻塞 Phase 4 代码开发，但未通过前不得持续运行外部 paper，更不得进入 live。
 
 ---
 
@@ -57,24 +58,26 @@
 
 Phase 2 事件上下文与实时驾驶舱 / Phase 3 候选交易与半自动闭环 / Phase 4 LLM 辅助与复盘 / Phase 5 Shadow 与 Paper 验证 / Phase 6 受控实盘。各阶段任务在前一阶段收尾时展开。
 
-### Phase 3 候选交易与半自动闭环（开发中）
+### Phase 3 候选交易与半自动闭环（代码完成；现场 Gate 待执行）
 
 | 任务 | 状态 | 说明 |
 |---|---|---|
-| P3-A 执行契约 | ✅ | Candidate 1.2/Risk/Order JSON Schema，ThetaData provider proof，`execution.proto` 两阶段风控与订单 RPC，`broker.proto` 账户/持仓/父子订单/成交/提交/撤单/对账 sidecar 契约。 |
-| P3-B 候选计划与仓位 | ✅ | Python 确定性组合定价、defined-risk 校验、风险预算取整、最大张数、TTL、Protobuf hash/idempotency key；CONTROLLED_AUTO 禁用。 |
-| P3-C Rust 两阶段硬风控 | 🔄 | ThetaData exact-contract quote/size/first-order Greeks bridge 与内容寻址批次已完成；Stage 仅复用仍通过 batch age 的缓存，Confirm 强制重新请求并逐字段验证。Gamma 始终由同步 ThetaData Delta/IV/underlying/time 推导，不信任返回 frame 中的 gamma。Q3 参数批准与完整 RTH option soak 待补。 |
-| P3-D 状态机与 paper adapter | 🔄 | 已覆盖确认、幂等、三类订单语义、自适应定价、父子订单、残仓、提交/部分成交/拒单/撤单/断线；PostgreSQL workflow 可原子重建并提升 ReconcilePending。IBKR 与 Longbridge 只读自动对账均已接线，残余拆腿敞口独立保持权威闸门关闭。 |
-| P3-E PostgreSQL 审计与恢复保护 | 🔄 | 计划/风险/订单/确认意图/状态事件事务化；Fernet capability 一次性 claim；state_version/行锁阻止回退；启动恢复与持续 supervisor 已接入。IBKR 全账户快照按 Rust 序号+SHA-256 两阶段闭锁，账户/持仓/成交/差异原子入账，失败审计与 unresolved API 可见。outbox、密钥轮换仍待补。 |
-| P3-F React 人工确认 | ✅ | 精确计划 hash 确认、TTL、Cockpit 双闸门、取消、父子单状态/成交/残仓显示、异常响应 fail closed；request generation + `state_version` 防迟到轮询回退，同版本操作响应冲突显式要求对账；浏览器视觉回归仍待执行。 |
-| P3-G Longbridge/IBKR adapter | 🔄 | Longbridge 4.3.3 Rust SDK 已接账户/持仓/全部活动订单/当日成交、BUY-first 拆腿、未知订单闭锁与 native id+remark+完整形状只读恢复，并输出统一 hash 事实快照。IBKR sidecar 已接四类快照、OPT/BAG、MKT/LMT/Adaptive、跨进程重启 orderRef+shape 幂等和只读恢复；全账户订单按配置 account 双重过滤。真实 adapter 提交选择和 paper 现场认证待补。 |
-| P3-H Gate/E2E | 🔄 | 已入库部分成交→断线→重启残仓保持、拒单不重发、IBKR 只读恢复/并发幂等/快照漂移、Theta Confirm 强制刷新测试；仍需完整 RTH option soak、真实 paper 账户故障演练、保护性退出和 Q3 参数批准后签收。 |
+| P3-A 执行契约 | ✅ | Candidate 1.3/Risk/Order JSON Schema；计划与每腿 ThetaData proof；OPEN/CLOSE 与 `POSITION_NOT_REDUCIBLE`；`execution.proto` 两阶段风控/订单 RPC；`broker.proto` 账户/持仓/父子订单/成交/提交/撤单/对账契约。 |
+| P3-B 候选计划与仓位 | ✅ | Python 确定性组合定价、defined-risk 开仓预算、保护性减仓数量、TTL、Protobuf hash/idempotency key；市价仅单腿 CLOSE，CONTROLLED_AUTO 禁用。 |
+| P3-C Rust 两阶段硬风控 | ✅ 代码 / ⏳ 现场 | Stage/Confirm exact-contract ThetaData 逐字段证明、derived Gamma、账户/规则/事件/限额闸门完成；CLOSE 仍要求数据与 Broker 事实，但可绕过开仓专属限制。Q3 参数批准与完整 RTH option soak 属现场 Gate。 |
+| P3-D 状态机与 paper adapter | ✅ 代码 / ⏳ 现场 | 确认、幂等、限价/自适应/受限市价、父子订单、残仓、提交/部分成交/拒单/撤单/断线/unknown outcome 与重启恢复完成；simulated-paper 默认，IBKR/Longbridge 外部 paper 路由多重 opt-in 且 live 不可达。 |
+| P3-E PostgreSQL 审计与恢复保护 | ✅ | 计划/风控/订单/确认/对账/失败状态与 deterministic outbox 同事务；`SKIP LOCKED` 租约、ack/重试/dead letter；Fernet 多 key 解密与启动原子轮换；state_version/行锁/数量不回退；Broker hash 两阶段入账。 |
+| P3-F React 人工确认 | ✅ | 精确 plan hash 确认、TTL、Cockpit 双闸门、取消、父子单/成交/残仓/OPEN-CLOSE 展示；保护性 CLOSE 不被前端“禁止新开仓”误拦，最终仍由 Rust 决定；桌面与 400px 响应式 fail-closed 画面已复核。 |
+| P3-G Longbridge/IBKR adapter | ✅ 代码 / ⏳ 现场 | Longbridge 4.3.3 Rust SDK 与 IBKR TWS/Gateway sidecar 已覆盖事实快照、严格恢复和 submit/cancel；执行 Broker 必须与唯一 reconciliation Broker 相同，外部 I/O 不持有 workflow 锁，unknown 关闭 authority。真实 paper 现场认证待补。 |
+| P3-H Gate/E2E | ✅ 代码 / ⏳ 现场 | 故障注入覆盖部分成交→断线→重启、拒单不重发、快照漂移、Confirm 强刷、outbox 并发/死信、key 轮换回滚、减仓方向/数量/行情/Broker 闭锁；完整 RTH 与真实 paper 故障演练、Q3 批准仍是上线 Gate。 |
 
 > 2026-07-21 Phase 3 子单审计与 Longbridge 加固：ExecutionOrder 1.1 已贯通 Proto/JSON/Python/React，完整子单投影和 residual 不变量阻止隐藏敞口、数量回退及无证明清仓；Longbridge 官方 Rust SDK 路径增加可脚本化 I/O 边界和 5 类故障/恢复测试，非 ThetaData 腿在 Rust Proto 解析入口即拒绝。全量 Gate：契约 32 / React 66 / Python 222（+3 环境门控 skip）/ Rust 85 / 强制跨语言 integration 1 全绿。受信任 ThetaData option snapshot registry 仍是下一切片，provider 字符串不构成 paper/live 放行证据。
 
 > 2026-07-21 Phase 3 Broker 事实账本：新增 `BeginBrokerReconciliation` / `CommitBrokerReconciliation` 两阶段协议。Begin 先关闭 Rust 权威闸门，再返回严格验证的 BrokerSnapshot 原始 protobuf、sequence、SHA-256 与短 TTL；Application API 原子写入 PostgreSQL 账户/持仓/成交并与本地订单投影核对；只有同一哈希、持久化成功、无差异且无待对账 workflow 的 Commit 才可恢复 HEALTHY。IBKR `reqAllOpenOrders` 已按配置账户过滤，失败尝试与 unresolved 状态可审计/查询。最终 Gate：契约 32 / React 66 / Python 244（+3 环境门控 skip）/ Rust 98 / 强制 integration 1 全绿；PostgreSQL 16 完成 0004 upgrade→downgrade→upgrade 与真实 FK/JSONB/timestamptz 并发测试。当前全量快照 authority 仅认证 IBKR；Longbridge 自动恢复、outbox、密钥轮换及 paper 现场故障演练仍未完成。
 
 > 2026-07-21 Phase 3 Longbridge 自动恢复：Rust 直接持有 `submission_enabled=false` 的官方 SDK authority，按 durable native id、remark 和完整订单形状只读认领单腿/拆腿订单，再将账户、持仓、订单、成交转换为与 IBKR 相同的 BrokerSnapshot hash 两阶段入账。Python supervisor 可按配置选择一个 Broker 并分别查询两类状态；共享 BrokerAuthority 尚未分片，配置两家会拒绝启动。任何残余拆腿敞口即使状态已离开 ReconcilePending，也禁止 Commit 重开权威闸门。全量 Gate：契约 32 / React 66 / Python 246（+3 环境门控 skip）/ Rust 101（+2 显式 live ignored）/ 强制 integration 1 全绿；两条 Longbridge demo 凭证只读 smoke 已真实通过，且 submit 被确认返回 LiveSubmissionDisabled。真实提交仍未启用；完整 paper RTH 认证、outbox 与密钥轮换仍待完成。
+
+> 2026-07-21 Phase 3 代码收口：Candidate 1.3 新增 OPEN/CLOSE，Rust 仅在最新已提交 Broker native 持仓可证明减少时允许保护性 CLOSE，市价仅限单腿；外部 IBKR/Longbridge paper 路由要求 paper 环境、全局与 Broker 专属 opt-in、执行/对账 Broker 一致，任何 live 或 unknown outcome 均 fail closed。PostgreSQL 0005 增加 transactional outbox，Fernet key ring 启动原子轮换并在坏密文时整体回滚。Longbridge 永久只读 authority 与 mutation adapter 隔离，重启撤单前必须以已认证 durable identity 做只读重绑定，提交前必须通过写侧全量只读 reconcile；任何写侧未就绪都会关闭全局 Broker authority。隔离 PostgreSQL 16 已通过 0005 upgrade→downgrade→upgrade、42 项 persistence 测试及双 worker `SKIP LOCKED` 不重复租约。最终代码 Gate：`make lint` 全绿；契约 32 / React 68 / Python 258（+4 环境门控 skip）/ Rust 118（+2 显式 live ignored）/ 强制跨语言 integration 1 全绿。未运行任何 Broker mutation；现场 Gate 仍保持关闭。
 
 ### Phase 2 事件上下文与实时驾驶舱（开发完成；现场验收待执行）
 

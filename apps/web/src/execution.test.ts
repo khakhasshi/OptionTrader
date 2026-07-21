@@ -75,6 +75,30 @@ describe("parseExecutionTicket", () => {
     ).toBeNull();
   });
 
+  it("accepts only zero-risk single-leg market closes", () => {
+    const close = {
+      ...TICKET,
+      plan: {
+        ...TICKET.plan,
+        position_effect: "CLOSE",
+        order_side: "SELL",
+        order_type: "MARKET",
+        max_loss: "0.00",
+        legs: [{ ...TICKET.plan.legs[0], side: "SELL" }],
+      },
+    };
+    expect(parseExecutionTicket(close)?.plan.position_effect).toBe("CLOSE");
+    expect(
+      parseExecutionTicket({ ...close, plan: { ...close.plan, max_loss: "1.00" } }),
+    ).toBeNull();
+    expect(
+      parseExecutionTicket({
+        ...TICKET,
+        plan: { ...TICKET.plan, order_type: "MARKET" },
+      }),
+    ).toBeNull();
+  });
+
   it("rejects stale or conflicting order projections", () => {
     const current = { ...TICKET.order, state: "WORKING" as const, state_version: 4, filled_quantity: 1 };
     expect(isNewerExecutionOrder(current, { ...TICKET.order, state_version: 1 })).toBe(false);

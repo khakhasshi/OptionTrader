@@ -67,7 +67,7 @@ class AdaptiveLimitPolicy(StrictModel):
 
 
 class CandidateTradePlan(StrictModel):
-    schema_version: Literal["1.2"]
+    schema_version: Literal["1.3"]
     plan_id: str = Field(min_length=1)
     plan_hash: Hash
     idempotency_key: str = Field(min_length=1)
@@ -93,6 +93,7 @@ class CandidateTradePlan(StrictModel):
     order_type: Literal["MARKET", "LIMIT", "ADAPTIVE_LIMIT"]
     adaptive_limit: AdaptiveLimitPolicy | None = None
     market_data_provider: Literal["THETADATA"]
+    position_effect: Literal["OPEN", "CLOSE"]
 
     @model_validator(mode="after")
     def identifiers_and_times_are_consistent(self) -> CandidateTradePlan:
@@ -110,6 +111,13 @@ class CandidateTradePlan(StrictModel):
             raise ValueError("adaptive-limit candidate requires pricing policy")
         if self.order_type != "ADAPTIVE_LIMIT" and self.adaptive_limit is not None:
             raise ValueError("adaptive pricing policy is only valid for adaptive limit")
+        max_loss = Decimal(self.max_loss)
+        if self.position_effect == "OPEN" and max_loss <= 0:
+            raise ValueError("opening candidate max loss must be positive")
+        if self.position_effect == "CLOSE" and max_loss != 0:
+            raise ValueError("closing candidate max loss must be zero")
+        if self.order_type == "MARKET" and (self.position_effect != "CLOSE" or len(self.legs) != 1):
+            raise ValueError("market orders are restricted to single-leg closing candidates")
         if any(leg.quote.chain_snapshot_id not in self.data_snapshot_ids for leg in self.legs):
             raise ValueError("every option chain snapshot must be part of plan proof")
         return self
@@ -146,6 +154,7 @@ RiskReason = Literal[
     "STRATEGY_NOT_ALLOWED",
     "ENTRY_WINDOW_CLOSED",
     "MARKET_ORDER_BLOCKED",
+    "POSITION_NOT_REDUCIBLE",
 ]
 
 OrderState = Literal[

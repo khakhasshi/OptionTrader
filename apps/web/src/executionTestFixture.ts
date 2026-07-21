@@ -2,7 +2,7 @@ import type { ExecutionTicket } from "./execution";
 
 export const EXECUTION_TICKET_FIXTURE = {
   plan: {
-    schema_version: "1.2",
+    schema_version: "1.3",
     plan_id: "plan-1",
     plan_hash: "a".repeat(64),
     idempotency_key: "idem-1",
@@ -26,6 +26,7 @@ export const EXECUTION_TICKET_FIXTURE = {
     order_side: "BUY",
     order_type: "LIMIT",
     market_data_provider: "THETADATA",
+    position_effect: "OPEN",
   },
   order: {
     schema_version: "1.1",

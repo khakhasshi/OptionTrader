@@ -44,6 +44,7 @@ from app.persistence import (
     persist_order_projection,
     persist_staged_candidate,
     restorable_execution_workflow,
+    rotate_confirmation_capabilities,
     staged_plan_projection,
 )
 from app.realtime.projector import ProjectorConfig
@@ -103,6 +104,7 @@ def restore_durable_execution_workflow() -> tuple[int, dict[str, int]]:
     """Rebuild Rust's volatile workflow before serving execution requests."""
     engine = _require_execution_engine()
     cipher = _require_confirmation_cipher()
+    rotate_confirmation_capabilities(engine, cipher)
     entries = restorable_execution_workflow(engine, cipher)
     restored, reconciliation_ids = grpc_restore_workflow(entries)
     broker_by_order_id = {order.order_id: order.broker_id for order in restored}
@@ -150,23 +152,38 @@ def _reconciliation_brokers(raw: str) -> tuple[str, ...]:
     return brokers
 
 
+def _validate_execution_reconciliation_route(
+    execution_backend: str, enabled: bool, brokers: tuple[str, ...]
+) -> None:
+    expected = {"ibkr-paper": "ibkr", "longbridge-paper": "longbridge"}.get(execution_backend)
+    if expected is not None and (not enabled or brokers != (expected,)):
+        raise ValueError("paper execution requires enabled reconciliation for the same broker")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     reconciliation_task: asyncio.Task[None] | None = None
+    enabled = os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_ENABLED", "true")
+    if enabled not in {"true", "false"}:
+        raise ValueError("OPTIONTRADER_BROKER_RECONCILIATION_ENABLED must be exactly true or false")
+    reconciliation_enabled = enabled == "true"
+    brokers = (
+        _reconciliation_brokers(os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_BROKERS", "ibkr"))
+        if reconciliation_enabled
+        else ()
+    )
+    _validate_execution_reconciliation_route(
+        os.getenv("OPTIONTRADER_BROKER_EXECUTION_BACKEND", "simulated-paper"),
+        reconciliation_enabled,
+        brokers,
+    )
     if os.getenv("DATABASE_URL") and os.getenv("OPTIONTRADER_CONFIRMATION_FERNET_KEY"):
         _, unresolved_by_broker = restore_durable_execution_workflow()
         reconciliation_supervisor.note_startup(unresolved_by_broker)
-        enabled = os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_ENABLED", "true")
-        if enabled not in {"true", "false"}:
-            raise ValueError(
-                "OPTIONTRADER_BROKER_RECONCILIATION_ENABLED must be exactly true or false"
-            )
-        if enabled == "true":
+        if reconciliation_enabled:
             interval = int(os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_INTERVAL_SECONDS", "30"))
             if not 5 <= interval <= 300:
                 raise ValueError("broker reconciliation interval must be between 5 and 300 seconds")
-            raw_brokers = os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_BROKERS", "ibkr")
-            brokers = _reconciliation_brokers(raw_brokers)
             reconciliation_task = asyncio.create_task(
                 reconciliation_supervisor.serve(_require_execution_engine(), interval, brokers)
             )

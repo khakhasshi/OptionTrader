@@ -1,7 +1,7 @@
 //! Rust Final Risk Check. Python, React and LLM may propose a candidate, but
 //! only this crate can approve it for the execution state machine.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::America::New_York;
@@ -62,6 +62,12 @@ pub enum BrokerOrderType {
     AdaptiveLimit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionEffect {
+    Open,
+    Close,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionQuoteProof {
     pub bid: Decimal,
@@ -120,6 +126,7 @@ pub struct CandidatePlan {
     pub order_type: BrokerOrderType,
     pub adaptive_policy_valid: bool,
     pub market_data_provider: String,
+    pub position_effect: PositionEffect,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +178,7 @@ pub struct AuthorityState {
     pub buying_power: Decimal,
     pub active_rule_version: String,
     pub allowed_strategies: BTreeSet<StrategyKind>,
+    pub positions: BTreeMap<String, i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +236,7 @@ pub enum RiskReasonCode {
     StrategyNotAllowed,
     EntryWindowClosed,
     MarketOrderBlocked,
+    PositionNotReducible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,7 +294,10 @@ fn candidate_shape_valid(plan: &CandidatePlan) -> bool {
         || plan.legs.is_empty()
         || plan.legs.len() > 4
         || plan.limit_price <= Decimal::ZERO
-        || plan.max_loss <= Decimal::ZERO
+        || match plan.position_effect {
+            PositionEffect::Open => plan.max_loss <= Decimal::ZERO,
+            PositionEffect::Close => plan.max_loss != Decimal::ZERO,
+        }
         || plan.expires_at <= plan.created_at
         || !plan.manual_confirmation_required
         || !plan.adaptive_policy_valid
@@ -380,8 +392,8 @@ fn sell_is_hedged(plan: &CandidatePlan, sold: &CandidateLeg) -> bool {
     })
 }
 
-fn strategy_and_broker_shape_valid(plan: &CandidatePlan) -> bool {
-    let strategy_valid = match plan.strategy {
+fn strategy_shape_valid(plan: &CandidatePlan) -> bool {
+    match plan.strategy {
         StrategyKind::LongGamma => {
             plan.order_side == OrderSide::Buy
                 && plan.legs.iter().all(|leg| leg.side == OrderSide::Buy)
@@ -396,8 +408,11 @@ fn strategy_and_broker_shape_valid(plan: &CandidatePlan) -> bool {
                     .all(|sold| sell_is_hedged(plan, sold))
                 && plan.legs.iter().any(|leg| leg.side == OrderSide::Sell)
         }
-    };
-    let broker_valid = match plan.broker_id {
+    }
+}
+
+fn broker_shape_valid(plan: &CandidatePlan) -> bool {
+    match plan.broker_id {
         // Longbridge has no native combo order. The Rust adapter accepts only
         // strategy-valid packages and executes all BUY legs before SELL legs.
         BrokerId::Longbridge => true,
@@ -406,8 +421,29 @@ fn strategy_and_broker_shape_valid(plan: &CandidatePlan) -> bool {
                 .as_deref()
                 .is_some_and(|value| value.parse::<u64>().is_ok_and(|id| id > 0))
         }),
-    };
-    strategy_valid && broker_valid
+    }
+}
+
+fn position_reduces(plan: &CandidatePlan, positions: &BTreeMap<String, i32>) -> bool {
+    let mut contracts = BTreeSet::new();
+    plan.legs.iter().all(|leg| {
+        let Some(contract_id) = leg.broker_contract_id.as_deref() else {
+            return false;
+        };
+        if !contracts.insert(contract_id) {
+            return false;
+        }
+        let Some(existing) = positions.get(contract_id).copied() else {
+            return false;
+        };
+        match (existing.cmp(&0), leg.side) {
+            (std::cmp::Ordering::Greater, OrderSide::Sell) => {
+                leg.quantity <= existing.unsigned_abs()
+            }
+            (std::cmp::Ordering::Less, OrderSide::Buy) => leg.quantity <= existing.unsigned_abs(),
+            _ => false,
+        }
+    })
 }
 
 fn event_policy_allows(plan: &CandidatePlan, event: &EventRiskContext) -> bool {
@@ -437,6 +473,7 @@ fn event_policy_allows(plan: &CandidatePlan, event: &EventRiskContext) -> bool {
 
 pub fn final_risk_check(input: &FinalRiskInput) -> FinalRiskDecision {
     let mut reasons = BTreeSet::new();
+    let opening = input.plan.position_effect == PositionEffect::Open;
     if !input.authority.data_healthy {
         reasons.insert(RiskReasonCode::DataNotHealthy);
     }
@@ -446,73 +483,89 @@ pub fn final_risk_check(input: &FinalRiskInput) -> FinalRiskDecision {
     if !input.authority.broker_reconciled {
         reasons.insert(RiskReasonCode::BrokerNotReconciled);
     }
-    if !input.authority.risk_limits_confirmed {
-        reasons.insert(RiskReasonCode::RiskLimitsUnconfirmed);
-    }
-    if input.authority.kill_switch_active {
-        reasons.insert(RiskReasonCode::KillSwitchActive);
-    }
-    if input.authority.daily_realized_pnl <= -input.limits.max_daily_loss {
-        reasons.insert(RiskReasonCode::DailyLossLimit);
-    }
-    if input.authority.daily_trade_count >= input.limits.max_daily_trades {
-        reasons.insert(RiskReasonCode::MaxTradesReached);
-    }
-    if input.authority.consecutive_losses >= 3
-        && input
-            .authority
-            .cooldown_until
-            .is_none_or(|until| input.evaluated_at < until)
-    {
-        reasons.insert(RiskReasonCode::LossCooldownActive);
-    }
-    if input.plan.max_loss > input.limits.max_plan_loss {
-        reasons.insert(RiskReasonCode::PlanRiskLimit);
-    }
-    if input.authority.open_risk + input.plan.max_loss > input.limits.max_open_risk {
-        reasons.insert(RiskReasonCode::OpenRiskLimit);
-    }
-    if input.authority.buying_power < input.plan.max_loss {
-        reasons.insert(RiskReasonCode::BuyingPowerInsufficient);
-    }
-    if input
-        .plan
-        .legs
-        .iter()
-        .any(|leg| leg.quantity > input.limits.max_contracts)
-    {
-        reasons.insert(RiskReasonCode::MaxContractsExceeded);
+    if opening {
+        if !input.authority.risk_limits_confirmed {
+            reasons.insert(RiskReasonCode::RiskLimitsUnconfirmed);
+        }
+        if input.authority.kill_switch_active {
+            reasons.insert(RiskReasonCode::KillSwitchActive);
+        }
+        if input.authority.daily_realized_pnl <= -input.limits.max_daily_loss {
+            reasons.insert(RiskReasonCode::DailyLossLimit);
+        }
+        if input.authority.daily_trade_count >= input.limits.max_daily_trades {
+            reasons.insert(RiskReasonCode::MaxTradesReached);
+        }
+        if input.authority.consecutive_losses >= 3
+            && input
+                .authority
+                .cooldown_until
+                .is_none_or(|until| input.evaluated_at < until)
+        {
+            reasons.insert(RiskReasonCode::LossCooldownActive);
+        }
+        if input.plan.max_loss > input.limits.max_plan_loss {
+            reasons.insert(RiskReasonCode::PlanRiskLimit);
+        }
+        if input.authority.open_risk + input.plan.max_loss > input.limits.max_open_risk {
+            reasons.insert(RiskReasonCode::OpenRiskLimit);
+        }
+        if input.authority.buying_power < input.plan.max_loss {
+            reasons.insert(RiskReasonCode::BuyingPowerInsufficient);
+        }
+        if input
+            .plan
+            .legs
+            .iter()
+            .any(|leg| leg.quantity > input.limits.max_contracts)
+        {
+            reasons.insert(RiskReasonCode::MaxContractsExceeded);
+        }
     }
     if input.authority.active_rule_version != input.plan.rule_version {
         reasons.insert(RiskReasonCode::RuleVersionMismatch);
     }
-    if !input
-        .authority
-        .allowed_strategies
-        .contains(&input.plan.strategy)
-    {
-        reasons.insert(RiskReasonCode::StrategyNotAllowed);
-    }
-    if !entry_window_open(input) {
-        reasons.insert(RiskReasonCode::EntryWindowClosed);
-    }
-    if input.plan.order_type == BrokerOrderType::Market {
-        reasons.insert(RiskReasonCode::MarketOrderBlocked);
+    if opening {
+        if !input
+            .authority
+            .allowed_strategies
+            .contains(&input.plan.strategy)
+        {
+            reasons.insert(RiskReasonCode::StrategyNotAllowed);
+        }
+        if !entry_window_open(input) {
+            reasons.insert(RiskReasonCode::EntryWindowClosed);
+        }
+        if input.plan.order_type == BrokerOrderType::Market {
+            reasons.insert(RiskReasonCode::MarketOrderBlocked);
+        }
+    } else {
+        if !position_reduces(&input.plan, &input.authority.positions) {
+            reasons.insert(RiskReasonCode::PositionNotReducible);
+        }
+        if input.plan.order_type == BrokerOrderType::Market && input.plan.legs.len() != 1 {
+            reasons.insert(RiskReasonCode::MarketOrderBlocked);
+        }
     }
     quote_reasons(input, &mut reasons);
-    if !input.event_context.available {
-        reasons.insert(RiskReasonCode::EventContextUnavailable);
-    }
-    if !event_context_valid(&input.event_context, &input.authority) {
-        reasons.insert(RiskReasonCode::EventContextInvalid);
-    }
-    if !event_policy_allows(&input.plan, &input.event_context) {
-        reasons.insert(RiskReasonCode::EventPolicyBlock);
+    if opening {
+        if !input.event_context.available {
+            reasons.insert(RiskReasonCode::EventContextUnavailable);
+        }
+        if !event_context_valid(&input.event_context, &input.authority) {
+            reasons.insert(RiskReasonCode::EventContextInvalid);
+        }
+        if !event_policy_allows(&input.plan, &input.event_context) {
+            reasons.insert(RiskReasonCode::EventPolicyBlock);
+        }
     }
     if input.evaluated_at >= input.plan.expires_at {
         reasons.insert(RiskReasonCode::PlanExpired);
     }
-    if !candidate_shape_valid(&input.plan) || !strategy_and_broker_shape_valid(&input.plan) {
+    if !candidate_shape_valid(&input.plan)
+        || !broker_shape_valid(&input.plan)
+        || (opening && !strategy_shape_valid(&input.plan))
+    {
         reasons.insert(RiskReasonCode::PlanInvalid);
     }
     if !input.plan.hash_verified || input.plan.plan_hash.len() != 64 {
@@ -604,6 +657,7 @@ mod tests {
                 order_type: BrokerOrderType::Limit,
                 adaptive_policy_valid: true,
                 market_data_provider: "THETADATA".into(),
+                position_effect: PositionEffect::Open,
             },
             event_context: EventRiskContext {
                 event_context_id: "event-1".into(),
@@ -642,6 +696,7 @@ mod tests {
                     StrategyKind::ShortPremium,
                     StrategyKind::EventVolCrush,
                 ]),
+                positions: BTreeMap::new(),
             },
             evaluated_at: now() + Duration::seconds(1),
             limits: RiskLimits {
@@ -816,5 +871,96 @@ mod tests {
         assert!(final_risk_check(&wrong_quote)
             .reasons
             .contains(&RiskReasonCode::QuoteProofInvalid));
+    }
+
+    fn closing_input() -> FinalRiskInput {
+        let mut value = input();
+        value.plan.position_effect = PositionEffect::Close;
+        value.plan.max_loss = Decimal::ZERO;
+        value.plan.legs[0].side = OrderSide::Sell;
+        value.plan.order_side = OrderSide::Sell;
+        value.authority.positions.insert("123456".into(), 2);
+        value
+    }
+
+    #[test]
+    fn proven_single_leg_close_bypasses_entry_only_blocks() {
+        let mut value = closing_input();
+        value.plan.order_type = BrokerOrderType::Market;
+        value.authority.risk_limits_confirmed = false;
+        value.authority.kill_switch_active = true;
+        value.authority.daily_realized_pnl = Decimal::from(-10_000);
+        value.authority.open_risk = Decimal::from(10_000);
+        value.authority.daily_trade_count = 99;
+        value.authority.consecutive_losses = 99;
+        value.authority.cooldown_until = Some(now() + Duration::hours(1));
+        value.authority.buying_power = Decimal::ZERO;
+        value.authority.allowed_strategies.clear();
+        value.event_context.available = false;
+        value.event_context.hash_verified = false;
+        value.event_context.source_documents.clear();
+
+        let decision = final_risk_check(&value);
+        assert!(
+            decision.approved,
+            "unexpected close rejection: {:?}",
+            decision.reasons
+        );
+    }
+
+    #[test]
+    fn close_wrong_side_missing_position_or_excess_quantity_fails_closed() {
+        let mut wrong_side = closing_input();
+        wrong_side.plan.legs[0].side = OrderSide::Buy;
+        assert!(final_risk_check(&wrong_side)
+            .reasons
+            .contains(&RiskReasonCode::PositionNotReducible));
+
+        let mut missing = closing_input();
+        missing.authority.positions.clear();
+        assert!(final_risk_check(&missing)
+            .reasons
+            .contains(&RiskReasonCode::PositionNotReducible));
+
+        let mut excess = closing_input();
+        excess.plan.legs[0].quantity = 3;
+        assert!(final_risk_check(&excess)
+            .reasons
+            .contains(&RiskReasonCode::PositionNotReducible));
+    }
+
+    #[test]
+    fn multi_leg_market_close_is_blocked_even_when_every_leg_reduces() {
+        let mut value = closing_input();
+        value.plan.order_type = BrokerOrderType::Market;
+        let mut second = value.plan.legs[0].clone();
+        second.contract_id = "QQQ-P".into();
+        second.broker_contract_id = Some("234567".into());
+        second.option_right = OptionRight::Put;
+        value.plan.legs.push(second);
+        value.authority.positions.insert("234567".into(), 2);
+
+        assert_eq!(
+            final_risk_check(&value).reasons,
+            vec![RiskReasonCode::MarketOrderBlocked]
+        );
+    }
+
+    #[test]
+    fn close_still_requires_fresh_thetadata_and_broker_authority() {
+        let mut value = closing_input();
+        value.authority.data_healthy = false;
+        value.authority.broker_health = BrokerHealth::Disconnected;
+        value.authority.broker_reconciled = false;
+        value.plan.legs[0].quote.occurred_at = now() - Duration::minutes(3);
+        let reasons = final_risk_check(&value).reasons;
+        for expected in [
+            RiskReasonCode::DataNotHealthy,
+            RiskReasonCode::BrokerNotHealthy,
+            RiskReasonCode::BrokerNotReconciled,
+            RiskReasonCode::QuoteStale,
+        ] {
+            assert!(reasons.contains(&expected), "missing {expected:?}");
+        }
     }
 }

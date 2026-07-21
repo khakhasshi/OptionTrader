@@ -77,6 +77,8 @@ class CandidateInputs:
     adaptive_max_quote_age_ms: int = 500
     adaptive_max_spread_bps: int = 2_000
     market_data_provider: str = "THETADATA"
+    position_effect: str = "OPEN"
+    close_quantity: int | None = None
 
 
 def _unit_economics(inputs: CandidateInputs) -> tuple[Decimal, Decimal]:
@@ -136,6 +138,26 @@ def _unit_economics(inputs: CandidateInputs) -> tuple[Decimal, Decimal]:
     return credit, max_loss
 
 
+def _close_economics(inputs: CandidateInputs) -> tuple[Decimal, str]:
+    buys = Decimal("0")
+    sells = Decimal("0")
+    for leg in inputs.quoted_legs:
+        bid = _decimal(leg.bid, "bid", allow_zero=True)
+        ask = _decimal(leg.ask, "ask")
+        if ask < bid:
+            raise ValueError("candidate leg market is crossed")
+        if leg.side == "BUY":
+            buys += ask
+        elif leg.side == "SELL":
+            sells += bid
+        else:
+            raise ValueError("candidate leg side is unmapped")
+    net_debit = buys - sells
+    if net_debit == 0:
+        raise ValueError("closing candidate must have a non-zero protected price")
+    return abs(net_debit), "BUY" if net_debit > 0 else "SELL"
+
+
 def _to_proto(
     plan: CandidateTradePlan, *, clear_identity: bool = False
 ) -> execution_pb2.CandidateTradePlan:
@@ -160,6 +182,10 @@ def _to_proto(
         "LIMIT": execution_pb2.BROKER_ORDER_TYPE_LIMIT,
         "ADAPTIVE_LIMIT": execution_pb2.BROKER_ORDER_TYPE_ADAPTIVE_LIMIT,
     }[plan.order_type]
+    position_effect = {
+        "OPEN": execution_pb2.POSITION_EFFECT_OPEN,
+        "CLOSE": execution_pb2.POSITION_EFFECT_CLOSE,
+    }[plan.position_effect]
     adaptive = None
     if plan.adaptive_limit is not None:
         adaptive = execution_pb2.AdaptiveLimitPolicy(
@@ -232,6 +258,7 @@ def _to_proto(
         ),
         order_type=order_type,
         market_data_provider=plan.market_data_provider,
+        position_effect=position_effect,
         **({"adaptive_limit": adaptive} if adaptive is not None else {}),
     )
 
@@ -263,6 +290,12 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
         raise ValueError("candidate TTL must be between 1 and 120 seconds")
     if inputs.order_type not in {"MARKET", "LIMIT", "ADAPTIVE_LIMIT"}:
         raise ValueError("candidate order type is unmapped")
+    if inputs.position_effect not in {"OPEN", "CLOSE"}:
+        raise ValueError("candidate position effect is unmapped")
+    if inputs.order_type == "MARKET" and (
+        inputs.position_effect != "CLOSE" or len(inputs.quoted_legs) != 1
+    ):
+        raise ValueError("market orders are restricted to single-leg closing candidates")
     if inputs.market_data_provider != "THETADATA":
         raise ValueError("candidate market data provider must be THETADATA")
     for leg in inputs.quoted_legs:
@@ -280,17 +313,29 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
             raise ValueError("broker-native contract id is required")
         if inputs.broker_id == "ibkr" and not leg.broker_contract_id.isdigit():
             raise ValueError("IBKR contract id must be a numeric conId")
-    limit_price, unit_max_loss = _unit_economics(inputs)
-    risk_budget = _decimal(inputs.risk_budget, "risk budget")
     if inputs.max_contracts < 1:
         raise ValueError("max_contracts must be positive")
-    quantity = min(
-        int((risk_budget / unit_max_loss).to_integral_value(rounding=ROUND_FLOOR)),
-        inputs.max_contracts,
-    )
-    if quantity < 1:
-        raise ValueError("risk budget cannot fund one defined-risk unit")
-    max_loss = unit_max_loss * quantity
+    if inputs.position_effect == "OPEN":
+        if inputs.close_quantity is not None:
+            raise ValueError("opening candidate cannot set close_quantity")
+        limit_price, unit_max_loss = _unit_economics(inputs)
+        risk_budget = _decimal(inputs.risk_budget, "risk budget")
+        quantity = min(
+            int((risk_budget / unit_max_loss).to_integral_value(rounding=ROUND_FLOOR)),
+            inputs.max_contracts,
+        )
+        if quantity < 1:
+            raise ValueError("risk budget cannot fund one defined-risk unit")
+        max_loss = unit_max_loss * quantity
+        order_side = "BUY" if inputs.strategy == "LongGamma" else "SELL"
+    else:
+        if _decimal(inputs.risk_budget, "risk budget", allow_zero=True) != 0:
+            raise ValueError("closing candidate risk budget must be zero")
+        if inputs.close_quantity is None or not 1 <= inputs.close_quantity <= inputs.max_contracts:
+            raise ValueError("close_quantity must be within the configured contract bound")
+        limit_price, order_side = _close_economics(inputs)
+        quantity = inputs.close_quantity
+        max_loss = Decimal("0")
     created = occurred.isoformat(timespec="seconds").replace("+00:00", "Z")
     expires = (
         (occurred + timedelta(seconds=inputs.ttl_seconds))
@@ -299,7 +344,7 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
     )
     placeholder_hash = "0" * 64
     plan = CandidateTradePlan(
-        schema_version="1.2",
+        schema_version="1.3",
         plan_id="pending",
         plan_hash=placeholder_hash,
         idempotency_key="pending",
@@ -341,15 +386,23 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
         limit_price=_fixed(limit_price),
         max_slippage=_fixed(_decimal(inputs.max_slippage, "max slippage", allow_zero=True)),
         max_loss=_fixed(max_loss),
-        take_profit=_fixed(max_loss * Decimal("0.40")),
-        stop_loss=_fixed(max_loss * Decimal("0.30")),
-        time_stop_minutes=30,
-        invalidation_rules=["market_or_event_context_changes", "spread_exceeds_limit"],
+        take_profit=(
+            _fixed(max_loss * Decimal("0.40")) if inputs.position_effect == "OPEN" else None
+        ),
+        stop_loss=(
+            _fixed(max_loss * Decimal("0.30")) if inputs.position_effect == "OPEN" else None
+        ),
+        time_stop_minutes=30 if inputs.position_effect == "OPEN" else 0,
+        invalidation_rules=(
+            ["market_or_event_context_changes", "spread_exceeds_limit"]
+            if inputs.position_effect == "OPEN"
+            else ["position_or_market_context_changes"]
+        ),
         expires_at_utc=expires,
         rule_version=inputs.rule_version,
         data_snapshot_ids=list(inputs.data_snapshot_ids),
         manual_confirmation_required=True,
-        order_side="BUY" if inputs.strategy == "LongGamma" else "SELL",
+        order_side=order_side,  # type: ignore[arg-type]
         order_type=inputs.order_type,  # type: ignore[arg-type]
         adaptive_limit=(
             AdaptiveLimitPolicy(
@@ -362,6 +415,7 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
             else None
         ),
         market_data_provider="THETADATA",
+        position_effect=inputs.position_effect,  # type: ignore[arg-type]
     )
     digest = canonical_plan_hash(plan)
     return plan.model_copy(

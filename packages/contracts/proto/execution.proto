@@ -39,6 +39,12 @@ enum BrokerOrderType {
   BROKER_ORDER_TYPE_ADAPTIVE_LIMIT = 3;
 }
 
+enum PositionEffect {
+  POSITION_EFFECT_UNSPECIFIED = 0;
+  POSITION_EFFECT_OPEN = 1;
+  POSITION_EFFECT_CLOSE = 2;
+}
+
 enum OptionRight {
   OPTION_RIGHT_UNSPECIFIED = 0;
   OPTION_RIGHT_CALL = 1;
@@ -92,6 +98,7 @@ enum RiskReasonCode {
   RISK_REASON_CODE_STRATEGY_NOT_ALLOWED = 28;
   RISK_REASON_CODE_ENTRY_WINDOW_CLOSED = 29;
   RISK_REASON_CODE_MARKET_ORDER_BLOCKED = 30;
+  RISK_REASON_CODE_POSITION_NOT_REDUCIBLE = 31;
 }
 
 enum ExecutionOrderState {
@@ -174,6 +181,9 @@ message CandidateTradePlan {
   optional AdaptiveLimitPolicy adaptive_limit = 25;
   // Market, option quote, Greeks and chain truth must be THETADATA.
   string market_data_provider = 26;
+  // CLOSE is accepted only when every leg is proven to reduce the latest
+  // reconciled broker position. It never means reverse-or-open.
+  PositionEffect position_effect = 27;
 }
 
 message EventSourceProof {

@@ -69,6 +69,27 @@ audit_events = Table(
     schema="audit",
 )
 
+outbox_events = Table(
+    "outbox_events",
+    metadata,
+    Column("id", _BIGINT, primary_key=True, autoincrement=True),
+    Column("event_id", Text, nullable=False, unique=True),
+    Column("topic", Text, nullable=False),
+    Column("aggregate_type", Text, nullable=False),
+    Column("aggregate_id", Text, nullable=False),
+    Column("occurred_at_utc", DateTime(timezone=True), nullable=False),
+    Column("payload", _JSON, nullable=False),
+    Column("attempts", Integer, nullable=False),
+    Column("available_at_utc", DateTime(timezone=True), nullable=False),
+    Column("lease_owner", Text),
+    Column("lease_expires_at_utc", DateTime(timezone=True)),
+    Column("published_at_utc", DateTime(timezone=True)),
+    Column("dead_lettered_at_utc", DateTime(timezone=True)),
+    Column("last_error_code", Text),
+    Column("created_at_utc", DateTime(timezone=True), nullable=False),
+    schema="audit",
+)
+
 # events.event_contexts — sourced event records and deterministic daily context.
 event_contexts = Table(
     "event_contexts",
@@ -231,6 +252,7 @@ __all__ = [
     "fills",
     "metadata",
     "order_events",
+    "outbox_events",
     "orders",
     "position_snapshots",
     "risk_decisions",

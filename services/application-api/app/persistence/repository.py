@@ -11,9 +11,11 @@ row already exists (replay re-runs must not duplicate or error).
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -33,6 +35,7 @@ from app.persistence.tables import (
     fills,
     order_events,
     orders,
+    outbox_events,
     position_snapshots,
     risk_decisions,
     signals,
@@ -50,6 +53,264 @@ def _now_utc() -> datetime:
     """created_at_utc stamp. Isolated so callers/tests can reason about it;
     occurred_at_utc (the decision instant) always comes from the caller."""
     return datetime.now(timezone.utc)
+
+
+def _outbox_event_id(source_event_id: str, topic: str) -> str:
+    digest = sha256(
+        json_dumps_stable({"source_event_id": source_event_id, "topic": topic}).encode("utf-8")
+    ).hexdigest()
+    return f"outbox_{digest}"
+
+
+def json_dumps_stable(value: dict[str, Any]) -> str:
+    import json
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _write_outbox(
+    conn: Any,
+    *,
+    source_event_id: str,
+    topic: str,
+    aggregate_type: str,
+    aggregate_id: str,
+    occurred_at_utc: datetime,
+    payload: dict[str, Any],
+    created_at_utc: datetime,
+) -> None:
+    if not source_event_id or not topic or not aggregate_type or not aggregate_id:
+        raise ValueError("outbox event identity is incomplete")
+    row = {
+        "event_id": _outbox_event_id(source_event_id, topic),
+        "topic": topic,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "occurred_at_utc": occurred_at_utc,
+        "payload": payload,
+        "attempts": 0,
+        "available_at_utc": created_at_utc,
+        "lease_owner": None,
+        "lease_expires_at_utc": None,
+        "published_at_utc": None,
+        "dead_lettered_at_utc": None,
+        "last_error_code": None,
+        "created_at_utc": created_at_utc,
+    }
+    if conn.dialect.name == "postgresql":
+        conn.execute(
+            postgresql_insert(outbox_events)
+            .values(**row)
+            .on_conflict_do_nothing(index_elements=[outbox_events.c.event_id])
+        )
+    elif conn.dialect.name == "sqlite":
+        conn.execute(
+            sqlite_insert(outbox_events)
+            .values(**row)
+            .on_conflict_do_nothing(index_elements=[outbox_events.c.event_id])
+        )
+    else:
+        exists = conn.execute(
+            select(outbox_events.c.event_id).where(outbox_events.c.event_id == row["event_id"])
+        ).first()
+        if exists is None:
+            conn.execute(outbox_events.insert().values(**row))
+
+
+@dataclass(frozen=True)
+class OutboxMessage:
+    event_id: str
+    topic: str
+    aggregate_type: str
+    aggregate_id: str
+    occurred_at_utc: datetime
+    payload: dict[str, Any]
+    attempts: int
+
+
+def claim_outbox_batch(
+    engine: Engine,
+    worker_id: str,
+    *,
+    limit: int = 50,
+    lease_seconds: int = 30,
+    now: datetime | None = None,
+) -> list[OutboxMessage]:
+    """Lease unpublished events for at-least-once delivery.
+
+    PostgreSQL workers use ``FOR UPDATE SKIP LOCKED``. The event_id is the
+    downstream idempotency key; consumers must deduplicate it.
+    """
+    if not worker_id or not 1 <= limit <= 500 or not 5 <= lease_seconds <= 300:
+        raise ValueError("outbox claim parameters are invalid")
+    claimed_at = now or _now_utc()
+    if claimed_at.tzinfo is None:
+        raise ValueError("outbox claim time must be timezone-aware")
+    lease_expires = claimed_at + timedelta(seconds=lease_seconds)
+    with engine.begin() as conn:
+        query = (
+            select(outbox_events)
+            .where(
+                outbox_events.c.published_at_utc.is_(None),
+                outbox_events.c.dead_lettered_at_utc.is_(None),
+                outbox_events.c.available_at_utc <= claimed_at,
+                (
+                    outbox_events.c.lease_expires_at_utc.is_(None)
+                    | (outbox_events.c.lease_expires_at_utc <= claimed_at)
+                ),
+            )
+            .order_by(outbox_events.c.available_at_utc, outbox_events.c.id)
+            .limit(limit)
+        )
+        if conn.dialect.name == "postgresql":
+            query = query.with_for_update(skip_locked=True)
+        rows = conn.execute(query).mappings().all()
+        claimed: list[OutboxMessage] = []
+        for row in rows:
+            updated = conn.execute(
+                update(outbox_events)
+                .where(
+                    outbox_events.c.id == row["id"],
+                    outbox_events.c.published_at_utc.is_(None),
+                    outbox_events.c.dead_lettered_at_utc.is_(None),
+                    (
+                        outbox_events.c.lease_expires_at_utc.is_(None)
+                        | (outbox_events.c.lease_expires_at_utc <= claimed_at)
+                    ),
+                )
+                .values(
+                    attempts=outbox_events.c.attempts + 1,
+                    lease_owner=worker_id,
+                    lease_expires_at_utc=lease_expires,
+                    last_error_code=None,
+                )
+            )
+            if updated.rowcount != 1:
+                continue
+            occurred = row["occurred_at_utc"]
+            if occurred.tzinfo is None:
+                occurred = occurred.replace(tzinfo=timezone.utc)
+            claimed.append(
+                OutboxMessage(
+                    event_id=str(row["event_id"]),
+                    topic=str(row["topic"]),
+                    aggregate_type=str(row["aggregate_type"]),
+                    aggregate_id=str(row["aggregate_id"]),
+                    occurred_at_utc=occurred,
+                    payload=dict(row["payload"]),
+                    attempts=int(row["attempts"]) + 1,
+                )
+            )
+    return claimed
+
+
+def mark_outbox_published(
+    engine: Engine,
+    event_id: str,
+    worker_id: str,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    published_at = now or _now_utc()
+    if not event_id or not worker_id or published_at.tzinfo is None:
+        raise ValueError("outbox publish acknowledgement is invalid")
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(outbox_events)
+            .where(
+                outbox_events.c.event_id == event_id,
+                outbox_events.c.lease_owner == worker_id,
+                outbox_events.c.published_at_utc.is_(None),
+                outbox_events.c.dead_lettered_at_utc.is_(None),
+                outbox_events.c.lease_expires_at_utc > published_at,
+            )
+            .values(
+                published_at_utc=published_at,
+                lease_owner=None,
+                lease_expires_at_utc=None,
+                last_error_code=None,
+            )
+        )
+    return result.rowcount == 1
+
+
+def reschedule_outbox_message(
+    engine: Engine,
+    event_id: str,
+    worker_id: str,
+    error_code: str,
+    *,
+    retry_delay_seconds: int = 5,
+    max_attempts: int = 8,
+    now: datetime | None = None,
+) -> bool:
+    failed_at = now or _now_utc()
+    if (
+        not event_id
+        or not worker_id
+        or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", error_code) is None
+        or not 1 <= retry_delay_seconds <= 3600
+        or not 1 <= max_attempts <= 100
+        or failed_at.tzinfo is None
+    ):
+        raise ValueError("outbox retry acknowledgement is invalid")
+    with engine.begin() as conn:
+        row = (
+            conn.execute(
+                select(outbox_events.c.id, outbox_events.c.attempts)
+                .where(
+                    outbox_events.c.event_id == event_id,
+                    outbox_events.c.lease_owner == worker_id,
+                    outbox_events.c.published_at_utc.is_(None),
+                    outbox_events.c.dead_lettered_at_utc.is_(None),
+                    outbox_events.c.lease_expires_at_utc > failed_at,
+                )
+                .with_for_update()
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            return False
+        exhausted = int(row["attempts"]) >= max_attempts
+        conn.execute(
+            update(outbox_events)
+            .where(outbox_events.c.id == row["id"])
+            .values(
+                available_at_utc=failed_at + timedelta(seconds=retry_delay_seconds),
+                lease_owner=None,
+                lease_expires_at_utc=None,
+                dead_lettered_at_utc=failed_at if exhausted else None,
+                last_error_code=error_code,
+            )
+        )
+    return True
+
+
+def rotate_confirmation_capabilities(engine: Engine, cipher: ConfirmationCipher) -> int:
+    """Atomically re-encrypt every durable capability with the primary key."""
+    if cipher.key_count < 2:
+        return 0
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(
+                confirmation_capabilities.c.order_id,
+                confirmation_capabilities.c.token_ciphertext,
+            ).with_for_update()
+        ).mappings()
+        rotated = 0
+        for row in rows:
+            current = str(row["token_ciphertext"])
+            if not cipher.requires_rotation(current):
+                continue
+            ciphertext = cipher.rotate(current)
+            conn.execute(
+                update(confirmation_capabilities)
+                .where(confirmation_capabilities.c.order_id == row["order_id"])
+                .values(token_ciphertext=ciphertext)
+            )
+            rotated += 1
+    return rotated
 
 
 def persist_signal(
@@ -101,6 +362,16 @@ def persist_signal(
         if not inserted:
             return False
         conn.execute(audit_events.insert().values(**audit_row))
+        _write_outbox(
+            conn,
+            source_event_id=str(audit_row["event_id"]),
+            topic="signal.persisted",
+            aggregate_type="Signal",
+            aggregate_id=ctx.signal_id,
+            occurred_at_utc=ctx.occurred_at_utc,
+            payload={"signal_id": ctx.signal_id, "session_id": ctx.session_id},
+            created_at_utc=created,
+        )
     return True
 
 
@@ -166,6 +437,16 @@ def persist_event_context(engine: Engine, session_id: str, context: EventContext
         if not inserted:
             return False
         conn.execute(audit_events.insert().values(**audit))
+        _write_outbox(
+            conn,
+            source_event_id=str(audit["event_id"]),
+            topic="event_context.built",
+            aggregate_type="EventContext",
+            aggregate_id=context.event_context_id,
+            occurred_at_utc=occurred,
+            payload={"event_context_id": context.event_context_id, "available": context.available},
+            created_at_utc=created,
+        )
     return True
 
 
@@ -371,17 +652,24 @@ def persist_broker_reconciliation(engine: Engine, batch: Any) -> list[str]:
                 "side": broker_pb2.OrderSide.Name(fill.side).removeprefix("ORDER_SIDE_"),
                 "snapshot_hash": snapshot_hash,
             }
+            fill_inserted = False
             if conn.dialect.name == "postgresql":
-                conn.execute(
-                    postgresql_insert(fills)
-                    .values(**fill_row)
-                    .on_conflict_do_nothing(index_elements=[fills.c.fill_id])
+                fill_inserted = (
+                    conn.execute(
+                        postgresql_insert(fills)
+                        .values(**fill_row)
+                        .on_conflict_do_nothing(index_elements=[fills.c.fill_id])
+                    ).rowcount
+                    == 1
                 )
             elif conn.dialect.name == "sqlite":
-                conn.execute(
-                    sqlite_insert(fills)
-                    .values(**fill_row)
-                    .on_conflict_do_nothing(index_elements=[fills.c.fill_id])
+                fill_inserted = (
+                    conn.execute(
+                        sqlite_insert(fills)
+                        .values(**fill_row)
+                        .on_conflict_do_nothing(index_elements=[fills.c.fill_id])
+                    ).rowcount
+                    == 1
                 )
             else:
                 if (
@@ -391,9 +679,27 @@ def persist_broker_reconciliation(engine: Engine, batch: Any) -> list[str]:
                     is None
                 ):
                     conn.execute(fills.insert().values(**fill_row))
+                    fill_inserted = True
+            if fill_inserted:
+                _write_outbox(
+                    conn,
+                    source_event_id=str(fill_row["fill_id"]),
+                    topic="broker.fill_recorded",
+                    aggregate_type="ExecutionOrder" if identity else "BrokerOrder",
+                    aggregate_id=identity[0] if identity else fill.broker_order_id,
+                    occurred_at_utc=fill_row["occurred_at_utc"],
+                    payload={
+                        "fill_id": fill_row["fill_id"],
+                        "broker_id": broker,
+                        "broker_order_id": fill.broker_order_id,
+                        "contract_id": fill.contract_id,
+                    },
+                    created_at_utc=created,
+                )
+        audit_event_id = f"broker_reconcile_{broker}_{snapshot_hash[:24]}"
         conn.execute(
             audit_events.insert().values(
-                event_id=f"broker_reconcile_{broker}_{snapshot_hash[:24]}",
+                event_id=audit_event_id,
                 session_id=session_id,
                 occurred_at_utc=occurred,
                 actor="broker-reconciliation-supervisor",
@@ -406,6 +712,21 @@ def persist_broker_reconciliation(engine: Engine, batch: Any) -> list[str]:
                 created_at_utc=created,
             )
         )
+        _write_outbox(
+            conn,
+            source_event_id=audit_event_id,
+            topic="broker.snapshot_reconciled" if not mismatches else "broker.snapshot_diff",
+            aggregate_type="BrokerSnapshot",
+            aggregate_id=f"{broker}:{batch.snapshot_sequence}",
+            occurred_at_utc=occurred,
+            payload={
+                "broker_id": broker,
+                "snapshot_sequence": batch.snapshot_sequence,
+                "snapshot_hash": snapshot_hash,
+                "mismatch_codes": mismatches,
+            },
+            created_at_utc=created,
+        )
     return sorted(mismatch_codes)
 
 
@@ -416,10 +737,11 @@ def persist_broker_reconciliation_failure(
     if broker not in {"ibkr", "longbridge"} or not reason_code.isupper():
         raise ValueError("broker reconciliation failure code is invalid")
     occurred = _now_utc()
+    audit_event_id = f"broker_reconcile_failure_{uuid4().hex}"
     with engine.begin() as conn:
         conn.execute(
             audit_events.insert().values(
-                event_id=f"broker_reconcile_failure_{uuid4().hex}",
+                event_id=audit_event_id,
                 session_id=None,
                 occurred_at_utc=occurred,
                 actor="broker-reconciliation-supervisor",
@@ -431,6 +753,16 @@ def persist_broker_reconciliation_failure(
                 payload={"broker_id": broker, "reason_code": reason_code},
                 created_at_utc=occurred,
             )
+        )
+        _write_outbox(
+            conn,
+            source_event_id=audit_event_id,
+            topic="broker.reconciliation_failed",
+            aggregate_type="ExecutionOrder" if order_id else "BrokerAccount",
+            aggregate_id=order_id or broker,
+            occurred_at_utc=occurred,
+            payload={"broker_id": broker, "reason_code": reason_code},
+            created_at_utc=occurred,
         )
 
 
@@ -519,9 +851,10 @@ def persist_staged_candidate(
                 created_at_utc=created,
             )
         )
+        audit_event_id = f"audit_{decision.decision_id}"
         conn.execute(
             audit_events.insert().values(
-                event_id=f"audit_{decision.decision_id}",
+                event_id=audit_event_id,
                 session_id=plan.session_id,
                 occurred_at_utc=occurred,
                 actor="rust-risk-gateway",
@@ -533,6 +866,30 @@ def persist_staged_candidate(
                 payload={"plan_hash": plan.plan_hash, "decision": decision_payload},
                 created_at_utc=created,
             )
+        )
+        _write_outbox(
+            conn,
+            source_event_id=audit_event_id,
+            topic="candidate.staged",
+            aggregate_type="CandidateTradePlan",
+            aggregate_id=plan.plan_id,
+            occurred_at_utc=occurred,
+            payload={"plan_id": plan.plan_id, "plan_hash": plan.plan_hash, "status": status},
+            created_at_utc=created,
+        )
+        _write_outbox(
+            conn,
+            source_event_id=decision.decision_id,
+            topic="risk.decision_recorded",
+            aggregate_type="CandidateTradePlan",
+            aggregate_id=plan.plan_id,
+            occurred_at_utc=occurred,
+            payload={
+                "decision_id": decision.decision_id,
+                "decision": decision.decision,
+                "reason_codes": decision.reason_codes,
+            },
+            created_at_utc=created,
         )
         if result.order is not None:
             order = result.order
@@ -578,6 +935,20 @@ def persist_staged_candidate(
                     payload=order.model_dump(mode="json"),
                     created_at_utc=created,
                 )
+            )
+            _write_outbox(
+                conn,
+                source_event_id=f"{order.order_id}:state:{order.state_version}",
+                topic="order.staged",
+                aggregate_type="ExecutionOrder",
+                aggregate_id=order.order_id,
+                occurred_at_utc=occurred,
+                payload={
+                    "order_id": order.order_id,
+                    "state": order.state,
+                    "state_version": order.state_version,
+                },
+                created_at_utc=created,
             )
     return True
 
@@ -666,6 +1037,16 @@ def claim_confirmation_intent(
                 created_at_utc=occurred,
             )
         )
+        _write_outbox(
+            conn,
+            source_event_id=event_id,
+            topic="confirmation.requested",
+            aggregate_type="ExecutionOrder",
+            aggregate_id=order_id,
+            occurred_at_utc=occurred,
+            payload={"order_id": order_id, "plan_hash": plan_hash},
+            created_at_utc=occurred,
+        )
     return token
 
 
@@ -727,8 +1108,8 @@ def persist_order_projection(
         if current_order.residual_exposure and not order.residual_exposure:
             resolved_flat = (
                 order.state == "FILLED"
+                and order.broker_order_id is not None
                 and order.filled_quantity == order.total_quantity
-                and bool(order.broker_child_orders)
                 and all(
                     child.state == "FILLED" and child.filled_quantity == child.quantity
                     for child in order.broker_child_orders
@@ -780,12 +1161,15 @@ def persist_order_projection(
                 created_at_utc=created,
             )
         )
+        audit_event_id = (
+            "audit_"
+            + sha256(
+                f"{order.order_id}|{from_status}|{order.state}|{action}|{order.state_version}|{order.updated_at_utc}".encode()
+            ).hexdigest()
+        )
         conn.execute(
             audit_events.insert().values(
-                event_id="audit_"
-                + sha256(
-                    f"{order.order_id}|{from_status}|{order.state}|{action}|{order.state_version}|{order.updated_at_utc}".encode()
-                ).hexdigest(),
+                event_id=audit_event_id,
                 session_id=order.session_id,
                 occurred_at_utc=occurred,
                 actor=actor,
@@ -797,6 +1181,21 @@ def persist_order_projection(
                 payload=payload,
                 created_at_utc=created,
             )
+        )
+        _write_outbox(
+            conn,
+            source_event_id=audit_event_id,
+            topic="order.projected",
+            aggregate_type="ExecutionOrder",
+            aggregate_id=order.order_id,
+            occurred_at_utc=occurred,
+            payload={
+                "order_id": order.order_id,
+                "state": order.state,
+                "state_version": order.state_version,
+                "action": action,
+            },
+            created_at_utc=created,
         )
     return True
 
@@ -903,12 +1302,17 @@ def restorable_execution_workflow(
 
 
 __all__ = [
+    "OutboxMessage",
+    "claim_outbox_batch",
     "claim_confirmation_intent",
+    "mark_outbox_published",
     "persist_event_context",
     "persist_order_projection",
     "persist_signal",
     "persist_staged_candidate",
+    "reschedule_outbox_message",
     "restorable_execution_workflow",
+    "rotate_confirmation_capabilities",
     "latest_order_projection",
     "latest_execution_ticket",
     "staged_plan_projection",

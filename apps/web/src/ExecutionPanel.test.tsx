@@ -30,6 +30,7 @@ describe("ExecutionPanel", () => {
     render(<ExecutionPanel sessionId="live" canTrade />);
 
     const confirm = await screen.findByRole("button", { name: "Confirm" });
+    expect(screen.getByText("LongGamma · OPEN")).toBeInTheDocument();
     expect(confirm).toBeEnabled();
     fireEvent.click(confirm);
     const finalButton = screen.getByRole("button", { name: "Confirm exact hash" });
@@ -54,6 +55,26 @@ describe("ExecutionPanel", () => {
     );
     render(<ExecutionPanel sessionId="live" canTrade={false} />);
     expect(await screen.findByRole("button", { name: "Confirm" })).toBeDisabled();
+  });
+
+  it("does not let the new-position UI gate block a protective close", async () => {
+    const closeTicket = {
+      ...TICKET,
+      plan: {
+        ...TICKET.plan,
+        position_effect: "CLOSE" as const,
+        order_side: "SELL" as const,
+        order_type: "MARKET" as const,
+        max_loss: "0.00",
+        legs: [{ ...TICKET.plan.legs[0], side: "SELL" as const }],
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, status: 200, json: async () => closeTicket }) as Response),
+    );
+    render(<ExecutionPanel sessionId="live" canTrade={false} />);
+    expect(await screen.findByRole("button", { name: "Confirm" })).toBeEnabled();
   });
 
   it("fails closed on malformed or unavailable audit responses", async () => {

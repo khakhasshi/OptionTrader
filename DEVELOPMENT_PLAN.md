@@ -225,6 +225,7 @@ Python 输出的 `CandidateTradePlan` 必须是确定性结构，包含：
 plan_id / signal_id / session_id
 plan_hash / broker_id / idempotency_key
 strategy / direction / legs
+position effect（OPEN / CLOSE）
 quantity / limit policy / max slippage
 max loss / take profit / stop loss / time stop
 invalidation rules / expires_at_utc

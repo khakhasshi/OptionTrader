@@ -54,6 +54,9 @@ class IbkrEndpointConfig:
             raise ValueError("OPTIONTRADER_IBKR_TIMEZONE is invalid") from exc
         if not 1 <= port <= 65_535 or not 1 <= client_id <= 2_147_483_647:
             raise ValueError("IBKR port or client id is outside its valid range")
+        submission_enabled = _boolean("OPTIONTRADER_IBKR_SUBMISSION_ENABLED", False)
+        if submission_enabled and not paper:
+            raise ValueError("Phase 3 IBKR submission is restricted to paper accounts")
         return cls(
             mode=mode,
             host=host,
@@ -61,6 +64,6 @@ class IbkrEndpointConfig:
             client_id=client_id,
             account=account,
             paper=paper,
-            submission_enabled=_boolean("OPTIONTRADER_IBKR_SUBMISSION_ENABLED", False),
+            submission_enabled=submission_enabled,
             timezone=timezone,
         )

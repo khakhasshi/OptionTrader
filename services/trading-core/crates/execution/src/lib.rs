@@ -337,6 +337,20 @@ impl OrderRecord {
         if self.state.is_terminal() {
             return Ok(());
         }
+        if self.broker_order_id.is_none()
+            && matches!(
+                self.state,
+                OrderState::Submitting
+                    | OrderState::Working
+                    | OrderState::PartialFill
+                    | OrderState::CancelPending
+            )
+        {
+            // The request may have crossed the broker boundary before the
+            // response was lost. Treat a fill as possible until account-level
+            // reconciliation proves otherwise.
+            self.residual_exposure = true;
+        }
         self.transition(OrderState::ReconcilePending, "BROKER_DISCONNECTED", at)
     }
 }
@@ -732,6 +746,20 @@ mod tests {
             registry.reserve("key", "b", "order-3"),
             Err(ExecutionError::DuplicateConflict)
         );
+    }
+
+    #[test]
+    fn unknown_submit_outcome_keeps_possible_exposure_visible() {
+        let mut record = record();
+        record.initial_risk(true, now()).unwrap();
+        record
+            .confirm("confirm-unknown".into(), &"a".repeat(64), now())
+            .unwrap();
+        record.begin_submit(now()).unwrap();
+        record.broker_disconnected(now()).unwrap();
+        assert_eq!(record.state, OrderState::ReconcilePending);
+        assert!(record.residual_exposure);
+        assert!(record.broker_order_id.is_none());
     }
 
     #[test]

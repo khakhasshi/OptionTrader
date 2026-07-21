@@ -203,6 +203,57 @@ def test_adaptive_limit_policy_is_hash_bound_and_schema_valid() -> None:
     assert list(_validator().iter_errors(plan.model_dump(mode="json", exclude_none=True))) == []
 
 
+def test_single_leg_market_close_is_zero_risk_hash_bound_and_schema_valid() -> None:
+    leg = replace(_inputs().quoted_legs[0], side="SELL")
+    plan = build_candidate_plan(
+        _inputs(
+            quoted_legs=(leg,),
+            position_effect="CLOSE",
+            close_quantity=1,
+            risk_budget="0",
+            order_type="MARKET",
+        )
+    )
+
+    assert plan.schema_version == "1.3"
+    assert plan.position_effect == "CLOSE"
+    assert plan.order_side == "SELL"
+    assert plan.limit_price == "2.40"
+    assert plan.max_loss == "0.00"
+    assert plan.take_profit is None
+    assert plan.stop_loss is None
+    assert plan.legs[0].quantity == 1
+    assert canonical_plan_hash(plan) == plan.plan_hash
+    assert list(_validator().iter_errors(plan.model_dump(mode="json", exclude_none=True))) == []
+
+
+def test_close_quantity_budget_and_market_shape_fail_closed() -> None:
+    leg = replace(_inputs().quoted_legs[0], side="SELL")
+    with pytest.raises(ValueError, match="risk budget must be zero"):
+        build_candidate_plan(
+            _inputs(
+                quoted_legs=(leg,),
+                position_effect="CLOSE",
+                close_quantity=1,
+                risk_budget="1",
+            )
+        )
+    with pytest.raises(ValueError, match="close_quantity"):
+        build_candidate_plan(_inputs(quoted_legs=(leg,), position_effect="CLOSE", risk_budget="0"))
+    with pytest.raises(ValueError, match="single-leg closing"):
+        build_candidate_plan(_inputs(order_type="MARKET"))
+    with pytest.raises(ValueError, match="single-leg closing"):
+        build_candidate_plan(
+            _inputs(
+                quoted_legs=(leg, replace(leg, contract_id="other", broker_contract_id="789")),
+                position_effect="CLOSE",
+                close_quantity=1,
+                risk_budget="0",
+                order_type="MARKET",
+            )
+        )
+
+
 def test_native_contract_required_and_longbridge_combo_is_buy_first_eligible() -> None:
     leg = _inputs().quoted_legs[0]
     with pytest.raises(ValueError, match="broker-native"):

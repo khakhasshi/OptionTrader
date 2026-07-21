@@ -15,8 +15,8 @@ use optiontrader_proto::broker_v1::{
     broker_adapter_service_client::BrokerAdapterServiceClient, AccountSnapshot, AdaptivePriority,
     BrokerChildOrderSnapshot, BrokerHealth, BrokerId, BrokerOrderSnapshot,
     BrokerOrderStatus as ProtoStatus, BrokerOrderType as ProtoOrderType, BrokerSnapshot,
-    FillSnapshot, GetBrokerSnapshotRequest, OrderSide as ProtoSide, PositionSnapshot,
-    RecoverBrokerOrderRequest, SubmitBrokerOrderRequest,
+    CancelBrokerOrderRequest, FillSnapshot, GetBrokerSnapshotRequest, OrderSide as ProtoSide,
+    PositionSnapshot, RecoverBrokerOrderRequest, SubmitBrokerOrderRequest,
 };
 use prost::Message;
 use rust_decimal::Decimal;
@@ -29,6 +29,14 @@ pub enum BrokerRecoveryError {
     InvalidSnapshot,
     NotReconciled,
     OrderConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerMutationError {
+    Disabled,
+    NotReady,
+    Rejected,
+    OutcomeUnknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,21 +62,29 @@ pub enum BrokerSnapshotAuthority {
     Fixed(Result<RecoveredBrokerOrder, BrokerRecoveryError>),
     #[cfg(test)]
     FullFixed(Result<ValidatedBrokerSnapshot, BrokerRecoveryError>),
+    #[cfg(test)]
+    MutationFixed {
+        bind: Result<(), BrokerRecoveryError>,
+        submit: Result<BrokerOrder, BrokerMutationError>,
+        cancel: Result<BrokerOrder, BrokerMutationError>,
+    },
 }
 
 pub(crate) struct LongbridgeSnapshotState {
     adapter: Option<LongbridgeBroker>,
     sequence: u64,
+    submission_enabled: bool,
 }
 
 impl BrokerSnapshotAuthority {
-    pub fn from_env() -> Self {
+    pub fn from_env(longbridge_submission_enabled: bool) -> Self {
         Self::Remote {
             ibkr_endpoint: std::env::var("OPTIONTRADER_IBKR_SIDECAR_GRPC")
                 .unwrap_or_else(|_| "http://127.0.0.1:50053".into()),
             longbridge: Arc::new(Mutex::new(LongbridgeSnapshotState {
                 adapter: None,
                 sequence: 0,
+                submission_enabled: longbridge_submission_enabled,
             })),
         }
     }
@@ -88,6 +104,8 @@ impl BrokerSnapshotAuthority {
             Self::Fixed(result) => return result.clone(),
             #[cfg(test)]
             Self::FullFixed(_) => return Err(BrokerRecoveryError::Unavailable),
+            #[cfg(test)]
+            Self::MutationFixed { .. } => return Err(BrokerRecoveryError::Unavailable),
         };
         if expected_broker_order_id.is_empty() {
             return Err(BrokerRecoveryError::OrderConflict);
@@ -98,7 +116,8 @@ impl BrokerSnapshotAuthority {
                 let mut state = state.lock().map_err(|_| BrokerRecoveryError::Unavailable)?;
                 if state.adapter.is_none() {
                     state.adapter = Some(
-                        LongbridgeBroker::from_env(false).map_err(map_longbridge_recovery_error)?,
+                        LongbridgeBroker::from_env(state.submission_enabled)
+                            .map_err(map_longbridge_recovery_error)?,
                     );
                 }
                 let request = domain_request(&expected_order)?;
@@ -185,6 +204,8 @@ impl BrokerSnapshotAuthority {
             Self::Fixed(_) => return Err(BrokerRecoveryError::Unavailable),
             #[cfg(test)]
             Self::FullFixed(result) => return result.clone(),
+            #[cfg(test)]
+            Self::MutationFixed { .. } => return Err(BrokerRecoveryError::Unavailable),
         };
         if BrokerId::try_from(broker_id).ok() == Some(BrokerId::Longbridge) {
             let state = Arc::clone(longbridge);
@@ -192,7 +213,8 @@ impl BrokerSnapshotAuthority {
                 let mut state = state.lock().map_err(|_| BrokerRecoveryError::Unavailable)?;
                 if state.adapter.is_none() {
                     state.adapter = Some(
-                        LongbridgeBroker::from_env(false).map_err(map_longbridge_recovery_error)?,
+                        LongbridgeBroker::from_env(state.submission_enabled)
+                            .map_err(map_longbridge_recovery_error)?,
                     );
                 }
                 let next_sequence = state.sequence.saturating_add(1).max(1);
@@ -229,6 +251,210 @@ impl BrokerSnapshotAuthority {
         .into_inner();
         validate_full_snapshot(snapshot, broker_id, now)
     }
+
+    /// Rebuild the mutation adapter's in-memory identity ledger after a
+    /// separately authenticated read-only recovery. This performs broker reads
+    /// only; it cannot submit, replace, or cancel an order.
+    pub async fn bind_recovered_order_for_mutation(
+        &self,
+        expected_order: SubmitBrokerOrderRequest,
+        expected_broker_order_id: String,
+    ) -> Result<(), BrokerRecoveryError> {
+        if expected_broker_order_id.is_empty()
+            || BrokerId::try_from(expected_order.broker_id).ok() != Some(BrokerId::Longbridge)
+        {
+            return Err(BrokerRecoveryError::OrderConflict);
+        }
+        let longbridge = match self {
+            Self::Remote { longbridge, .. } => longbridge,
+            #[cfg(test)]
+            Self::Fixed(_) | Self::FullFixed(_) => return Err(BrokerRecoveryError::Unavailable),
+            #[cfg(test)]
+            Self::MutationFixed { bind, .. } => return bind.clone(),
+        };
+        let state = Arc::clone(longbridge);
+        tokio::task::spawn_blocking(move || {
+            let mut state = state.lock().map_err(|_| BrokerRecoveryError::Unavailable)?;
+            if !state.submission_enabled {
+                return Err(BrokerRecoveryError::NotReconciled);
+            }
+            if state.adapter.is_none() {
+                state.adapter =
+                    Some(LongbridgeBroker::from_env(true).map_err(map_longbridge_recovery_error)?);
+            }
+            let request = domain_request(&expected_order)?;
+            state
+                .adapter
+                .as_mut()
+                .ok_or(BrokerRecoveryError::Unavailable)?
+                .restore_expected_order(request, &expected_broker_order_id)
+                .map_err(map_longbridge_recovery_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| BrokerRecoveryError::Unavailable)?
+    }
+
+    pub async fn submit_order(
+        &self,
+        request: SubmitBrokerOrderRequest,
+    ) -> Result<BrokerOrder, BrokerMutationError> {
+        let (ibkr_endpoint, longbridge) = match self {
+            Self::Remote {
+                ibkr_endpoint,
+                longbridge,
+            } => (ibkr_endpoint, longbridge),
+            #[cfg(test)]
+            Self::Fixed(_) | Self::FullFixed(_) => return Err(BrokerMutationError::Disabled),
+            #[cfg(test)]
+            Self::MutationFixed { submit, .. } => return submit.clone(),
+        };
+        match BrokerId::try_from(request.broker_id).ok() {
+            Some(BrokerId::Longbridge) => {
+                let state = Arc::clone(longbridge);
+                tokio::task::spawn_blocking(move || {
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| BrokerMutationError::OutcomeUnknown)?;
+                    if !state.submission_enabled {
+                        return Err(BrokerMutationError::Disabled);
+                    }
+                    if state.adapter.is_none() {
+                        state.adapter = Some(
+                            LongbridgeBroker::from_env(true)
+                                .map_err(|_| BrokerMutationError::NotReady)?,
+                        );
+                    }
+                    let adapter = state
+                        .adapter
+                        .as_mut()
+                        .ok_or(BrokerMutationError::NotReady)?;
+                    let domain =
+                        domain_request(&request).map_err(|_| BrokerMutationError::Rejected)?;
+                    submit_after_reconciliation(adapter, domain)
+                })
+                .await
+                .map_err(|_| BrokerMutationError::OutcomeUnknown)?
+            }
+            Some(BrokerId::Ibkr) => {
+                let mut client = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    BrokerAdapterServiceClient::connect(ibkr_endpoint.clone()),
+                )
+                .await
+                .map_err(|_| BrokerMutationError::OutcomeUnknown)?
+                .map_err(|_| BrokerMutationError::NotReady)?;
+                let response = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.submit_broker_order(request.clone()),
+                )
+                .await
+                .map_err(|_| BrokerMutationError::OutcomeUnknown)?
+                .map_err(|status| {
+                    if status.code() == tonic::Code::InvalidArgument {
+                        BrokerMutationError::Rejected
+                    } else {
+                        BrokerMutationError::OutcomeUnknown
+                    }
+                })?
+                .into_inner();
+                validate_mutation_order(response, &request)
+            }
+            Some(BrokerId::Unspecified) | None => Err(BrokerMutationError::Rejected),
+        }
+    }
+
+    pub async fn cancel_order(
+        &self,
+        broker_id: i32,
+        broker_order_id: String,
+    ) -> Result<BrokerOrder, BrokerMutationError> {
+        if broker_order_id.is_empty() {
+            return Err(BrokerMutationError::Rejected);
+        }
+        let (ibkr_endpoint, longbridge) = match self {
+            Self::Remote {
+                ibkr_endpoint,
+                longbridge,
+            } => (ibkr_endpoint, longbridge),
+            #[cfg(test)]
+            Self::Fixed(_) | Self::FullFixed(_) => return Err(BrokerMutationError::Disabled),
+            #[cfg(test)]
+            Self::MutationFixed { cancel, .. } => return cancel.clone(),
+        };
+        match BrokerId::try_from(broker_id).ok() {
+            Some(BrokerId::Longbridge) => {
+                let state = Arc::clone(longbridge);
+                tokio::task::spawn_blocking(move || {
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| BrokerMutationError::OutcomeUnknown)?;
+                    if !state.submission_enabled {
+                        return Err(BrokerMutationError::Disabled);
+                    }
+                    if state.adapter.is_none() {
+                        state.adapter = Some(
+                            LongbridgeBroker::from_env(true)
+                                .map_err(|_| BrokerMutationError::NotReady)?,
+                        );
+                    }
+                    let adapter = state
+                        .adapter
+                        .as_mut()
+                        .ok_or(BrokerMutationError::NotReady)?;
+                    let mut order = adapter
+                        .cancel(&broker_order_id)
+                        .map_err(map_longbridge_mutation_error)?;
+                    if order.status == BrokerOrderStatus::Working {
+                        order.status = BrokerOrderStatus::ReconcilePending;
+                        order.residual_exposure = true;
+                    }
+                    Ok(order)
+                })
+                .await
+                .map_err(|_| BrokerMutationError::OutcomeUnknown)?
+            }
+            Some(BrokerId::Ibkr) => {
+                let mut client = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    BrokerAdapterServiceClient::connect(ibkr_endpoint.clone()),
+                )
+                .await
+                .map_err(|_| BrokerMutationError::OutcomeUnknown)?
+                .map_err(|_| BrokerMutationError::NotReady)?;
+                let response = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.cancel_broker_order(CancelBrokerOrderRequest {
+                        broker_id,
+                        broker_order_id,
+                    }),
+                )
+                .await
+                .map_err(|_| BrokerMutationError::OutcomeUnknown)?
+                .map_err(|_| BrokerMutationError::OutcomeUnknown)?
+                .into_inner();
+                let mut order =
+                    domain_order(response).map_err(|_| BrokerMutationError::OutcomeUnknown)?;
+                if order.status == BrokerOrderStatus::Working {
+                    order.status = BrokerOrderStatus::ReconcilePending;
+                    order.residual_exposure = true;
+                }
+                Ok(order)
+            }
+            Some(BrokerId::Unspecified) | None => Err(BrokerMutationError::Rejected),
+        }
+    }
+}
+
+fn validate_mutation_order(
+    raw: BrokerOrderSnapshot,
+    expected: &SubmitBrokerOrderRequest,
+) -> Result<BrokerOrder, BrokerMutationError> {
+    let broker_order_id = raw.broker_order_id.clone();
+    if broker_order_id.is_empty() || !order_matches_expected(&raw, expected, &broker_order_id) {
+        return Err(BrokerMutationError::OutcomeUnknown);
+    }
+    domain_order(raw).map_err(|_| BrokerMutationError::OutcomeUnknown)
 }
 
 fn map_longbridge_recovery_error(error: BrokerError) -> BrokerRecoveryError {
@@ -250,6 +476,36 @@ fn map_longbridge_recovery_error(error: BrokerError) -> BrokerRecoveryError {
         | BrokerError::TerminalOrder
         | BrokerError::LiveSubmissionDisabled => BrokerRecoveryError::NotReconciled,
     }
+}
+
+fn map_longbridge_mutation_error(error: BrokerError) -> BrokerMutationError {
+    match error {
+        BrokerError::InvalidQuantity
+        | BrokerError::InvalidOrderType
+        | BrokerError::InvalidPrice
+        | BrokerError::QuoteUnavailable
+        | BrokerError::QuoteStale
+        | BrokerError::QuoteCrossed
+        | BrokerError::SpreadTooWide
+        | BrokerError::UnsupportedOrderShape
+        | BrokerError::DuplicateConflict
+        | BrokerError::LiveSubmissionDisabled => BrokerMutationError::Rejected,
+        BrokerError::NotReconciled => BrokerMutationError::NotReady,
+        BrokerError::Disconnected
+        | BrokerError::OrderNotFound
+        | BrokerError::TerminalOrder
+        | BrokerError::InvalidConfiguration => BrokerMutationError::OutcomeUnknown,
+    }
+}
+
+fn submit_after_reconciliation(
+    adapter: &mut dyn BrokerAdapter,
+    request: BrokerOrderRequest,
+) -> Result<BrokerOrder, BrokerMutationError> {
+    adapter.reconcile().map_err(map_longbridge_mutation_error)?;
+    adapter
+        .submit(request)
+        .map_err(map_longbridge_mutation_error)
 }
 
 fn domain_request(
@@ -759,6 +1015,7 @@ pub fn expected_request(broker_id: i32, request: BrokerOrderRequest) -> SubmitBr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use broker::PaperBroker;
     use optiontrader_proto::broker_v1::{
         AccountSnapshot, BrokerOrderLeg as ProtoLeg, BrokerOrderStatus as ProtoStatus,
     };
@@ -841,6 +1098,74 @@ mod tests {
         .unwrap();
         assert_eq!(result.buying_power, Decimal::new(10_000, 0));
         assert_eq!(result.order.status, BrokerOrderStatus::Working);
+    }
+
+    #[test]
+    fn mutation_response_is_bound_to_exact_request_shape() {
+        let expected = expected();
+        let accepted = validate_mutation_order(order(), &expected).unwrap();
+        assert_eq!(accepted.broker_order_id, "900");
+
+        let mut drifted = order();
+        drifted.submitted_price = "1.26".into();
+        assert_eq!(
+            validate_mutation_order(drifted, &expected),
+            Err(BrokerMutationError::OutcomeUnknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_longbridge_authority_cannot_mutate() {
+        let authority = BrokerSnapshotAuthority::from_env(false);
+        let mut request = expected();
+        request.broker_id = BrokerId::Longbridge as i32;
+        assert_eq!(
+            authority
+                .bind_recovered_order_for_mutation(request.clone(), "native-order".into())
+                .await,
+            Err(BrokerRecoveryError::NotReconciled)
+        );
+        assert_eq!(
+            authority.submit_order(request).await,
+            Err(BrokerMutationError::Disabled)
+        );
+        assert_eq!(
+            authority
+                .cancel_order(BrokerId::Longbridge as i32, "native-order".into())
+                .await,
+            Err(BrokerMutationError::Disabled)
+        );
+    }
+
+    #[test]
+    fn mutation_adapter_must_reconcile_before_first_submit() {
+        let mut raw = expected();
+        raw.broker_id = BrokerId::Longbridge as i32;
+        raw.legs[0].broker_contract_id = "QQQ260721C00500000.US".into();
+        let request = domain_request(&raw).unwrap();
+        let mut adapter = PaperBroker::new(broker::BrokerId::Longbridge);
+        adapter.set_connection(DomainHealth::Reconciling, false);
+
+        let submitted = submit_after_reconciliation(&mut adapter, request).unwrap();
+        assert_eq!(submitted.status, BrokerOrderStatus::Working);
+        assert_eq!(adapter.account().health, DomainHealth::Healthy);
+        assert!(adapter.account().reconciled);
+    }
+
+    #[test]
+    fn failed_mutation_reconciliation_never_reaches_submit() {
+        let mut raw = expected();
+        raw.broker_id = BrokerId::Longbridge as i32;
+        raw.legs[0].broker_contract_id = "QQQ260721C00500000.US".into();
+        let request = domain_request(&raw).unwrap();
+        let mut adapter = PaperBroker::new(broker::BrokerId::Longbridge);
+        adapter.set_connection(DomainHealth::Disconnected, false);
+
+        assert_eq!(
+            submit_after_reconciliation(&mut adapter, request),
+            Err(BrokerMutationError::OutcomeUnknown)
+        );
+        assert!(adapter.orders().is_empty());
     }
 
     #[test]
@@ -930,7 +1255,7 @@ mod tests {
             Ok("true"),
             "explicit demo smoke opt-in is required"
         );
-        let authority = BrokerSnapshotAuthority::from_env();
+        let authority = BrokerSnapshotAuthority::from_env(false);
         let validated = authority
             .fetch_snapshot(BrokerId::Longbridge as i32, Utc::now())
             .await

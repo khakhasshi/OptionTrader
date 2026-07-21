@@ -20,7 +20,7 @@ Longbridge内容    (Regime/Vol/Strategy/Event/         │
                    (执行事实源 = 当前 broker_id)
 ```
 
-数据流：Rust Market Core 从 ThetaData 建立不可变快照（含递增 sequence_number）与 DataHealth，聚合快照入 PostgreSQL、原始高频行情入 Parquet。Python 消费快照生成 Regime/Vol/Signal/CandidateTradePlan，经 Rust 两阶段风控，人工确认后向唯一 Broker 提交市价、限价或受保护的自适应限价单；市价新开仓默认闭锁，全过程状态转换写入 PostgreSQL。
+数据流：Rust Market Core 从 ThetaData 建立不可变快照（含递增 sequence_number）与 DataHealth，聚合快照入 PostgreSQL、原始高频行情入 Parquet。Python 消费快照生成 Regime/Vol/Signal/CandidateTradePlan，经 Rust 两阶段风控，人工确认后向唯一 Broker 提交限价、自适应限价，或仅用于单腿保护性 CLOSE 的市价单；市价新开仓与多腿市价固定闭锁，全过程状态转换和 deterministic outbox 写入 PostgreSQL。
 
 ## 2. 目录结构
 
@@ -114,4 +114,4 @@ gRPC（Python↔Rust）：已实现 StreamMarketSnapshots、GetDataHealth、Eval
 
 ## 11. 当前进度
 
-Phase 0、1 已完成，Phase 2 代码签收且完整 RTH 现场 soak 待执行。Phase 3 已进入开发：Candidate 1.2 已强制 ThetaData 行情来源，两阶段 Rust 风控、可信期权快照、Rust package/每腿定价、Longbridge BUY-first 受控拆腿、IBKR BAG、paper/shadow 状态机、PostgreSQL 审计、UI 人工确认，以及 IBKR 全账户哈希绑定事实账本/持续对账 supervisor 已完成首批；Longbridge 自动恢复、outbox、密钥轮换、保护性退出与 paper 现场认证仍在进行。详见 `TASKS.md`。
+Phase 0、1 已完成，Phase 2 代码签收且完整 RTH 现场 soak 待执行。Phase 3 代码闭环已完成：Candidate 1.3 强制 ThetaData 行情证明并区分 OPEN/CLOSE；两阶段 Rust 风控、可信期权快照、Rust package/每腿定价、Longbridge BUY-first 受控拆腿、IBKR BAG、simulated/external paper 路由、PostgreSQL 事务审计/outbox、Fernet key ring 原子轮换、Broker 全账户事实账本、重启恢复、保护性减仓和 UI 人工确认均已接线并通过离线/集成门禁。Phase 3 的代码完成不等于 paper/live 放行：完整 RTH option soak、两家真实 paper 账户的提交/部分成交/撤单/断线/重启故障演练及 Q3 参数书面批准仍归现场 Gate，live 继续无可达路由。详见 `TASKS.md`。

@@ -53,7 +53,7 @@
     }
   },
   "properties": {
-    "schema_version": { "type": "string", "const": "1.2" },
+    "schema_version": { "type": "string", "const": "1.3" },
     "plan_id": { "type": "string" },
     "plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "idempotency_key": { "type": "string" },
@@ -79,18 +79,34 @@
     ,"order_type": { "type": "string", "enum": ["MARKET", "LIMIT", "ADAPTIVE_LIMIT"] }
     ,"adaptive_limit": { "$ref": "#/$defs/adaptiveLimit" }
     ,"market_data_provider": { "type": "string", "const": "THETADATA" }
+    ,"position_effect": { "type": "string", "enum": ["OPEN", "CLOSE"] }
   },
   "required": [
     "schema_version", "plan_id", "plan_hash", "idempotency_key", "session_id",
     "signal_id", "broker_id", "strategy", "execution_mode", "created_at_utc", "legs",
     "limit_price", "max_loss", "expires_at_utc", "rule_version", "data_snapshot_ids",
-    "manual_confirmation_required", "order_side", "order_type", "market_data_provider"
+    "manual_confirmation_required", "order_side", "order_type", "market_data_provider",
+    "position_effect"
   ],
   "allOf": [
     {
       "if": { "properties": { "order_type": { "const": "ADAPTIVE_LIMIT" } }, "required": ["order_type"] },
       "then": { "required": ["adaptive_limit"] },
       "else": { "not": { "required": ["adaptive_limit"] } }
+    },
+    {
+      "if": { "properties": { "position_effect": { "const": "OPEN" } }, "required": ["position_effect"] },
+      "then": { "properties": { "max_loss": { "pattern": "^(?!0+(\\.0+)?$)[0-9]+(\\.[0-9]+)?$" } } },
+      "else": { "properties": { "max_loss": { "pattern": "^0+(\\.0+)?$" } } }
+    },
+    {
+      "if": { "properties": { "order_type": { "const": "MARKET" } }, "required": ["order_type"] },
+      "then": {
+        "properties": {
+          "position_effect": { "const": "CLOSE" },
+          "legs": { "maxItems": 1 }
+        }
+      }
     }
   ],
   "additionalProperties": false

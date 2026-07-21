@@ -137,7 +137,8 @@ async fn main() {
     let (_, broker_health, broker_reconciled) = scenario();
     let broker_authority = BrokerAuthority::from_env(broker_health, broker_reconciled)
         .expect("valid OPTIONTRADER risk authority configuration");
-    let risk_service = RiskExecutionServiceImpl::new(market_authority, broker_authority);
+    let risk_service = RiskExecutionServiceImpl::new(market_authority, broker_authority)
+        .expect("valid Phase 3 broker execution configuration");
     let broker_handle = risk_service.broker_handle();
 
     let http_app = Router::new()

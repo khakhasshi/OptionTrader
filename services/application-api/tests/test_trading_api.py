@@ -225,6 +225,25 @@ def test_existing_durable_order_with_lost_gateway_state_requires_reconciliation(
     assert response.json()["detail"] == "execution_reconciliation_required"
 
 
+def test_reconciliation_broker_config_rejects_multiple_authorities() -> None:
+    assert main._reconciliation_brokers("ibkr") == ("ibkr",)
+    assert main._reconciliation_brokers(" longbridge ") == ("longbridge",)
+    with pytest.raises(ValueError, match="exactly one"):
+        main._reconciliation_brokers("ibkr,longbridge")
+    with pytest.raises(ValueError, match="exactly one"):
+        main._reconciliation_brokers("")
+
+
+def test_real_paper_execution_and_reconciliation_route_must_match() -> None:
+    main._validate_execution_reconciliation_route("simulated-paper", False, ())
+    main._validate_execution_reconciliation_route("ibkr-paper", True, ("ibkr",))
+    main._validate_execution_reconciliation_route("longbridge-paper", True, ("longbridge",))
+    with pytest.raises(ValueError, match="enabled reconciliation"):
+        main._validate_execution_reconciliation_route("ibkr-paper", False, ())
+    with pytest.raises(ValueError, match="same broker"):
+        main._validate_execution_reconciliation_route("ibkr-paper", True, ("longbridge",))
+
+
 def test_latest_order_never_serves_durable_projection_after_gateway_restart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -273,6 +292,7 @@ def test_startup_restore_persists_successful_broker_auto_reconciliation(
     actions: list[str] = []
     monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
     monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: object())
+    monkeypatch.setattr(main, "rotate_confirmation_capabilities", lambda *_args: 0)
     monkeypatch.setattr(
         main, "restorable_execution_workflow", lambda *_args: [(_plan(), working, "")]
     )
@@ -311,6 +331,7 @@ def test_startup_restore_keeps_unavailable_broker_order_unresolved(
 
     monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
     monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: object())
+    monkeypatch.setattr(main, "rotate_confirmation_capabilities", lambda *_args: 0)
     monkeypatch.setattr(
         main, "restorable_execution_workflow", lambda *_args: [(_plan(), working, "")]
     )
@@ -380,6 +401,7 @@ def test_startup_restore_counts_broker_pending_response_as_unresolved(
     actions: list[str] = []
     monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
     monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: object())
+    monkeypatch.setattr(main, "rotate_confirmation_capabilities", lambda *_args: 0)
     monkeypatch.setattr(
         main, "restorable_execution_workflow", lambda *_args: [(_plan(), working, "")]
     )

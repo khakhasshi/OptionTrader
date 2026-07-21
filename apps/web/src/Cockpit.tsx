@@ -16,7 +16,7 @@ import { useCockpitStream } from "./useCockpitStream";
 import { ExecutionPanel } from "./ExecutionPanel";
 
 /**
- * Phase 2 real-time Cockpit. Two independent channels feed the fail-closed
+ * Real-time Cockpit. Two independent channels feed the fail-closed
  * trading gate:
  *   - WebSocket cockpit stream (data/decision dimension): the Rust-authoritative
  *     snapshot plus Python-derived Regime/Vol/Strategy/Signal, per MarketTick.
@@ -83,7 +83,7 @@ export function Cockpit() {
   return (
     <main style={{ fontFamily: "system-ui", padding: 24 }}>
       <h1>OptionTrader Cockpit</h1>
-      <p style={{ color: "#5d6677" }}>Phase 2 — QQQ intraday volatility, real-time</p>
+      <p style={{ color: "#5d6677" }}>QQQ intraday volatility · real-time cockpit</p>
 
       <section style={{ display: "flex", gap: 16, marginTop: 16, flexWrap: "wrap" }}>
         <Badge label="Connection" value={online ? "ONLINE" : "OFFLINE (read-only)"} ok={Boolean(online)} />

@@ -14,7 +14,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
-from threading import Event, current_thread
+from threading import Barrier, Event, current_thread
 from typing import Any, cast
 from uuid import uuid4
 
@@ -30,6 +30,7 @@ from app.persistence import (
     audit_events,
     broker_snapshots,
     candidate_trade_plans,
+    claim_outbox_batch,
     claim_confirmation_intent,
     confirmation_capabilities,
     build_signal_contract,
@@ -37,8 +38,10 @@ from app.persistence import (
     event_contexts,
     fills,
     metadata,
+    mark_outbox_published,
     order_events,
     orders,
+    outbox_events,
     position_snapshots,
     persist_broker_reconciliation,
     persist_order_projection,
@@ -46,7 +49,9 @@ from app.persistence import (
     persist_event_context,
     persist_staged_candidate,
     restorable_execution_workflow,
+    reschedule_outbox_message,
     risk_decisions,
+    rotate_confirmation_capabilities,
     signals,
 )
 from app.grpc_gen import broker_pb2, execution_pb2
@@ -367,6 +372,7 @@ def test_execution_persistence_is_atomic_idempotent_and_encrypts_token(
         capability_row = conn.execute(select(confirmation_capabilities)).mappings().one()
         event_row = conn.execute(select(order_events)).mappings().one()
         audit_rows = conn.execute(select(audit_events)).mappings().all()
+        outbox_topics = set(conn.execute(select(outbox_events.c.topic)).scalars())
     serialized = json.dumps(
         [
             plan_row["payload"],
@@ -380,6 +386,117 @@ def test_execution_persistence_is_atomic_idempotent_and_encrypts_token(
     assert confirmation_cipher.decrypt(capability_row["token_ciphertext"]) == "never-persist-this"
     assert order_row["status"] == "AWAITING_CONFIRMATION"
     assert order_row["state_version"] == 1
+    assert outbox_topics == {"candidate.staged", "risk.decision_recorded", "order.staged"}
+
+
+def test_outbox_is_transactional_leased_and_at_least_once(engine: Engine) -> None:
+    assert persist_signal(engine, _ctx(), _regime(), _vol(), _decision())
+
+    claimed_at = datetime.now(UTC) + timedelta(seconds=1)
+    first = claim_outbox_batch(engine, "worker-a", limit=1, lease_seconds=30, now=claimed_at)
+    assert [message.topic for message in first] == ["signal.persisted"]
+    assert first[0].attempts == 1
+    assert claim_outbox_batch(engine, "worker-b", now=claimed_at) == []
+    assert not mark_outbox_published(
+        engine, first[0].event_id, "worker-b", now=claimed_at + timedelta(seconds=1)
+    )
+    assert reschedule_outbox_message(
+        engine,
+        first[0].event_id,
+        "worker-a",
+        "DOWNSTREAM_UNAVAILABLE",
+        retry_delay_seconds=5,
+        now=claimed_at + timedelta(seconds=1),
+    )
+    assert claim_outbox_batch(engine, "worker-b", now=claimed_at + timedelta(seconds=5)) == []
+    second = claim_outbox_batch(engine, "worker-b", now=claimed_at + timedelta(seconds=6))
+    assert [message.event_id for message in second] == [first[0].event_id]
+    assert second[0].attempts == 2
+    assert mark_outbox_published(
+        engine, second[0].event_id, "worker-b", now=claimed_at + timedelta(seconds=7)
+    )
+    assert claim_outbox_batch(engine, "worker-c", now=claimed_at + timedelta(minutes=1)) == []
+
+
+def test_outbox_dead_letters_after_bounded_attempts(engine: Engine) -> None:
+    assert persist_signal(engine, _ctx(), _regime(), _vol(), _decision())
+    now = datetime.now(UTC) + timedelta(seconds=1)
+    message = claim_outbox_batch(engine, "worker", limit=1, now=now)[0]
+    assert reschedule_outbox_message(
+        engine,
+        message.event_id,
+        "worker",
+        "PERMANENT_FAILURE",
+        max_attempts=1,
+        now=now + timedelta(seconds=1),
+    )
+    with engine.connect() as conn:
+        row = (
+            conn.execute(select(outbox_events).where(outbox_events.c.event_id == message.event_id))
+            .mappings()
+            .one()
+        )
+    assert row["dead_lettered_at_utc"] is not None
+    assert row["last_error_code"] == "PERMANENT_FAILURE"
+    assert claim_outbox_batch(engine, "other", now=now + timedelta(minutes=1)) == []
+
+
+def test_repeated_reconciliation_failures_have_distinct_outbox_identity(engine: Engine) -> None:
+    repository.persist_broker_reconciliation_failure(engine, "ibkr", "BROKER_RPC_FAILURE")
+    repository.persist_broker_reconciliation_failure(engine, "ibkr", "BROKER_RPC_FAILURE")
+    with engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(outbox_events).where(outbox_events.c.topic == "broker.reconciliation_failed")
+            )
+            .mappings()
+            .all()
+        )
+    assert len(rows) == 2
+    assert len({row["event_id"] for row in rows}) == 2
+
+
+def test_confirmation_capabilities_rotate_atomically_to_primary_key(engine: Engine) -> None:
+    old_key = Fernet.generate_key().decode("ascii")
+    new_key = Fernet.generate_key().decode("ascii")
+    old_cipher = ConfirmationCipher(old_key)
+    primary_cipher = ConfirmationCipher(new_key)
+    ring = ConfirmationCipher(f"{new_key},{old_key}")
+    plan, result = _staged_models()
+    assert persist_staged_candidate(engine, plan, result, old_cipher)
+
+    assert rotate_confirmation_capabilities(engine, ring) == 1
+    with engine.connect() as conn:
+        ciphertext = conn.execute(select(confirmation_capabilities.c.token_ciphertext)).scalar_one()
+    assert primary_cipher.decrypt(ciphertext) == "never-persist-this"
+    with pytest.raises(ValueError, match="cannot be decrypted"):
+        old_cipher.decrypt(ciphertext)
+    assert rotate_confirmation_capabilities(engine, ring) == 0
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(confirmation_capabilities.c.token_ciphertext)).scalar_one()
+            == ciphertext
+        )
+
+
+def test_confirmation_rotation_rejects_corrupt_ciphertext_without_partial_success(
+    engine: Engine,
+) -> None:
+    old_key = Fernet.generate_key().decode("ascii")
+    new_key = Fernet.generate_key().decode("ascii")
+    plan, result = _staged_models()
+    assert persist_staged_candidate(engine, plan, result, ConfirmationCipher(old_key))
+    with engine.begin() as conn:
+        conn.execute(
+            update(confirmation_capabilities).values(token_ciphertext="corrupt-ciphertext")
+        )
+    with pytest.raises(ValueError, match="cannot be rotated"):
+        rotate_confirmation_capabilities(engine, ConfirmationCipher(f"{new_key},{old_key}"))
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(confirmation_capabilities.c.token_ciphertext)).scalar_one()
+            == "corrupt-ciphertext"
+        )
 
 
 def _broker_batch(snapshot: Any) -> Any:
@@ -689,6 +806,39 @@ def test_order_projection_cannot_clear_unreconciled_residual_exposure(
         persist_order_projection(engine, falsely_cleared, action="FALSE_CLEAR", actor="gateway")
 
 
+def test_parent_fill_proof_clears_single_or_native_combo_residual(
+    engine: Engine, confirmation_cipher: ConfirmationCipher
+) -> None:
+    plan, result = _staged_models()
+    persist_staged_candidate(engine, plan, result, confirmation_cipher)
+    assert result.order is not None
+    uncertain = result.order.model_copy(
+        update={
+            "state": "RECONCILE_PENDING",
+            "state_version": 4,
+            "broker_order_id": "native-order-1",
+            "residual_exposure": True,
+            "updated_at_utc": "2026-07-20T14:30:04Z",
+        }
+    )
+    assert persist_order_projection(engine, uncertain, action="BROKER_UNKNOWN", actor="gateway")
+    filled = uncertain.model_copy(
+        update={
+            "state": "FILLED",
+            "state_version": 5,
+            "filled_quantity": uncertain.total_quantity,
+            "residual_exposure": False,
+            "updated_at_utc": "2026-07-20T14:30:05Z",
+        }
+    )
+
+    assert persist_order_projection(engine, filled, action="BROKER_FILLED", actor="gateway")
+    with engine.connect() as conn:
+        persisted = conn.execute(select(orders.c.payload)).scalar_one()
+    assert persisted["state"] == "FILLED"
+    assert persisted["residual_exposure"] is False
+
+
 def test_persist_writes_signal_and_audit(engine: Engine) -> None:
     wrote = persist_signal(engine, _ctx(), _regime(), _vol(), _decision())
     assert wrote is True
@@ -783,8 +933,19 @@ def test_postgresql_migration_and_concurrent_idempotency() -> None:
                 ).scalar_one()
                 == 1
             )
+            assert (
+                conn.execute(
+                    text("SELECT count(*) FROM audit.outbox_events WHERE aggregate_id=:id"),
+                    {"id": signal_id},
+                ).scalar_one()
+                == 1
+            )
     finally:
         with pg_engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM audit.outbox_events WHERE aggregate_id=:id"),
+                {"id": signal_id},
+            )
             conn.execute(
                 text("DELETE FROM audit.audit_events WHERE entity_id=:id"), {"id": signal_id}
             )
@@ -793,6 +954,78 @@ def test_postgresql_migration_and_concurrent_idempotency() -> None:
                 text("DELETE FROM trading.trading_sessions WHERE session_id=:id"),
                 {"id": session_id},
             )
+
+
+@pytest.mark.skipif(not os.getenv("DATABASE_URL"), reason="DATABASE_URL is required")
+def test_postgresql_outbox_skip_locked_never_leases_same_event_twice() -> None:
+    raw_url = os.environ["DATABASE_URL"]
+    pg_engine = create_engine(
+        raw_url.replace("postgresql://", "postgresql+psycopg://", 1), pool_size=3
+    )
+    suffix = uuid4().hex
+    session_id = f"outbox-{suffix}"
+    signal_id = f"sig-{suffix}"
+    barrier = Barrier(2)
+    try:
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO trading.trading_sessions "
+                    "(session_id, trading_date, status) VALUES (:id, CURRENT_DATE, 'REPLAY')"
+                ),
+                {"id": session_id},
+            )
+        assert persist_signal(
+            pg_engine,
+            SignalContext(signal_id, session_id, datetime.now(UTC), "rules-p3-test"),
+            _regime(),
+            _vol(),
+            _decision(),
+        )
+        with pg_engine.begin() as conn:
+            target_event_id = str(
+                conn.execute(
+                    select(outbox_events.c.event_id).where(
+                        outbox_events.c.aggregate_id == signal_id
+                    )
+                ).scalar_one()
+            )
+            conn.execute(
+                update(outbox_events)
+                .where(outbox_events.c.event_id == target_event_id)
+                .values(available_at_utc=datetime(2000, 1, 1, tzinfo=UTC))
+            )
+
+        def claim(worker: str) -> list[str]:
+            barrier.wait(timeout=2)
+            return [message.event_id for message in claim_outbox_batch(pg_engine, worker, limit=1)]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, ("worker-a", "worker-b")))
+        claimed_ids = [event_id for result in results for event_id in result]
+        assert claimed_ids.count(target_event_id) == 1
+        with pg_engine.connect() as conn:
+            lease_owner = conn.execute(
+                select(outbox_events.c.lease_owner).where(
+                    outbox_events.c.event_id == target_event_id
+                )
+            ).scalar_one()
+        assert lease_owner in {"worker-a", "worker-b"}
+    finally:
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM audit.outbox_events WHERE aggregate_id=:id"),
+                {"id": signal_id},
+            )
+            conn.execute(
+                text("DELETE FROM audit.audit_events WHERE entity_id=:id"), {"id": signal_id}
+            )
+            conn.execute(text("DELETE FROM trading.signals WHERE signal_id=:id"), {"id": signal_id})
+            conn.execute(
+                text("DELETE FROM trading.trading_sessions WHERE session_id=:id"),
+                {"id": session_id},
+            )
+        pg_engine.dispose()
 
 
 @pytest.mark.skipif(not os.getenv("DATABASE_URL"), reason="DATABASE_URL is required")
@@ -890,6 +1123,7 @@ def test_postgresql_order_projection_cannot_regress_during_concurrent_write() ->
                 "state_version": 5,
                 "filled_quantity": 1,
                 "broker_order_id": "paper-authoritative",
+                "residual_exposure": True,
                 "updated_at_utc": (now + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
             }
         )
@@ -958,6 +1192,12 @@ def test_postgresql_order_projection_cannot_regress_during_concurrent_write() ->
         assert row["payload"]["state"] == "PARTIAL_FILL"
     finally:
         with pg_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "DELETE FROM audit.outbox_events WHERE aggregate_id IN (:plan_id, :signal_id)"
+                ),
+                {"plan_id": plan.plan_id, "signal_id": plan.signal_id},
+            )
             conn.execute(
                 text("DELETE FROM audit.audit_events WHERE session_id=:session_id"),
                 {"session_id": plan.session_id},

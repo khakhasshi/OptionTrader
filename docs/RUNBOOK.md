@@ -68,18 +68,23 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
 2. `DATABASE_URL` 不可用时，Application API 必须在调用 Rust 前返回
    `execution_audit_unavailable`。不得临时绕过审计继续提交。
 3. Stage 返回的确认令牌不出现在 REST、浏览器或日志；Application API 使用
-   `OPTIONTRADER_CONFIRMATION_FERNET_KEY` 加密后写入 PostgreSQL capability store。
-   密钥缺失或无效时必须在调用 Rust 前返回 `confirmation_store_unavailable`。确认页面
-   必须展示 plan hash、全部腿、最大损失、Broker、模式和到期时间，并由操作者勾选。
+   `OPTIONTRADER_CONFIRMATION_FERNET_KEY` 的逗号分隔 key ring 加密后写入 PostgreSQL
+   capability store。首 key 用于新密文，旧 key 仅用于解密；启动会在同一事务原子轮换所有
+   legacy-key capability，已使用首 key 的记录不重写，任一密文损坏则整体回滚并拒绝启动。密钥缺失或无效时必须在调用
+   Rust 前返回 `confirmation_store_unavailable`。确认页面必须展示 plan hash、全部腿、
+   最大损失、Broker、模式和到期时间，并由操作者勾选。
 4. 确认后 Rust 重新执行 Final Risk Check。市场、事件、账户、限额、规则版本、快照或
    TTL 任一变化都可否决，不得通过再次点击或修改前端状态覆盖。
-   Candidate 1.2 的计划级和每腿 provider 必须均为 `THETADATA`；Broker quote 不得进入
+   Candidate 1.3 的计划级和每腿 provider 必须均为 `THETADATA`；Broker quote 不得进入
    计划或自适应定价。Python 必须先通过 `GetOptionSnapshots` 获取批次 hash，Rust 在 Stage
    与 Confirm 都向同一 Theta SDK bridge 验证 exact-contract quote/size/Greeks。
    Standard 订阅只提供 first-order Greeks：Gamma 由 ThetaData 的 Delta、IV、underlying price
    和到期时间确定性推导；option/underlying 时间差超过 5 秒即拒绝，不能用 Broker Gamma 回填。
-5. 当前 PAPER/MANUAL_CONFIRM 只进入内存 PaperBroker；真实 Longbridge/IBKR adapter
-   未启用，`LIVE_TRADING_ENABLED=false` 必须保持不变。Broker sidecar 仅绑定本机。
+5. 默认 `OPTIONTRADER_BROKER_EXECUTION_BACKEND=simulated-paper`。外部 paper 代码路由只接受
+   `ibkr-paper` 或 `longbridge-paper`，并要求 `OPTIONTRADER_ENV=paper`、
+   `OPTIONTRADER_BROKER_PAPER_SUBMISSION_ENABLED=true`、对应 Broker 的 paper/submission 开关，
+   且必须与本进程唯一持续对账 Broker 一致。任一条件不满足即拒绝启动；
+   `LIVE_TRADING_ENABLED=false` 必须保持不变，Phase 3 不存在 live 路由。Broker sidecar 仅绑定本机。
 6. Application API 启动时会从 PostgreSQL 读取 plan/order/capability 并调用 Rust
    `RestoreWorkflow`：未 claim 且未过期的确认能力原样恢复；终态保持终态；已提交、已 claim、
    过期但结果不明的订单统一进入 `RECONCILE_PENDING`，版本号加一且残余敞口置 true。返回的
@@ -89,7 +94,10 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
    HEALTHY、已对账账户快照；成功结果回写 PostgreSQL。失败保持 unresolved/RECONCILING；不得删除
    数据库行或重建计划绕过，恢复 RPC 不得提交、改单或撤单。
 7. 订单进入 `RECONCILE_PENDING`、BrokerHealth 非 HEALTHY、账本不一致或 kill switch
-   激活时，禁止新开仓；撤单/减仓恢复路径不得依赖 LLM。
+   激活时，禁止新开仓；撤单/减仓恢复路径不得依赖 LLM。Candidate 1.3 的保护性 CLOSE
+   可绕过仅针对开仓的事件/白名单/购买力/日损/次数/冷却/kill-switch 限制，但仍必须有新鲜
+   ThetaData proof、HEALTHY 且已对账的 Broker、当前规则版本和最新已提交 native 持仓。
+   每腿方向必须减少该持仓且数量不得超出；市价仅允许单腿 CLOSE，多腿 CLOSE 仍必须限价。
 8. capability claim 使用 PostgreSQL 行锁，可跨 API worker 仲裁；CLI worker 参数不再是
    确认安全边界。实时 SessionHub 仍是每进程实例，完整横向扩展尚未认证，paper soak 前
    仍建议单 worker。若 Confirm 的 gRPC 已成功但投影写入失败，claim 不得自动释放；先调用
@@ -104,13 +112,20 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
    `GET /api/v1/trading/reconciliation?broker_id=longbridge`；每个 Broker 独立展示状态，任何
    failure/mismatch/unresolved 或残余敞口都必须保持 false。
    `OPTIONTRADER_BROKER_RECONCILIATION_ENABLED=false` 仅供本地非交易开发，不能作为 paper 配置。
+10. 每次计划、风控、订单、成交、对账和失败状态转换会在原数据库事务写入 outbox。
+    publisher 使用 `claim_outbox_batch` 的 PostgreSQL `SKIP LOCKED` 租约，并按确定性 `event_id`
+    做 at-least-once 去重；成功 ack，失败退避，超过上限进入 dead letter。第一阶段不部署 NATS，
+    不得把“已写 outbox”描述为“已发送到外部消息系统”。
 
 ## Broker SDK 认证前启动
 
 Longbridge 原生 adapter 从 `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、
-`LONGBRIDGE_ACCESS_TOKEN` 读取凭证。不要把值写入 compose、日志或提交。当前 workflow 不会
-启用真实提交；持续对账可实例化 `submission_enabled=false` 的只读 adapter，且只允许读取事实和
-重建内存身份账本。仅在独立 paper 认证进程中显式启用提交。
+`LONGBRIDGE_ACCESS_TOKEN` 读取凭证。不要把值写入 compose、日志或提交。持续对账始终实例化
+`submission_enabled=false` 的只读 authority；只有独立 paper 认证进程满足全部执行路由门槛时，
+才会另外构造可提交 adapter。进程重启后的 Longbridge 撤单前，写侧还必须用只读恢复已经认证的
+durable request/native id 重建本地身份账本；重绑定失败保持 `RECONCILE_PENDING`。两者不能用
+“能读取账户”推导“允许下单”。每次 Longbridge submit 前，写侧还会执行自身的全量只读
+reconcile；发现未知活动单、无法归属的成交或连接异常时关闭 Broker authority，不进入 submit。
 
 凭证写入 Git 忽略且权限为 `600` 的根目录 `.env` 后，可显式执行两条只读 demo smoke。测试
 默认 `ignored`，且内部再次要求 opt-in；第一条先断言 submit 返回 `LiveSubmissionDisabled`，
@@ -125,6 +140,12 @@ OPTIONTRADER_RUN_LONGBRIDGE_DEMO_SMOKE=true cargo test --manifest-path services/
 Longbridge 多腿认证还需设置并记录以下参数；非法值会阻止 adapter 启动：
 
 ```text
+OPTIONTRADER_ENV=paper
+LIVE_TRADING_ENABLED=false
+OPTIONTRADER_BROKER_EXECUTION_BACKEND=longbridge-paper
+OPTIONTRADER_BROKER_PAPER_SUBMISSION_ENABLED=true
+OPTIONTRADER_LONGBRIDGE_PAPER=true
+OPTIONTRADER_BROKER_RECONCILIATION_BROKERS=longbridge
 OPTIONTRADER_LONGBRIDGE_LEG_FILL_TIMEOUT_MS=8000
 OPTIONTRADER_LONGBRIDGE_LEG_POLL_INTERVAL_MS=250
 ```
@@ -141,9 +162,13 @@ OPTIONTRADER_IBKR_PAPER=true
 OPTIONTRADER_IBKR_ACCOUNT=DU...
 OPTIONTRADER_IBKR_CLIENT_ID=37
 OPTIONTRADER_IBKR_SUBMISSION_ENABLED=false
+OPTIONTRADER_BROKER_EXECUTION_BACKEND=simulated-paper
+OPTIONTRADER_BROKER_PAPER_SUBMISSION_ENABLED=false
+OPTIONTRADER_BROKER_RECONCILIATION_BROKERS=ibkr
 ```
 
 执行 `make dev-ibkr-sidecar` 后，必须同时观察到 `nextValidId`、managed account，以及
 account summary / positions / open orders / executions 四个 end callback；缺任一项时 sidecar
 保持 RECONCILING。发现不属于本进程幂等账本的活动订单时 `account.reconciled=false`。只有 paper Gate
-逐项签收时，才可在该认证进程把 submission 开关改为 true；主系统继续保持 false。
+逐项签收时，才可在隔离认证进程把 backend 改为 `ibkr-paper`，并把全局 opt-in 与
+`OPTIONTRADER_IBKR_SUBMISSION_ENABLED` 同时改为 true；日常主系统继续保持上述 false/default。

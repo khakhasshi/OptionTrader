@@ -69,7 +69,10 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
     return Math.max(0, Math.ceil((Date.parse(ticket.order.expires_at_utc) - clock) / 1000));
   }, [clock, ticket]);
   const confirmable =
-    ticket?.order.state === "AWAITING_CONFIRMATION" && canTrade && remaining > 0 && pending === null;
+    ticket?.order.state === "AWAITING_CONFIRMATION" &&
+    (canTrade || ticket.plan.position_effect === "CLOSE") &&
+    remaining > 0 &&
+    pending === null;
   const cancellable =
     ticket !== null &&
     ["AWAITING_CONFIRMATION", "WORKING", "PARTIAL_FILL"].includes(ticket.order.state) &&
@@ -154,7 +157,7 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
         <>
           <div className="execution-summary">
             <div><span>State</span><strong className={`state state-${ticket.order.state.toLowerCase()}`}>{ticket.order.state}</strong></div>
-            <div><span>Strategy</span><strong>{ticket.plan.strategy}</strong></div>
+            <div><span>Strategy / effect</span><strong>{ticket.plan.strategy} · {ticket.plan.position_effect}</strong></div>
             <div><span>Broker / mode</span><strong>{ticket.plan.broker_id.toUpperCase()} · {ticket.plan.execution_mode}</strong></div>
             <div><span>Order / protection</span><strong>{ticket.plan.order_type} · {ticket.plan.limit_price}</strong></div>
             <div><span>Filled</span><strong>{ticket.order.filled_quantity} / {ticket.order.total_quantity}</strong></div>
@@ -216,6 +219,7 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
             <h3 id="confirm-title">Confirm exact plan</h3>
             <dl>
               <div><dt>Strategy</dt><dd>{ticket.plan.strategy}</dd></div>
+              <div><dt>Position effect</dt><dd>{ticket.plan.position_effect}</dd></div>
               <div><dt>Order</dt><dd>{ticket.plan.order_side} {ticket.plan.order_type}</dd></div>
               <div><dt>Protection</dt><dd>{ticket.plan.limit_price}</dd></div>
               <div><dt>Max loss</dt><dd>{ticket.plan.max_loss}</dd></div>
@@ -223,7 +227,7 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
             </dl>
             <label className="confirm-check">
               <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />
-              <span>I verified contracts, limit and maximum loss.</span>
+              <span>I verified position effect, contracts, protection and maximum loss.</span>
             </label>
             <div className="dialog-actions">
               <button className="secondary-command" onClick={() => { setReviewOpen(false); setAcknowledged(false); }}>Back</button>

@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.2",
+  "schema_version": "1.3",
   "plan_id": "plan_demo_001",
   "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "idempotency_key": "idem_demo_001",
@@ -48,5 +48,6 @@
   "manual_confirmation_required": true,
   "order_side": "BUY",
   "order_type": "LIMIT",
-  "market_data_provider": "THETADATA"
+  "market_data_provider": "THETADATA",
+  "position_effect": "OPEN"
 }

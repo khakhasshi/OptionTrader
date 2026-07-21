@@ -48,7 +48,7 @@ export interface AdaptiveLimitPolicy {
 }
 
 export interface CandidateTradePlan {
-  schema_version: "1.2";
+  schema_version: "1.3";
   plan_id: string;
   plan_hash: string;
   idempotency_key: string;
@@ -69,6 +69,7 @@ export interface CandidateTradePlan {
   order_type: "MARKET" | "LIMIT" | "ADAPTIVE_LIMIT";
   adaptive_limit?: AdaptiveLimitPolicy;
   market_data_provider: "THETADATA";
+  position_effect: "OPEN" | "CLOSE";
 }
 
 export interface ExecutionOrder {
@@ -221,7 +222,7 @@ function parseLeg(value: unknown): CandidateLeg | null {
 }
 
 function parsePlan(value: unknown): CandidateTradePlan | null {
-  if (!record(value) || value.schema_version !== "1.2") return null;
+  if (!record(value) || value.schema_version !== "1.3") return null;
   const legs = Array.isArray(value.legs) ? value.legs.map(parseLeg) : [];
   const adaptive = value.adaptive_limit === undefined ? null : parseAdaptiveLimit(value.adaptive_limit);
   if (
@@ -248,11 +249,15 @@ function parsePlan(value: unknown): CandidateTradePlan | null {
     !["MARKET", "LIMIT", "ADAPTIVE_LIMIT"].includes(String(value.order_type)) ||
     (value.order_type === "ADAPTIVE_LIMIT" && !adaptive) ||
     (value.order_type !== "ADAPTIVE_LIMIT" && value.adaptive_limit !== undefined)
-    || value.market_data_provider !== "THETADATA"
+    || value.market_data_provider !== "THETADATA" ||
+    (value.position_effect !== "OPEN" && value.position_effect !== "CLOSE") ||
+    (value.position_effect === "OPEN" && Number(value.max_loss) <= 0) ||
+    (value.position_effect === "CLOSE" && Number(value.max_loss) !== 0) ||
+    (value.order_type === "MARKET" && (value.position_effect !== "CLOSE" || legs.length !== 1))
   )
     return null;
   return {
-    schema_version: "1.2",
+    schema_version: "1.3",
     plan_id: value.plan_id,
     plan_hash: value.plan_hash,
     idempotency_key: value.idempotency_key,
@@ -272,6 +277,7 @@ function parsePlan(value: unknown): CandidateTradePlan | null {
     order_side: value.order_side as CandidateTradePlan["order_side"],
     order_type: value.order_type as CandidateTradePlan["order_type"],
     market_data_provider: "THETADATA",
+    position_effect: value.position_effect,
     ...(adaptive
       ? { adaptive_limit: adaptive }
       : {}),
