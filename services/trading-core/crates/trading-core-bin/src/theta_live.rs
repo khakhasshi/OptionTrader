@@ -1,24 +1,23 @@
-//! Async Theta Terminal WebSocket transport. One connection owns all stream
-//! requests, matching ThetaData's single-connection requirement.
+//! ThetaData Python SDK bridge client. Credentials and provider DataFrames stay
+//! in Python; this transport accepts only the internal protobuf bar contract.
 
 use std::time::Duration;
 
-use chrono::{Timelike, Utc};
+use chrono::{DateTime, NaiveDate, Offset, Timelike};
 use chrono_tz::America::New_York;
-use futures_util::{SinkExt, StreamExt};
-use market_core::{
-    parse_ohlc_backfill, parse_stream_message, subscribe_trade_request, ReplayBar,
-    ThetaBarAggregator, ThetaStreamEvent,
+use market_core::ReplayBar;
+use optiontrader_proto::market_v1::{
+    theta_data_sdk_service_client::ThetaDataSdkServiceClient, MarketBar, ThetaSdkBarBatch,
+    ThetaSdkStreamRequest,
 };
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[derive(Debug, Clone)]
 pub struct ThetaLiveConfig {
-    pub url: String,
-    pub rest_url: String,
+    pub endpoint: String,
     pub symbol: String,
-    pub backfill_enabled: bool,
+    pub venue: String,
+    pub poll_interval_ms: u32,
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
 }
@@ -26,10 +25,10 @@ pub struct ThetaLiveConfig {
 impl Default for ThetaLiveConfig {
     fn default() -> Self {
         ThetaLiveConfig {
-            url: "ws://127.0.0.1:25520/v1/events".into(),
-            rest_url: "http://127.0.0.1:25503/v3".into(),
+            endpoint: "http://127.0.0.1:50052".into(),
             symbol: "QQQ".into(),
-            backfill_enabled: true,
+            venue: "nqb".into(),
+            poll_interval_ms: 2_000,
             reconnect_base: Duration::from_millis(250),
             reconnect_max: Duration::from_secs(10),
         }
@@ -44,124 +43,179 @@ pub enum ThetaLiveEvent {
     Bar(ReplayBar),
 }
 
-async fn fetch_backfill(config: &ThetaLiveConfig) -> Result<Vec<ReplayBar>, String> {
-    let now_et = Utc::now().with_timezone(&New_York);
-    let date = now_et.date_naive();
-    let current_minute = (now_et.hour() * 60 + now_et.minute()) as u16;
-    if current_minute <= 570 {
-        return Ok(Vec::new());
+fn parse_decimal(value: &str, field: &'static str, optional: bool) -> Result<Option<f64>, String> {
+    if optional && value.is_empty() {
+        return Ok(None);
     }
-    let complete_through = current_minute.saturating_sub(1).min(959);
-    let end_time = format!(
-        "{:02}:{:02}:00.000",
-        complete_through / 60,
-        complete_through % 60
-    );
-    let date_param = date.format("%Y%m%d").to_string();
-    let response = reqwest::Client::new()
-        .get(format!(
-            "{}/stock/history/ohlc",
-            config.rest_url.trim_end_matches('/')
-        ))
-        .query(&[
-            ("symbol", config.symbol.as_str()),
-            ("date", date_param.as_str()),
-            ("interval", "1m"),
-            ("start_time", "09:30:00.000"),
-            ("end_time", end_time.as_str()),
-            ("venue", "nqb"),
-            ("format", "json"),
-        ])
-        .send()
-        .await
-        .map_err(|error| format!("backfill request: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("backfill status: {error}"))?;
-    let raw = response
-        .text()
-        .await
-        .map_err(|error| format!("backfill body: {error}"))?;
-    let bars =
-        parse_ohlc_backfill(&raw, date).map_err(|error| format!("backfill protocol: {error}"))?;
-    if bars.first().map(|bar| bar.minute_et) != Some(570)
-        || bars.last().map(|bar| bar.minute_et) != Some(complete_through)
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid SDK {field}"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!("invalid SDK {field}"));
+    }
+    Ok(Some(parsed))
+}
+
+fn sdk_bar_to_replay(bar: MarketBar) -> Result<ReplayBar, String> {
+    if !bar.occurred_at_utc.ends_with('Z') {
+        return Err("SDK occurred_at_utc must use UTC Z".into());
+    }
+    let utc = DateTime::parse_from_rfc3339(&bar.occurred_at_utc)
+        .map_err(|_| "invalid SDK occurred_at_utc")?;
+    let et =
+        DateTime::parse_from_rfc3339(&bar.timestamp_et).map_err(|_| "invalid SDK timestamp_et")?;
+    if utc.timestamp_millis() != et.timestamp_millis() {
+        return Err("SDK UTC/ET timestamps disagree".into());
+    }
+    let expected_et = utc.with_timezone(&New_York);
+    if et.naive_local() != expected_et.naive_local()
+        || et.offset().local_minus_utc() != expected_et.offset().fix().local_minus_utc()
     {
-        return Err(format!(
-            "backfill incomplete: expected 570..={complete_through}, got {:?}..={:?}",
-            bars.first().map(|bar| bar.minute_et),
-            bars.last().map(|bar| bar.minute_et)
-        ));
+        return Err("SDK timestamp_et is not America/New_York".into());
+    }
+    if !(570..960).contains(&bar.minute_et) {
+        return Err("SDK minute is outside regular trading hours".into());
+    }
+    let timestamp_minute = expected_et.hour() * 60 + expected_et.minute();
+    if timestamp_minute != bar.minute_et {
+        return Err("SDK minute does not match timestamp_et".into());
+    }
+    let open = parse_decimal(&bar.open, "open", false)?.expect("required decimal");
+    let high = parse_decimal(&bar.high, "high", false)?.expect("required decimal");
+    let low = parse_decimal(&bar.low, "low", false)?.expect("required decimal");
+    let close = parse_decimal(&bar.close, "close", false)?.expect("required decimal");
+    let vwap = parse_decimal(&bar.vwap, "vwap", true)?;
+    if !(low <= open && open <= high && low <= close && close <= high) {
+        return Err("SDK OHLC price is outside the bar range".into());
+    }
+    Ok(ReplayBar {
+        occurred_at_utc: bar.occurred_at_utc,
+        timestamp_et: bar.timestamp_et,
+        occurred_at_utc_ms: utc.timestamp_millis(),
+        minute_et: bar.minute_et as u16,
+        open,
+        high,
+        low,
+        close,
+        volume: bar.volume,
+        vwap,
+    })
+}
+
+fn validate_batch(
+    batch: ThetaSdkBarBatch,
+    first_batch: bool,
+    last_minute: Option<u16>,
+) -> Result<Vec<ReplayBar>, String> {
+    if !batch.fetched_at_utc.ends_with('Z') {
+        return Err("invalid SDK batch fetched_at_utc".into());
+    }
+    let fetched_at = DateTime::parse_from_rfc3339(&batch.fetched_at_utc)
+        .map_err(|_| "invalid SDK batch fetched_at_utc")?;
+    let session_date = NaiveDate::parse_from_str(&batch.session_date, "%Y-%m-%d")
+        .map_err(|_| "invalid SDK batch session_date")?;
+    if fetched_at.with_timezone(&New_York).date_naive() != session_date {
+        return Err("SDK batch session_date does not match fetch time".into());
+    }
+    let complete_through = batch.complete_through_minute_et;
+    if complete_through != 0 && !(570..960).contains(&complete_through) {
+        return Err("invalid SDK complete-through watermark".into());
+    }
+    if batch.backfill != first_batch {
+        return Err("SDK bridge backfill phase violation".into());
+    }
+    let bars: Vec<ReplayBar> = batch
+        .bars
+        .into_iter()
+        .map(sdk_bar_to_replay)
+        .collect::<Result<_, _>>()?;
+    if bars.iter().any(|bar| {
+        DateTime::parse_from_rfc3339(&bar.timestamp_et)
+            .map_or(true, |timestamp| timestamp.date_naive() != session_date)
+    }) {
+        return Err("SDK bar date does not match batch session".into());
+    }
+    if bars
+        .windows(2)
+        .any(|pair| pair[1].minute_et != pair[0].minute_et + 1)
+    {
+        return Err("SDK batch contains a minute gap or disorder".into());
+    }
+    if let Some(first) = bars.first() {
+        let expected = last_minute.map_or(570, |minute| minute + 1);
+        if first.minute_et != expected {
+            return Err(format!(
+                "SDK stream minute gap: expected {expected}, got {}",
+                first.minute_et
+            ));
+        }
+    }
+    match (complete_through, bars.last()) {
+        (0, None) => {}
+        (0, Some(_)) => return Err("SDK emitted bars before the first complete RTH minute".into()),
+        (_, Some(last)) if u32::from(last.minute_et) == complete_through => {}
+        (_, Some(last)) => {
+            return Err(format!(
+                "SDK backfill incomplete: expected through {complete_through}, got {}",
+                last.minute_et
+            ))
+        }
+        (_, None) => return Err("SDK backfill is empty after the first complete RTH minute".into()),
     }
     Ok(bars)
 }
 
 async fn connect_once(
     config: &ThetaLiveConfig,
-    request_id: u64,
-    aggregator: &mut ThetaBarAggregator,
     tx: &mpsc::Sender<ThetaLiveEvent>,
 ) -> Result<(), String> {
-    let (mut socket, _) = connect_async(&config.url)
+    let mut client = ThetaDataSdkServiceClient::connect(config.endpoint.clone())
         .await
-        .map_err(|error| format!("connect: {error}"))?;
-    let request = subscribe_trade_request(&config.symbol, request_id).to_string();
-    socket
-        .send(Message::Text(request.into()))
+        .map_err(|error| format!("SDK bridge connect: {error}"))?;
+    let response = client
+        .stream_completed_bars(ThetaSdkStreamRequest {
+            symbol: config.symbol.clone(),
+            venue: config.venue.clone(),
+            poll_interval_ms: config.poll_interval_ms,
+        })
         .await
-        .map_err(|error| format!("subscribe: {error}"))?;
-
-    // Subscribe first so current-minute trades buffer in the socket while the
-    // REST call recovers every completed minute from the session open.
-    if config.backfill_enabled {
-        let bars = fetch_backfill(config).await?;
-        if tx.send(ThetaLiveEvent::Backfill(bars)).await.is_err() {
+        .map_err(|error| format!("SDK bridge subscribe: {error}"))?;
+    let mut stream = response.into_inner();
+    let mut first_batch = true;
+    let mut last_minute = None;
+    while let Some(batch) = stream
+        .message()
+        .await
+        .map_err(|error| format!("SDK bridge receive: {error}"))?
+    {
+        let is_backfill = batch.backfill;
+        let bars = validate_batch(batch, first_batch, last_minute)?;
+        let batch_last_minute = bars.last().map(|bar| bar.minute_et);
+        if first_batch && tx.send(ThetaLiveEvent::Connected).await.is_err() {
             return Ok(());
         }
-    }
-
-    while let Some(message) = socket.next().await {
-        let message = message.map_err(|error| format!("receive: {error}"))?;
-        match message {
-            Message::Text(text) => match parse_stream_message(&text, &config.symbol)
-                .map_err(|error| format!("protocol: {error}"))?
-            {
-                ThetaStreamEvent::Connected => {
-                    if tx.send(ThetaLiveEvent::Connected).await.is_err() {
-                        return Ok(());
-                    }
+        if is_backfill {
+            if tx.send(ThetaLiveEvent::Backfill(bars)).await.is_err() {
+                return Ok(());
+            }
+        } else {
+            for bar in bars {
+                last_minute = Some(bar.minute_et);
+                if tx.send(ThetaLiveEvent::Bar(bar)).await.is_err() {
+                    return Ok(());
                 }
-                ThetaStreamEvent::Disconnected => return Err("terminal disconnected".into()),
-                ThetaStreamEvent::Trade(trade) => {
-                    if let Some(bar) = aggregator
-                        .push(trade)
-                        .map_err(|error| format!("aggregate: {error}"))?
-                    {
-                        if tx.send(ThetaLiveEvent::Bar(bar)).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-                ThetaStreamEvent::Ignored => {}
-            },
-            Message::Close(_) => return Err("terminal closed websocket".into()),
-            Message::Ping(payload) => socket
-                .send(Message::Pong(payload))
-                .await
-                .map_err(|error| format!("pong: {error}"))?,
-            _ => {}
+            }
         }
+        last_minute = batch_last_minute.or(last_minute);
+        first_batch = false;
     }
-    Err("terminal websocket ended".into())
+    Err("SDK bridge stream ended".into())
 }
 
 pub async fn run(config: ThetaLiveConfig, tx: mpsc::Sender<ThetaLiveEvent>) {
-    let mut request_id = 1_u64;
     let mut backoff = config.reconnect_base;
     loop {
-        // Sequence values and a partial minute cannot be trusted across a new
-        // socket. REST backfill becomes authoritative for completed minutes.
-        let mut aggregator = ThetaBarAggregator::default();
-        match connect_once(&config, request_id, &mut aggregator, &tx).await {
+        match connect_once(&config, &tx).await {
             Ok(()) => return,
             Err(reason) => {
                 if tx.send(ThetaLiveEvent::Disconnected(reason)).await.is_err() {
@@ -171,67 +225,131 @@ pub async fn run(config: ThetaLiveConfig, tx: mpsc::Sender<ThetaLiveEvent>) {
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(config.reconnect_max);
-        request_id = request_id.saturating_add(1);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use tokio::net::TcpListener;
-    use tokio_tungstenite::accept_async;
+    use optiontrader_proto::market_v1::{
+        theta_data_sdk_service_server::{ThetaDataSdkService, ThetaDataSdkServiceServer},
+        ThetaSdkStreamRequest,
+    };
+    use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+    use tonic::{Request, Response, Status};
 
-    fn trade(ms: u32, sequence: u64, price: f64) -> String {
-        json!({
-            "header": {"type": "TRADE", "status": "CONNECTED"},
-            "contract": {"security_type": "STOCK", "root": "QQQ"},
-            "trade": {
-                "ms_of_day": ms, "sequence": sequence, "size": 1,
-                "condition": 0, "price": price, "exchange": 57, "date": 20260720
-            }
-        })
-        .to_string()
+    fn proto_bar(minute: u32) -> MarketBar {
+        let hour = minute / 60;
+        let minute_of_hour = minute % 60;
+        MarketBar {
+            occurred_at_utc: format!("2026-07-20T{}:{minute_of_hour:02}:00Z", hour + 4),
+            timestamp_et: format!("2026-07-20T{hour:02}:{minute_of_hour:02}:00-04:00"),
+            minute_et: minute,
+            open: "500".into(),
+            high: "501".into(),
+            low: "499".into(),
+            close: "500.5".into(),
+            volume: 100,
+            vwap: "500.25".into(),
+        }
+    }
+
+    fn batch(backfill: bool, bars: Vec<MarketBar>) -> ThetaSdkBarBatch {
+        let complete_through_minute_et = bars.last().map_or(0, |bar| bar.minute_et);
+        ThetaSdkBarBatch {
+            bars,
+            backfill,
+            fetched_at_utc: "2026-07-20T13:32:00Z".into(),
+            complete_through_minute_et,
+            session_date: "2026-07-20".into(),
+        }
+    }
+
+    #[test]
+    fn validates_backfill_and_incremental_sequence() {
+        let initial = validate_batch(
+            batch(true, vec![proto_bar(570), proto_bar(571)]),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(initial.len(), 2);
+        assert!(validate_batch(batch(false, vec![proto_bar(573)]), false, Some(571)).is_err());
+        assert!(validate_batch(batch(true, vec![]), false, Some(571)).is_err());
+        let mut partial = batch(true, vec![proto_bar(570), proto_bar(571)]);
+        partial.complete_through_minute_et = 572;
+        assert!(validate_batch(partial, true, None).is_err());
+    }
+
+    #[test]
+    fn rejects_timestamp_disagreement_and_invalid_ohlc() {
+        let mut timestamp = proto_bar(570);
+        timestamp.occurred_at_utc = "2026-07-20T13:31:00Z".into();
+        assert!(sdk_bar_to_replay(timestamp).is_err());
+
+        let mut range = proto_bar(570);
+        range.close = "502".into();
+        assert!(sdk_bar_to_replay(range).is_err());
+
+        let mut minute = proto_bar(570);
+        minute.minute_et = 571;
+        assert!(sdk_bar_to_replay(minute).is_err());
+    }
+
+    #[derive(Default)]
+    struct FakeSdkService;
+
+    #[tonic::async_trait]
+    impl ThetaDataSdkService for FakeSdkService {
+        type StreamCompletedBarsStream = ReceiverStream<Result<ThetaSdkBarBatch, Status>>;
+
+        async fn stream_completed_bars(
+            &self,
+            request: Request<ThetaSdkStreamRequest>,
+        ) -> Result<Response<Self::StreamCompletedBarsStream>, Status> {
+            assert_eq!(request.into_inner().symbol, "QQQ");
+            let (tx, rx) = mpsc::channel(4);
+            tokio::spawn(async move {
+                tx.send(Ok(batch(true, vec![proto_bar(570), proto_bar(571)])))
+                    .await
+                    .unwrap();
+                tx.send(Ok(batch(false, vec![proto_bar(572)])))
+                    .await
+                    .unwrap();
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
     }
 
     #[tokio::test]
-    async fn websocket_transport_subscribes_and_emits_finalized_bar() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    async fn grpc_bridge_emits_reconciled_backfill_then_live_bar() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut websocket = accept_async(stream).await.unwrap();
-            let request = websocket.next().await.unwrap().unwrap();
-            let request: serde_json::Value =
-                serde_json::from_str(request.to_text().unwrap()).unwrap();
-            assert_eq!(request["contract"]["root"], "QQQ");
-            websocket
-                .send(Message::Text(trade(34_200_000, 1, 500.0).into()))
+            tonic::transport::Server::builder()
+                .add_service(ThetaDataSdkServiceServer::new(FakeSdkService))
+                .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
-            websocket
-                .send(Message::Text(trade(34_260_000, 2, 501.0).into()))
-                .await
-                .unwrap();
-            websocket.close(None).await.unwrap();
         });
-
         let (tx, mut rx) = mpsc::channel(8);
-        let mut aggregator = ThetaBarAggregator::default();
         let config = ThetaLiveConfig {
-            url: format!("ws://{addr}"),
-            backfill_enabled: false,
-            reconnect_base: Duration::from_millis(1),
-            reconnect_max: Duration::from_millis(1),
+            endpoint: format!("http://{addr}"),
             ..ThetaLiveConfig::default()
         };
-        let result = connect_once(&config, 7, &mut aggregator, &tx).await;
-        assert!(result.is_err());
-        let ThetaLiveEvent::Bar(bar) = rx.recv().await.unwrap() else {
-            panic!("expected bar")
+
+        let result = connect_once(&config, &tx).await;
+
+        assert_eq!(result.unwrap_err(), "SDK bridge stream ended");
+        assert!(matches!(rx.recv().await, Some(ThetaLiveEvent::Connected)));
+        let Some(ThetaLiveEvent::Backfill(backfill)) = rx.recv().await else {
+            panic!("expected SDK backfill")
         };
-        assert_eq!(bar.minute_et, 570);
-        assert_eq!(bar.close, 500.0);
-        server.await.unwrap();
+        assert_eq!(backfill.len(), 2);
+        let Some(ThetaLiveEvent::Bar(live)) = rx.recv().await else {
+            panic!("expected incremental SDK bar")
+        };
+        assert_eq!(live.minute_et, 572);
+        server.abort();
     }
 }

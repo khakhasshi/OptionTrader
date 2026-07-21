@@ -34,17 +34,24 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
 
 ## ThetaData 实时源
 
-1. 启动 Theta Terminal v3，确认本机 `25503`（REST）和 `25520`（WebSocket）可达。
-2. 配置 `THETADATA_BASE_URL=http://127.0.0.1:25503/v3`、
-   `THETADATA_WS_URL=ws://127.0.0.1:25520/v1/events`，运行 `make dev-core-theta`。
-3. 盘中启动或重连时，必须先看到 REST 回补从 09:30 覆盖至上一完整分钟；回补期间
-   Cockpit 显示 STALE/No Trade。缺口、HTTP 错误、前缀冲突或 entitlement 错误不得
-   手工改健康状态解锁。
-4. `GetDataHealth`、`/health` 与 Cockpit 必须一致；市场流持续 90 秒无 tick 时 Python
+1. 准备官方 Python SDK 凭证。推荐设置
+   `THETADATA_CREDENTIALS_FILE=/absolute/path/to/creds.txt` 并执行 `chmod 600`；也可设置
+   `THETADATA_API_KEY` 或 `THETADATA_DOTENV_PATH`。不得复制凭证到仓库或命令输出。
+2. 在独立终端运行 `make dev-thetadata-sdk`，确认 `127.0.0.1:50052` 启动；SDK 直接连接
+   ThetaData 服务器，不需要启动 Theta Terminal。
+3. 在第二个终端运行 `make dev-core-theta-sdk`。Rust 通过
+   `THETADATA_SDK_GRPC=http://127.0.0.1:50052` 消费已完成分钟 bar。
+4. 盘中启动或重连时，必须先看到从 09:30 开始的连续回补；回补期间 Cockpit 显示
+   STALE/No Trade。SDK 请求错误、空/部分占位、分钟缺口、时间冲突、前缀冲突或
+   entitlement 错误不得手工改健康状态解锁。
+5. 可用以下 opt-in smoke 验证凭证和 Standard 股票 OHLC 权限：
+   `THETADATA_CREDENTIALS_FILE=/absolute/path/to/creds.txt uv run pytest
+   tests/test_thetadata_sdk_live.py -q`（在 `services/application-api` 下运行）。
+6. `GetDataHealth`、`/health` 与 Cockpit 必须一致；市场流持续 90 秒无 tick 时 Python
    发布 DISCONNECTED 并重连，Rust 也按自身阈值将健康降级。
 
-当前仓库以官方消息形状和本地 mock Terminal 覆盖自动测试。真实账号 entitlement、
-一份脱敏原始字段样本以及完整 RTH 连续运行需要现场执行，未执行前不得作为 paper/live
+当前仓库已用真实账号完成 QQQ 三分钟历史 OHLC 凭证/字段 smoke，并以 mock SDK gRPC
+覆盖回补和增量传输。完整 RTH 连续运行仍需现场执行，未执行前不得作为 paper/live
 上线证据。
 
 ## 事件上下文日常导入

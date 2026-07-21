@@ -355,7 +355,7 @@ fn refresh_live_silence(state: &mut LiveFeedState, health_cfg: market_core::Heal
     state.health.reason = Some(reason.into());
 }
 
-/// Dynamic MarketService backed by Theta Terminal. Unlike finite replay, the
+/// Dynamic MarketService backed by the ThetaData Python SDK bridge. Unlike finite replay, the
 /// producer appends finalized bars indefinitely and subscribers wait on cursor.
 #[derive(Clone)]
 pub struct LiveMarketServiceImpl {
@@ -381,7 +381,7 @@ impl LiveMarketServiceImpl {
                     quote_age_ms: 0,
                     out_of_order_count: 0,
                     reconnect_count: 0,
-                    reason: Some("Theta Terminal stream not connected".into()),
+                    reason: Some("ThetaData SDK bridge not connected".into()),
                 },
                 reconnect_count: 0,
                 last_bar_received_at: None,
@@ -415,7 +415,7 @@ impl LiveMarketServiceImpl {
                             Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                         live.health.status = DataHealth::Reconciling;
                         live.health.reason =
-                            Some("Theta connected; awaiting complete minute".into());
+                            Some("ThetaData SDK connected; awaiting complete minute".into());
                     }
                     ThetaLiveEvent::Disconnected(reason) => {
                         live.reconnect_count = live.reconnect_count.saturating_add(1);
@@ -443,7 +443,7 @@ impl LiveMarketServiceImpl {
                         if !prefix_matches {
                             live.health.status = DataHealth::Stale;
                             live.health.reason = Some(
-                                "Theta REST backfill conflicts with published live bars".into(),
+                                "ThetaData SDK backfill conflicts with published live bars".into(),
                             );
                             live.needs_reconcile = true;
                             continue;
@@ -471,7 +471,7 @@ impl LiveMarketServiceImpl {
                             Err(error) => {
                                 live.health.status = DataHealth::Stale;
                                 live.health.reason =
-                                    Some(format!("Theta REST backfill rejected: {error}"));
+                                    Some(format!("ThetaData SDK backfill rejected: {error}"));
                                 live.needs_reconcile = true;
                             }
                         }
@@ -502,7 +502,7 @@ impl LiveMarketServiceImpl {
                                     reconnect_count: live.reconnect_count,
                                     reason: live
                                         .needs_reconcile
-                                        .then(|| "reconnect awaiting REST reconciliation".into()),
+                                        .then(|| "reconnect awaiting SDK reconciliation".into()),
                                 };
                                 live.ticks.push((snapshot, bar));
                                 live.last_bar_received_at = Some(Instant::now());
@@ -605,9 +605,6 @@ impl MarketService for LiveMarketServiceImpl {
 mod tests {
     use super::*;
     use market_core::HealthConfig;
-    use serde_json::json;
-    use tokio::net::TcpListener;
-    use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     const NDJSON: &str = include_str!("../fixtures/replay_qqq_sample.ndjson");
 
@@ -618,18 +615,6 @@ mod tests {
             ..ReplayConfig::default()
         };
         Arc::new(MarketFeed::from_ndjson(NDJSON, cfg).unwrap())
-    }
-
-    fn theta_trade(ms: u32, sequence: u64, price: f64) -> String {
-        json!({
-            "header": {"type": "TRADE", "status": "CONNECTED"},
-            "contract": {"security_type": "STOCK", "root": "QQQ"},
-            "trade": {
-                "ms_of_day": ms, "sequence": sequence, "size": 10,
-                "condition": 0, "price": price, "exchange": 57, "date": 20260720
-            }
-        })
-        .to_string()
     }
 
     async fn drain(svc: &MarketServiceImpl) -> Vec<optiontrader_proto::market_v1::MarketTick> {
@@ -827,12 +812,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_rest_snapshot_uses_current_watchdog_health() {
+    async fn live_http_snapshot_uses_current_watchdog_health() {
         let service = LiveMarketServiceImpl::new(
-            ThetaLiveConfig {
-                backfill_enabled: false,
-                ..ThetaLiveConfig::default()
-            },
+            ThetaLiveConfig::default(),
             ReplayConfig {
                 health: HealthConfig {
                     expected_interval_ms: 1,
@@ -942,69 +924,5 @@ mod tests {
         assert!(!proto.opening_range_high.is_empty());
         let proto_bar = bar_to_proto(bar);
         assert_eq!(proto_bar.occurred_at_utc, snap.occurred_at_utc);
-    }
-
-    #[tokio::test]
-    async fn theta_websocket_drives_dynamic_grpc_snapshot() {
-        use futures_util::{SinkExt, StreamExt as FuturesStreamExt};
-        use tokio_stream::StreamExt as TokioStreamExt;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut websocket = accept_async(stream).await.unwrap();
-            let request = FuturesStreamExt::next(&mut websocket)
-                .await
-                .unwrap()
-                .unwrap();
-            let request: serde_json::Value =
-                serde_json::from_str(request.to_text().unwrap()).unwrap();
-            assert_eq!(request["contract"]["root"], "QQQ");
-            websocket
-                .send(Message::Text(theta_trade(34_200_000, 1, 500.0).into()))
-                .await
-                .unwrap();
-            websocket
-                .send(Message::Text(theta_trade(34_260_000, 2, 501.0).into()))
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-
-        let service = LiveMarketServiceImpl::new(
-            ThetaLiveConfig {
-                url: format!("ws://{addr}"),
-                backfill_enabled: false,
-                reconnect_base: Duration::from_millis(5),
-                reconnect_max: Duration::from_millis(5),
-                ..ThetaLiveConfig::default()
-            },
-            ReplayConfig {
-                opening_range_minutes: 3,
-                previous_close: Some(497.20),
-                ..ReplayConfig::default()
-            },
-        );
-        let response = service
-            .stream_market_snapshots(Request::new(StreamRequest {
-                session_id: "theta-mock".into(),
-                speedup: 0.0,
-                resume_after_sequence: 0,
-            }))
-            .await
-            .unwrap();
-        let mut stream = response.into_inner();
-        let tick = tokio::time::timeout(Duration::from_secs(2), TokioStreamExt::next(&mut stream))
-            .await
-            .expect("dynamic gRPC tick timed out")
-            .expect("dynamic gRPC stream ended")
-            .unwrap();
-        let snapshot = tick.snapshot.expect("snapshot");
-        assert_eq!(snapshot.symbol, "QQQ.US");
-        assert_eq!(snapshot.sequence_number, 1);
-        assert_eq!(snapshot.data_health, ProtoHealth::Healthy as i32);
-        assert_eq!(tick.delivery_phase, DeliveryPhase::Live as i32);
-        server.await.unwrap();
     }
 }

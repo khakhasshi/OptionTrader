@@ -116,10 +116,36 @@ message StreamRequest {
 
 message GetDataHealthRequest {}
 
+// Internal Python SDK -> Rust boundary. Credentials remain inside the Python
+// bridge; only completed, normalized one-minute bars cross this interface.
+message ThetaSdkStreamRequest {
+  string symbol = 1;
+  string venue = 2;
+  uint32 poll_interval_ms = 3;
+}
+
+message ThetaSdkBarBatch {
+  repeated MarketBar bars = 1;
+  // Exactly the first successfully fetched batch on each connection is a
+  // backfill. Rust reconciles it against every bar already published.
+  bool backfill = 2;
+  string fetched_at_utc = 3;
+  // Last minute complete at fetch time (ET minute-of-day). Zero means no RTH
+  // minute is complete yet. Rust requires the batch to reach this watermark.
+  uint32 complete_through_minute_et = 4;
+  string session_date = 5; // YYYY-MM-DD in America/New_York
+}
+
 service MarketService {
   // Server-streaming tick feed in deterministic occurred_at_utc order. Each
   // tick carries both the aggregate snapshot and its raw per-minute bar.
   rpc StreamMarketSnapshots(StreamRequest) returns (stream MarketTick);
   // Current DataHealth as of the last processed record.
   rpc GetDataHealth(GetDataHealthRequest) returns (DataHealthState);
+}
+
+// Served by the Python process that owns the official ThetaData SDK client.
+// Rust consumes this service and remains authoritative for market health.
+service ThetaDataSdkService {
+  rpc StreamCompletedBars(ThetaSdkStreamRequest) returns (stream ThetaSdkBarBatch);
 }

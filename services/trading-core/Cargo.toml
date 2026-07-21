@@ -16,15 +16,12 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = "0.10"
-futures-util = "0.3"
-tokio-tungstenite = "0.26"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tonic = "0.12"

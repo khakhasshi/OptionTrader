@@ -47,12 +47,14 @@ class ThetaDataHistoricalAdapter:
     def from_sdk(cls, **client_kwargs: Any) -> ThetaDataHistoricalAdapter:
         """Create the adapter when the optional ``thetadata`` SDK is installed."""
         try:
-            from thetadata import ThetaClient as SdkClient
+            from thetadata.client import ThetaClient as SdkClient
         except ImportError as exc:
             raise RuntimeError(
                 "ThetaData SDK is not installed; run this research job in the ThetaData environment"
             ) from exc
-        return cls(client=SdkClient(dataframe_type="pandas", **client_kwargs))
+        return cls(
+            client=cast(ThetaDataClient, SdkClient(dataframe_type="pandas", **client_kwargs))
+        )
 
     def qqq_bars(self, start_date: date, end_date: date) -> pd.DataFrame:
         return _frame(

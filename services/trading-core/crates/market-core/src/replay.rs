@@ -5,7 +5,7 @@
 //! yields an identical snapshot sequence.
 //!
 //! `SnapshotSource` owns finite deterministic replay. The asynchronous ThetaData
-//! WebSocket adapter lives in `theta.rs` and feeds the runtime one finalized bar
+//! SDK bridge feeds the runtime one finalized bar
 //! at a time; forcing a live stream through this finite interface would hide
 //! disconnect/reconnect semantics.
 

@@ -97,7 +97,7 @@ make up / make down  # docker compose 本地依赖（PostgreSQL 等）
 - **D2**：monorepo 目录结构遵循 DEVELOPMENT_PLAN.md 第 4 节。
 - **D3**：Phase 0 先落骨架 + 契约 + 迁移基础 + 端到端 smoke（fixture 快照从 Rust→Python→React）；不在 Phase 0 接实盘。
 - **D4**：Phase 2 实时传输——Python↔Rust 用 gRPC（`market.proto` 的 `MarketService`，server streaming 返回 `stream MarketTick{snapshot,bar,delivery_phase,high_watermark_sequence}` + `GetDataHealth`）；React↔Python 用 WebSocket 增量推送 + REST 快照恢复。快照/DataHealth 权威在 Rust；流带原始每分钟 bar 以保证实时引擎输出与离线回放逐位一致。重连通过 `resume_after_sequence` 回补，BACKFILL 只重建状态且强制 No Trade；Projector 独立校验 sequence/high-watermark，恢复目标帧本身仍闭锁，只有越过目标后新产生的 LIVE 帧才可恢复许可。数据源=回放时钟驱动 + 可插拔实时适配器（`SnapshotSource`）。生成代码不入仓（Rust build.rs / Python 脚本）；`make test` 强制构建当前 Rust 二进制并执行跨语言 smoke。详见 `docs/adr/0001-phase2-realtime-transport.md`。
-- **D5**：Phase 2 真实源与事件上下文——`OPTIONTRADER_MARKET_SOURCE=theta` 使用 Theta v3 STOCK/TRADE WebSocket；盘中启动/重连必须以当日 Nasdaq Basic 1m OHLC 从 09:30 回补，覆盖不足或与已发布前缀冲突保持闭锁。Python 从四类严格来源文件生成 EventContext，缺失、陈旧、未来接收时间或关键低置信度输入禁止新开仓；事件文本不进入指令通道。真实 entitlement 与完整 RTH soak 是现场 Gate，不以 mock 测试替代。
+- **D5**：Phase 2 真实源与事件上下文——`OPTIONTRADER_MARKET_SOURCE=theta-sdk` 只消费内部 `ThetaDataSdkService`；Python 官方 SDK 直连 ThetaData 并轮询当日 Nasdaq Basic 已完成 1m OHLC，凭证不跨入 Rust。每次连接首批必须从 09:30 连续回补，Python 过滤空占位/当前未完成分钟，Rust 再校验时间、OHLC、连续性及已发布前缀；任一失败保持闭锁。Python 从四类严格来源文件生成 EventContext，缺失、陈旧、未来接收时间或关键低置信度输入禁止新开仓；事件文本不进入指令通道。真实凭证小样本 smoke 已通过，完整 RTH soak 仍是现场 Gate，不以 mock 测试替代。
 - 后续决策追加于此并同步 ADR。
 
 ## 10. 暂不实现（第一阶段）

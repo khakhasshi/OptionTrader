@@ -12,9 +12,9 @@ Phase 0/1 的 Rust→Python→React 链路是 HTTP 轮询 + fixture 快照。Pha
 streaming），React↔Python 用 WebSocket；进入交易许可链的 MarketSnapshot 与
 DataHealth 权威唯一在 Rust Market Core。
 
-数据源方面，代码支持 Theta Terminal v3 的股票 TRADE WebSocket 与当日 OHLC REST
-回补；真实 Standard entitlement、字段样本和完整交易日 soak 仍需在运行 Terminal 的
-现场环境验收。
+数据源方面，Python 使用官方 `thetadata` SDK 直接连接 ThetaData 服务器，不依赖本机
+Theta Terminal。SDK 桥接服务轮询当日已完成 OHLC 并通过内部 gRPC 交给 Rust；真实
+Standard 凭证与短区间 QQQ 字段 smoke 已通过，完整交易日 soak 仍需现场验收。
 
 ## 决策
 
@@ -35,15 +35,15 @@ DataHealth 权威唯一在 Rust Market Core。
    RECONCILING；首记录前为 RECONCILING，永不默认 HEALTHY，fail closed。
 
 4. **可插拔数据源**：`ReplaySnapshotSource` 读标准化 NDJSON bar（复用
-   features.rs）确定性回放；`OPTIONTRADER_MARKET_SOURCE=theta` 启用唯一 Theta
-   WebSocket 生产者。实时源订阅 QQQ STOCK/TRADE，严格校验 symbol、状态、sequence、
-   价格和 RTH 时间，再聚合一分钟 OHLCV/VWAP。
+   features.rs）确定性回放；`OPTIONTRADER_MARKET_SOURCE=theta-sdk` 启用唯一 Rust
+   SDK-bridge 消费者。Python `ThetaDataSdkService` 持有官方 SDK 和凭证，只输出 QQQ
+   已完成一分钟 OHLCV/VWAP；Rust 重新校验 symbol/venue、UTC/ET、价格、RTH 和分钟连续性。
 
-5. **盘中启动/重连先回补再放行**：建立 WebSocket 并发送订阅后，请求 Theta v3
-   `/stock/history/ohlc` 的 Nasdaq Basic 当日 09:30 至上一完整分钟 bars；当前分钟消息
-   在 socket 中缓冲。回补必须从 09:30 覆盖到目标分钟，并与已发布前缀完全一致；失败、
-   缺口或冲突均保持 RECONCILING/STALE。回补 records 以 BACKFILL 交付，追平后的新
-   WebSocket bar 才可能为 LIVE。
+5. **盘中启动/重连先回补再放行**：SDK 桥接连接成功后，从 Nasdaq Basic 当日 09:30
+   起轮询至当前分钟；Python 删除 SDK 空占位行并强制排除当前未完成分钟。每条连接的
+   第一批必须标记 backfill，Rust 要求从 09:30 连续且与已发布前缀完全一致；失败、缺口
+   或冲突均保持 RECONCILING/STALE。回补 records 以 BACKFILL 交付，追平后新增的完整
+   minute bar 才可能为 LIVE。
 
 6. **gRPC 与 HTTP 同进程并存**：trading-core-bin 内 axum :8080（Phase 0 REST
    不破坏）+ tonic :50051，tokio::select 并发。
@@ -79,8 +79,8 @@ DataHealth 权威唯一在 Rust Market Core。
 
 ## 影响
 
-- 新增依赖栈：Rust tonic/prost/tokio-stream/tokio-tungstenite/reqwest；Python
-  grpcio/grpcio-tools/protobuf。
+- 新增依赖栈：Rust tonic/prost/tokio-stream；Python
+  grpcio/grpcio-tools/protobuf/thetadata。
 - proto 契约包含 MarketTick/MarketBar、DeliveryPhase、resume cursor 与
   high-watermark；proto 与 jsonschema 各守其边界。
 - 四类事件文件通过严格 JSON Schema/Pydantic 导入，生成 EventContext 并注入

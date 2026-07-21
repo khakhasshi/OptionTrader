@@ -1,7 +1,7 @@
 //! trading-core process entrypoint. Serves HTTP `/health` (contract:
 //! health.json#/$defs/ServiceHealth) and `/market/snapshot` (contract:
 //! market_snapshot.json), plus the gRPC MarketService (StreamMarketSnapshots,
-//! GetDataHealth) backed by deterministic replay or Theta Terminal live data.
+//! GetDataHealth) backed by deterministic replay or ThetaData SDK live data.
 //!
 //! HTTP and gRPC run concurrently in one process. Market DataHealth derives
 //! from the selected source; broker reconciliation remains a Phase 3 concern.
@@ -96,16 +96,14 @@ async fn main() {
         .unwrap_or(50051);
 
     let market_source = env::var("OPTIONTRADER_MARKET_SOURCE").unwrap_or_else(|_| "replay".into());
-    if market_source != "replay" && market_source != "theta" {
-        panic!("OPTIONTRADER_MARKET_SOURCE must be replay or theta");
+    if market_source != "replay" && market_source != "theta-sdk" {
+        panic!("OPTIONTRADER_MARKET_SOURCE must be replay or theta-sdk");
     }
-    let live_service = (market_source == "theta").then(|| {
+    let live_service = (market_source == "theta-sdk").then(|| {
         LiveMarketServiceImpl::new(
             ThetaLiveConfig {
-                url: env::var("THETADATA_WS_URL")
-                    .unwrap_or_else(|_| "ws://127.0.0.1:25520/v1/events".into()),
-                rest_url: env::var("THETADATA_BASE_URL")
-                    .unwrap_or_else(|_| "http://127.0.0.1:25503/v3".into()),
+                endpoint: env::var("THETADATA_SDK_GRPC")
+                    .unwrap_or_else(|_| "http://127.0.0.1:50052".into()),
                 ..ThetaLiveConfig::default()
             },
             replay_config(),

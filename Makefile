@@ -2,7 +2,7 @@
 # JS: npm workspaces | Python: uv | Rust: cargo | DB: PostgreSQL + Alembic
 
 .DEFAULT_GOAL := help
-.PHONY: help setup setup-web setup-api setup-core dev dev-web dev-api dev-core dev-core-theta \
+.PHONY: help setup setup-web setup-api setup-core dev dev-web dev-api dev-core dev-thetadata-sdk dev-core-theta-sdk \
         health build-core test test-contracts test-web test-api test-core test-integration \
         lint lint-web lint-api lint-core \
         contracts gen-py-grpc events-context migrate migrate-down up down clean
@@ -31,7 +31,8 @@ gen-py-grpc: ## 生成 Python gRPC 桩到 app/grpc_gen/ (git 忽略，必须可�
 	bash scripts/gen_python_grpc.sh
 
 dev: ## 本地并行启动 web / application-api / trading-core
-	@echo "分别在独立终端运行: make dev-web / make dev-api / make dev-core"
+	@echo "回放: make dev-web / make dev-api / make dev-core"
+	@echo "Theta SDK: 另启动 make dev-thetadata-sdk / make dev-core-theta-sdk"
 
 dev-web: ## 启动 React 驾驶舱
 	npm --workspace $(WEB_DIR) run dev
@@ -42,8 +43,11 @@ dev-api: gen-py-grpc ## 启动 Python FastAPI
 dev-core: ## 启动 Rust trading-core (HTTP :8080 + gRPC :50051)
 	cd $(CORE_DIR) && cargo run
 
-dev-core-theta: ## 以 Theta Terminal 实时源启动 trading-core（含当日 REST 回补）
-	cd $(CORE_DIR) && OPTIONTRADER_MARKET_SOURCE=theta cargo run
+dev-thetadata-sdk: gen-py-grpc ## 启动官方 ThetaData Python SDK 桥接服务 (:50052)
+	cd $(API_DIR) && uv run python -m app.thetadata_sdk.server
+
+dev-core-theta-sdk: ## 以 ThetaData Python SDK 实时源启动 trading-core
+	cd $(CORE_DIR) && OPTIONTRADER_MARKET_SOURCE=theta-sdk cargo run
 
 health: ## 检查三个服务 health endpoint
 	@echo "web:  http://localhost:5173"
