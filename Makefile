@@ -2,10 +2,10 @@
 # JS: npm workspaces | Python: uv | Rust: cargo | DB: PostgreSQL + Alembic
 
 .DEFAULT_GOAL := help
-.PHONY: help setup setup-web setup-api setup-core dev dev-web dev-api dev-core \
+.PHONY: help setup setup-web setup-api setup-core dev dev-web dev-api dev-core dev-core-theta \
         health build-core test test-contracts test-web test-api test-core test-integration \
         lint lint-web lint-api lint-core \
-        contracts gen-py-grpc migrate migrate-down up down clean
+        contracts gen-py-grpc events-context migrate migrate-down up down clean
 
 WEB_DIR  := apps/web
 API_DIR  := services/application-api
@@ -41,6 +41,9 @@ dev-api: gen-py-grpc ## 启动 Python FastAPI
 
 dev-core: ## 启动 Rust trading-core (HTTP :8080 + gRPC :50051)
 	cd $(CORE_DIR) && cargo run
+
+dev-core-theta: ## 以 Theta Terminal 实时源启动 trading-core（含当日 REST 回补）
+	cd $(CORE_DIR) && OPTIONTRADER_MARKET_SOURCE=theta cargo run
 
 health: ## 检查三个服务 health endpoint
 	@echo "web:  http://localhost:5173"
@@ -83,6 +86,9 @@ lint-core: ## Rust fmt + clippy (all targets)
 
 contracts: ## 生成 Protobuf / JSON Schema / OpenAPI 客户端
 	bash scripts/gen_contracts.sh
+
+events-context: ## 验证当前日期的四类事件输入并生成 EventContext
+	cd $(API_DIR) && uv run python -m app.events.cli --event-dir ../../data/events
 
 migrate: ## Alembic 迁移到最新 (可用 DATABASE_URL 覆盖目标库)
 	cd $(API_DIR) && uv run alembic upgrade head

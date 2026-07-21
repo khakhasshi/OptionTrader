@@ -66,6 +66,13 @@
       ],
       "description": "Contract-compliant Signal derived this frame (enum values, not engine labels)."
     },
+    "event_context": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "event_context.json" }
+      ],
+      "description": "Sourced deterministic event context used by the strategy and trading gate."
+    },
     "risk_flags": {
       "type": "array",
       "items": { "type": "string" },
@@ -74,7 +81,8 @@
   },
   "required": [
     "schema_version", "seq", "session_id", "server_time_utc",
-    "connection", "new_position_allowed", "risk_flags"
+    "connection", "new_position_allowed", "snapshot", "regime", "vol",
+    "signal", "event_context", "risk_flags"
   ],
   "additionalProperties": false
 }

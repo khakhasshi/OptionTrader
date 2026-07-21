@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "as_of_date": "2026-07-17",
+  "source": "Invesco",
+  "source_timestamp_utc": "2026-07-17T22:00:00Z",
+  "received_at_utc": "2026-07-18T01:00:00Z",
+  "confidence": 1.0,
+  "raw_ref": "fixture://invesco/qqq-holdings-20260717",
+  "holdings": [
+    {"symbol":"NVDA","name":"NVIDIA","weight":"0.0900"},
+    {"symbol":"MSFT","name":"Microsoft","weight":"0.0800"},
+    {"symbol":"AAPL","name":"Apple","weight":"0.0750"},
+    {"symbol":"AMZN","name":"Amazon","weight":"0.0550"},
+    {"symbol":"META","name":"Meta","weight":"0.0500"},
+    {"symbol":"AVGO","name":"Broadcom","weight":"0.0450"},
+    {"symbol":"GOOGL","name":"Alphabet A","weight":"0.0400"},
+    {"symbol":"GOOG","name":"Alphabet C","weight":"0.0350"},
+    {"symbol":"TSLA","name":"Tesla","weight":"0.0300"},
+    {"symbol":"COST","name":"Costco","weight":"0.0250"},
+    {"symbol":"NFLX","name":"Netflix","weight":"0.0220"},
+    {"symbol":"PLTR","name":"Palantir","weight":"0.0200"},
+    {"symbol":"AMD","name":"AMD","weight":"0.0190"},
+    {"symbol":"CSCO","name":"Cisco","weight":"0.0180"},
+    {"symbol":"TMUS","name":"T-Mobile","weight":"0.0170"},
+    {"symbol":"LIN","name":"Linde","weight":"0.0160"},
+    {"symbol":"PEP","name":"PepsiCo","weight":"0.0150"},
+    {"symbol":"INTU","name":"Intuit","weight":"0.0140"},
+    {"symbol":"AMGN","name":"Amgen","weight":"0.0130"},
+    {"symbol":"QCOM","name":"Qualcomm","weight":"0.0120"}
+  ]
+}

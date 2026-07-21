@@ -13,6 +13,31 @@ const SNAPSHOT = {
   data_health: "HEALTHY",
 };
 
+const EVENT_CONTEXT = {
+  schema_version: "1.0",
+  event_context_id: "evtctx_test",
+  trading_date: "2026-07-20",
+  generated_at_utc: "2026-07-20T13:45:00Z",
+  available: true,
+  source_documents: ["macro", "holdings", "earnings", "news"].map((category) => ({
+    category,
+    source: "test-source",
+    source_timestamp_utc: "2026-07-20T13:40:00Z",
+    received_at_utc: "2026-07-20T13:41:00Z",
+    confidence: 1,
+    raw_ref: `fixture://${category}`,
+  })),
+  event_day_type: "Normal",
+  macro_events: [],
+  earnings_events: [],
+  news_events: [],
+  qqq_weighted_event_score: "0.0000",
+  minutes_to_major_event: 1440,
+  event_released: false,
+  risk_flags: ["NO_NAKED_0DTE"],
+  deterministic_context_summary: "day=Normal; fixture",
+};
+
 function frame(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     schema_version: "1.0",
@@ -31,6 +56,7 @@ function frame(overrides: Record<string, unknown> = {}): Record<string, unknown>
       reason: ["ok"],
       rule_version: "r1",
     },
+    event_context: EVENT_CONTEXT,
     risk_flags: [],
     ...overrides,
   };
@@ -53,6 +79,7 @@ describe("parseCockpitState", () => {
         regime: null,
         vol: null,
         signal: null,
+        event_context: null,
         risk_flags: ["stream ended"],
       }),
     );
@@ -82,6 +109,17 @@ describe("parseCockpitState", () => {
     const parsed = parseCockpitState(frame({ signal: { strategy: "Bogus" } }));
     expect(parsed).not.toBeNull();
     expect(parsed?.signal).toBeNull();
+  });
+
+  it("fails the trading gate when event context is invalid or unavailable", () => {
+    const invalid = parseCockpitState(frame({ event_context: { available: true } }));
+    expect(invalid?.event_context).toBeNull();
+    expect(cockpitCanTrade({ frame: invalid, brokerAllowed: true })).toBe(false);
+
+    const unavailable = parseCockpitState(
+      frame({ event_context: { ...EVENT_CONTEXT, available: false } }),
+    );
+    expect(cockpitCanTrade({ frame: unavailable, brokerAllowed: true })).toBe(false);
   });
 
   it("rejects an unknown regime enum inside a signal (drops signal)", () => {

@@ -11,6 +11,7 @@ pub mod features;
 pub mod health;
 pub mod model;
 pub mod replay;
+pub mod theta;
 
 pub use features::{
     assess_bar_health, atm_straddle, bid_ask_spread, historical_volatility, hv20_hv60,
@@ -18,7 +19,11 @@ pub use features::{
 };
 pub use health::{DataHealthMachine, DataHealthStateRecord, HealthConfig};
 pub use model::{normalize_bars, MarketBar, OptionQuote, OptionRight, SESSION_OPEN_MINUTE_ET};
-pub use replay::{LiveThetaSource, ReplayBar, ReplayConfig, ReplaySnapshotSource, SnapshotSource};
+pub use replay::{ReplayBar, ReplayConfig, ReplaySnapshotSource, SnapshotSource};
+pub use theta::{
+    parse_ohlc_backfill, parse_stream_message, subscribe_trade_request, ThetaBarAggregator,
+    ThetaStreamEvent,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeatureError {

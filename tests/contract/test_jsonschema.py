@@ -122,6 +122,7 @@ def test_cockpit_state_allows_null_derivations_when_fail_closed():
         "regime": None,
         "vol": None,
         "signal": None,
+        "event_context": None,
         "risk_flags": ["upstream stream disconnected"],
     }
     v = Draft202012Validator(res["cockpit_state.json"].contents, registry=reg)

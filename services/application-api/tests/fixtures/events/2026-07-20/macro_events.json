@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "source": "Federal Reserve and BLS calendars",
+  "source_timestamp_utc": "2026-07-20T11:55:00Z",
+  "received_at_utc": "2026-07-20T12:00:00Z",
+  "confidence": 1.0,
+  "raw_ref": "fixture://official-macro-calendars/2026-07-20",
+  "coverage_start": "2026-07-20",
+  "coverage_end": "2026-07-24",
+  "events": [
+    {
+      "event_id": "macro_fomc_20260720",
+      "name": "FOMC policy statement",
+      "event_kind": "FOMC",
+      "scheduled_at_utc": "2026-07-20T14:00:00Z",
+      "importance": "HIGH",
+      "confirmed": true,
+      "source": "Federal Reserve",
+      "source_timestamp_utc": "2026-07-17T16:00:00Z",
+      "received_at_utc": "2026-07-20T12:00:00Z",
+      "confidence": 1.0,
+      "raw_ref": "fixture://federal-reserve/fomc-20260720"
+    }
+  ]
+}

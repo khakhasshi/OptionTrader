@@ -92,6 +92,11 @@ export function Cockpit() {
           ok={Boolean(streamLive)}
         />
         <Badge label="Data Health" value={dataHealth} ok={dataHealth === "HEALTHY"} />
+        <Badge
+          label="Event Context"
+          value={frame?.event_context?.available ? frame.event_context.event_day_type : "UNAVAILABLE"}
+          ok={frame?.event_context?.available === true}
+        />
         <Badge label="Broker Health" value={brokerHealth} ok={brokerHealth === "HEALTHY"} />
         <Badge
           label="Reconciliation"
@@ -99,6 +104,20 @@ export function Cockpit() {
           ok={reconciled}
         />
         <Badge label="Trading" value={canTrade ? "ALLOWED" : "No Trade"} ok={canTrade} />
+      </section>
+
+      <h2 style={{ marginTop: 28, fontSize: 18 }}>Event Context</h2>
+      <section style={{ display: "flex", gap: 16, marginTop: 12, flexWrap: "wrap" }}>
+        <Field label="Event Day" value={frame?.event_context?.event_day_type ?? "—"} />
+        <Field
+          label="Next Major Event"
+          value={
+            frame?.event_context?.minutes_to_major_event == null
+              ? "UNKNOWN"
+              : `${frame.event_context.minutes_to_major_event} min`
+          }
+        />
+        <Field label="Weighted Risk" value={frame?.event_context?.qqq_weighted_event_score ?? "—"} />
       </section>
 
       <h2 style={{ marginTop: 28, fontSize: 18 }}>Decision</h2>

@@ -11,7 +11,8 @@ row already exists (replay re-runs must not duplicate or error).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from typing import Any
 
 from sqlalchemy import insert, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -19,7 +20,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 
 from app.persistence.serialize import SignalContext, build_signal_rows
-from app.persistence.tables import audit_events, signals
+from app.persistence.tables import audit_events, event_contexts, signals
+from app.events import EventContext
 from app.regime import RegimeState
 from app.strategy import StrategyDecision
 from app.vol import VolState
@@ -83,4 +85,69 @@ def persist_signal(
     return True
 
 
-__all__ = ["persist_signal"]
+def persist_event_context(engine: Engine, session_id: str, context: EventContext) -> bool:
+    """Persist EventContext + immutable audit event in one idempotent transaction."""
+    occurred = datetime.fromisoformat(context.generated_at_utc.replace("Z", "+00:00"))
+    created = _now_utc()
+    payload: dict[str, Any] = context.model_dump(mode="json")
+    row = {
+        "event_id": context.event_context_id,
+        "session_id": session_id,
+        "trading_date": date.fromisoformat(context.trading_date),
+        "category": context.event_day_type,
+        "occurred_at_utc": occurred,
+        "source": "event-context-layer",
+        "payload": payload,
+        "created_at_utc": created,
+    }
+    audit = {
+        "event_id": f"audit_{context.event_context_id}",
+        "session_id": session_id,
+        "occurred_at_utc": occurred,
+        "actor": "application-service",
+        "action": "EVENT_CONTEXT_BUILT",
+        "entity_type": "EventContext",
+        "entity_id": context.event_context_id,
+        "from_status": None,
+        "to_status": "AVAILABLE" if context.available else "UNAVAILABLE",
+        "payload": payload,
+        "created_at_utc": created,
+    }
+
+    with engine.begin() as conn:
+        if conn.dialect.name == "postgresql":
+            inserted = (
+                conn.execute(
+                    postgresql_insert(event_contexts)
+                    .values(**row)
+                    .on_conflict_do_nothing(index_elements=[event_contexts.c.event_id])
+                    .returning(event_contexts.c.event_id)
+                ).scalar_one_or_none()
+                is not None
+            )
+        elif conn.dialect.name == "sqlite":
+            inserted = (
+                conn.execute(
+                    sqlite_insert(event_contexts)
+                    .values(**row)
+                    .on_conflict_do_nothing(index_elements=[event_contexts.c.event_id])
+                ).rowcount
+                == 1
+            )
+        else:
+            existing = conn.execute(
+                select(event_contexts.c.event_id).where(
+                    event_contexts.c.event_id == context.event_context_id
+                )
+            ).first()
+            if existing is not None:
+                return False
+            conn.execute(insert(event_contexts).values(**row))
+            inserted = True
+        if not inserted:
+            return False
+        conn.execute(audit_events.insert().values(**audit))
+    return True
+
+
+__all__ = ["persist_event_context", "persist_signal"]

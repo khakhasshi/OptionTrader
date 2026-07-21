@@ -57,5 +57,27 @@
     "reason": ["Trend + IV cheap/fair + breakout in allowed window"],
     "rule_version": "phase1-2026-07-21"
   },
+  "event_context": {
+    "schema_version": "1.0",
+    "event_context_id": "evtctx_2026-07-20_sample",
+    "trading_date": "2026-07-20",
+    "generated_at_utc": "2026-07-20T13:45:00Z",
+    "available": true,
+    "source_documents": [
+      {"category":"macro","source":"Federal Reserve/BLS","source_timestamp_utc":"2026-07-20T12:00:00Z","received_at_utc":"2026-07-20T12:01:00Z","confidence":1.0,"raw_ref":"fixture://macro"},
+      {"category":"holdings","source":"Invesco","source_timestamp_utc":"2026-07-18T00:00:00Z","received_at_utc":"2026-07-18T00:01:00Z","confidence":1.0,"raw_ref":"fixture://holdings"},
+      {"category":"earnings","source":"Issuer IR","source_timestamp_utc":"2026-07-20T12:00:00Z","received_at_utc":"2026-07-20T12:01:00Z","confidence":1.0,"raw_ref":"fixture://earnings"},
+      {"category":"news","source":"SEC/Longbridge","source_timestamp_utc":"2026-07-20T13:40:00Z","received_at_utc":"2026-07-20T13:41:00Z","confidence":1.0,"raw_ref":"fixture://news"}
+    ],
+    "event_day_type": "Normal",
+    "macro_events": [],
+    "earnings_events": [],
+    "news_events": [],
+    "qqq_weighted_event_score": "0.0000",
+    "minutes_to_major_event": 1440,
+    "event_released": false,
+    "risk_flags": ["NO_NAKED_0DTE"],
+    "deterministic_context_summary": "day=Normal; fixture"
+  },
   "risk_flags": []
 }

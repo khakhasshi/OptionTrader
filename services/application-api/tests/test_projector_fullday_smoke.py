@@ -34,6 +34,7 @@ from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
 from app.realtime.projector import CockpitProjector, ProjectorConfig
+from tests.event_support import available_event_context
 
 _SCHEMA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
@@ -103,6 +104,7 @@ def _tick(i: int, close: float, health: str, minute_offset: int = 0) -> dict[str
         "bar": bar,
         "delivery_phase": "LIVE",
         "high_watermark_sequence": i + 1,
+        "event_context": available_event_context(ts_utc),
     }
 
 

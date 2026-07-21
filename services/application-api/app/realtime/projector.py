@@ -18,7 +18,9 @@ from datetime import datetime, time, timezone
 from typing import Any
 
 import pandas as pd
+from pydantic import ValidationError
 
+from app.events import EventContext
 from app.persistence.serialize import SignalContext, build_signal_contract
 from app.regime import RegimeInputs, RegimeState
 from app.regime import evaluate as regime_evaluate
@@ -89,6 +91,7 @@ class CockpitProjector:
             "regime": None,
             "vol": None,
             "signal": None,
+            "event_context": None,
             "risk_flags": [],
         }
 
@@ -117,6 +120,7 @@ class CockpitProjector:
         delivery_phase = tick.get("delivery_phase", "UNSPECIFIED")
         high_watermark = tick.get("high_watermark_sequence")
         market_seq = snapshot.get("sequence_number")
+        event_context, event_error = _event_context(tick.get("event_context"), bar)
 
         if delivery_phase not in {"BACKFILL", "LIVE"}:
             frame = self._base_frame(server_time)
@@ -189,7 +193,16 @@ class CockpitProjector:
             decision = strategy_decide(
                 regime,
                 vol,
-                StrategyInputs(now_et=now_et, data_healthy=data_health == "HEALTHY"),
+                StrategyInputs(
+                    now_et=now_et,
+                    data_healthy=data_health == "HEALTHY"
+                    and event_context is not None
+                    and event_context.available,
+                    minutes_to_major_event=(
+                        event_context.minutes_to_major_event if event_context else None
+                    ),
+                    event_released=event_context.event_released if event_context else False,
+                ),
             )
             signal = self._signal(snapshot, regime, decision)
         except (ValueError, KeyError) as exc:
@@ -216,8 +229,18 @@ class CockpitProjector:
         if reconciling:
             connection = "STALE"
 
-        allowed = data_health == "HEALTHY" and connection == "LIVE" and not reconciling
+        event_available = event_context is not None and event_context.available
+        allowed = (
+            data_health == "HEALTHY"
+            and connection == "LIVE"
+            and not reconciling
+            and event_available
+        )
         risk_flags = list(decision.risk_notes)
+        if event_context is not None:
+            risk_flags.extend(event_context.risk_flags)
+        if not event_available:
+            risk_flags.append(event_error or "event context unavailable; new positions blocked")
         if transport_reconciling:
             risk_flags.append(
                 f"backfill in progress: market_seq={market_seq}, "
@@ -238,6 +261,9 @@ class CockpitProjector:
         frame["regime"] = _regime_dict(regime)
         frame["vol"] = _vol_dict(vol)
         frame["signal"] = signal
+        frame["event_context"] = (
+            event_context.model_dump(mode="json") if event_context is not None else None
+        )
         frame["risk_flags"] = risk_flags
         return frame
 
@@ -279,6 +305,21 @@ def _utc_now_iso() -> str:
 def _parse_et_time(timestamp_et: str) -> time:
     result: time = pd.Timestamp(timestamp_et).time()
     return result
+
+
+def _event_context(raw: Any, bar: dict[str, Any]) -> tuple[EventContext | None, str | None]:
+    if raw is None:
+        return None, "event context missing; new positions blocked"
+    try:
+        context = EventContext.model_validate(raw)
+    except ValidationError as exc:
+        return None, f"event context invalid ({exc.error_count()} errors); new positions blocked"
+    trading_date = str(bar.get("timestamp_et", ""))[:10]
+    if context.trading_date != trading_date:
+        return None, "event context trading date mismatch; new positions blocked"
+    if not context.available:
+        return context, "event context unavailable; new positions blocked"
+    return context, None
 
 
 def _regime_dict(regime: RegimeState) -> dict[str, Any]:

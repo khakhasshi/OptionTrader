@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     Column,
+    Date,
     DateTime,
     MetaData,
     Table,
@@ -61,4 +62,19 @@ audit_events = Table(
     schema="audit",
 )
 
-__all__ = ["metadata", "signals", "audit_events"]
+# events.event_contexts — sourced event records and deterministic daily context.
+event_contexts = Table(
+    "event_contexts",
+    metadata,
+    Column("event_id", Text, primary_key=True),
+    Column("session_id", Text),
+    Column("trading_date", Date, nullable=False),
+    Column("category", Text, nullable=False),
+    Column("occurred_at_utc", DateTime(timezone=True), nullable=False),
+    Column("source", Text, nullable=False),
+    Column("payload", _JSON, nullable=False),
+    Column("created_at_utc", DateTime(timezone=True)),
+    schema="events",
+)
+
+__all__ = ["metadata", "signals", "audit_events", "event_contexts"]

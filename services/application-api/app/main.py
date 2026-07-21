@@ -1,9 +1,8 @@
 """OptionTrader Application Service entrypoint.
 
-Phase 0: health check + skeleton + fail-closed proxies to the Rust trading
-core. Strategy/regime/vol/replay/llm modules land in later phases (see
-PROJECT_PLAN.md). This service never bypasses the Rust Risk & Execution Gateway
-to place orders.
+Provides fail-closed proxies to Rust trading-core, the Phase 2 EventContext API,
+and the per-session real-time cockpit stream. This service never bypasses the
+Rust Risk & Execution Gateway to place orders.
 
 The two proxy endpoints validate the upstream response against strict Pydantic
 models that mirror the JSON Schema contracts. An unreachable core, invalid
@@ -31,7 +30,7 @@ from pydantic import (
 )
 
 from app.realtime.projector import ProjectorConfig
-from app.realtime.session import get_hub, latest_frame
+from app.realtime.session import current_event_context, get_hub, latest_frame
 
 __all__ = ["app", "httpx"]
 
@@ -224,9 +223,18 @@ def cockpit_state(session_id: str) -> JSONResponse:
             "regime": None,
             "vol": None,
             "signal": None,
+            "event_context": None,
             "risk_flags": ["no frames yet for session"],
         }
     return JSONResponse(status_code=200, content=frame)
+
+
+@app.get("/api/v1/events/context")
+@app.get("/api/v1/events/today")
+def event_context() -> JSONResponse:
+    """Current deterministic EventContext; unavailable inputs remain HTTP 200 but fail closed."""
+    context = current_event_context()
+    return JSONResponse(status_code=200, content=context.model_dump(mode="json"))
 
 
 @app.websocket("/api/v1/stream/cockpit")

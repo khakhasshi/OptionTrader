@@ -22,6 +22,8 @@ Fail closed: upstream end or error publishes a terminal DISCONNECTED frame.
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from datetime import datetime, timezone
@@ -29,6 +31,7 @@ from typing import Any
 
 import grpc
 
+from app.events import EventContext, EventContextStore, unavailable_event_context
 from app.realtime.client import stream_ticks
 from app.realtime.projector import CockpitProjector, ProjectorConfig
 
@@ -39,11 +42,15 @@ UpstreamEvent = tuple[str, Any]
 # the source must replay every record with a higher sequence so a reconnect
 # backfills the gap instead of skipping it (Phase 2 review P0).
 AsyncTickSource = Callable[[str, int], AsyncIterator[UpstreamEvent]]
+EventContextProvider = Callable[[datetime], EventContext]
 
 # session_id -> latest frame, for REST recovery on reconnect.
 _LATEST: dict[str, dict[str, Any]] = {}
 # session_id -> live hub.
 _HUBS: dict[str, "SessionHub"] = {}
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_EVENT_DIR = Path(os.getenv("OPTIONTRADER_EVENT_DIR", _REPO_ROOT / "data" / "events"))
+_EVENT_STORE = EventContextStore(_EVENT_DIR)
 
 
 def latest_frame(session_id: str) -> dict[str, Any] | None:
@@ -64,6 +71,33 @@ def _rpc_code(exc: grpc.RpcError) -> str:
         except Exception:  # noqa: BLE001
             return "UNKNOWN"
     return "UNKNOWN"
+
+
+def _default_event_context(now_utc: datetime) -> EventContext:
+    return _EVENT_STORE.get(now_utc)
+
+
+def _stream_silence_seconds() -> float:
+    raw = os.getenv("OPTIONTRADER_STREAM_SILENCE_SECONDS", "90")
+    try:
+        return max(float(raw), 0.01)
+    except ValueError:
+        return 90.0
+
+
+def current_event_context(now_utc: datetime | None = None) -> EventContext:
+    """Return the current sourced context for API inspection and readiness checks."""
+    return _default_event_context(now_utc or datetime.now(timezone.utc))
+
+
+def _tick_time(tick: dict[str, Any]) -> datetime:
+    raw = (tick.get("snapshot") or {}).get("occurred_at_utc")
+    if not isinstance(raw, str):
+        return datetime.now(timezone.utc)
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return datetime.now(timezone.utc)
 
 
 async def _grpc_source(session_id: str, resume_after_sequence: int) -> AsyncIterator[UpstreamEvent]:
@@ -90,16 +124,25 @@ async def _grpc_source(session_id: str, resume_after_sequence: int) -> AsyncIter
             return
 
 
-# PLACEHOLDER_HUB
-
-
 class SessionHub:
     """One projector + one upstream pump for a session, fanned out to N subs."""
 
-    def __init__(self, config: ProjectorConfig, source: AsyncTickSource | None = None) -> None:
+    def __init__(
+        self,
+        config: ProjectorConfig,
+        source: AsyncTickSource | None = None,
+        event_provider: EventContextProvider | None = None,
+        stream_silence_seconds: float | None = None,
+    ) -> None:
         self._config = config
         self._source = source or _grpc_source
         self._projector = CockpitProjector(config=config)
+        self._event_provider = event_provider or _default_event_context
+        self._stream_silence_seconds = (
+            stream_silence_seconds
+            if stream_silence_seconds is not None
+            else _stream_silence_seconds()
+        )
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._latest: dict[str, Any] | None = None
         self._stopped = False
@@ -130,13 +173,30 @@ class SessionHub:
             try:
                 # Resume after the last contiguously-consumed record so the
                 # upstream backfills any gap opened while we were disconnected.
-                async for kind, payload in self._source(
-                    self._config.session_id, self._last_market_seq
-                ):
+                source = self._source(self._config.session_id, self._last_market_seq).__aiter__()
+                while True:
+                    try:
+                        kind, payload = await asyncio.wait_for(
+                            anext(source), timeout=self._stream_silence_seconds
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError:
+                        ended_reason = f"upstream silent for {self._stream_silence_seconds:g}s"
+                        break
                     if self._stopped:
                         return
                     if kind == "tick":
-                        frame = self._projector.apply(payload)
+                        tick = dict(payload)
+                        tick_time = _tick_time(tick)
+                        try:
+                            event_context = self._event_provider(tick_time)
+                        except Exception as exc:  # noqa: BLE001 — event faults fail closed
+                            event_context = unavailable_event_context(
+                                tick_time, f"event provider fault: {exc}"
+                            )
+                        tick["event_context"] = event_context.model_dump(mode="json")
+                        frame = self._projector.apply(tick)
                         self._track_market_seq(frame)
                         self._publish(frame)
                         backoff = self._backoff_base  # healthy data resets backoff
@@ -198,13 +258,23 @@ class SessionHub:
             self._subscribers.discard(queue)
 
 
-def get_hub(config: ProjectorConfig, source: AsyncTickSource | None = None) -> SessionHub:
+def get_hub(
+    config: ProjectorConfig,
+    source: AsyncTickSource | None = None,
+    event_provider: EventContextProvider | None = None,
+    stream_silence_seconds: float | None = None,
+) -> SessionHub:
     """Return the session's hub. A reconnecting client reuses the same live hub,
     so its projector's seq stays monotonic across reconnects. A hub that was
     explicitly stopped is replaced with a fresh one."""
     hub = _HUBS.get(config.session_id)
     if hub is None or hub._stopped:  # noqa: SLF001 — internal lifecycle check
-        hub = SessionHub(config, source=source)
+        hub = SessionHub(
+            config,
+            source=source,
+            event_provider=event_provider,
+            stream_silence_seconds=stream_silence_seconds,
+        )
         _HUBS[config.session_id] = hub
     return hub
 

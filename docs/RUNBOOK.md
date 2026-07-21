@@ -31,3 +31,24 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
 
 真实实时源接入前应在传输契约中引入显式 `session_epoch` 或等价的数据世代标识。届时
 只有经过身份校验的新 epoch 才能重置 sequence/watermark；不能仅凭数值回退推断重启。
+
+## ThetaData 实时源
+
+1. 启动 Theta Terminal v3，确认本机 `25503`（REST）和 `25520`（WebSocket）可达。
+2. 配置 `THETADATA_BASE_URL=http://127.0.0.1:25503/v3`、
+   `THETADATA_WS_URL=ws://127.0.0.1:25520/v1/events`，运行 `make dev-core-theta`。
+3. 盘中启动或重连时，必须先看到 REST 回补从 09:30 覆盖至上一完整分钟；回补期间
+   Cockpit 显示 STALE/No Trade。缺口、HTTP 错误、前缀冲突或 entitlement 错误不得
+   手工改健康状态解锁。
+4. `GetDataHealth`、`/health` 与 Cockpit 必须一致；市场流持续 90 秒无 tick 时 Python
+   发布 DISCONNECTED 并重连，Rust 也按自身阈值将健康降级。
+
+当前仓库以官方消息形状和本地 mock Terminal 覆盖自动测试。真实账号 entitlement、
+一份脱敏原始字段样本以及完整 RTH 连续运行需要现场执行，未执行前不得作为 paper/live
+上线证据。
+
+## 事件上下文日常导入
+
+盘前将四类文件放入 `data/events/YYYY-MM-DD/`，运行 `make events-context`。退出码 2、
+`available=false` 或任一来源检查失败时保持 No Trade。需要审计落库时使用 CLI 的
+`--persist`；它会在同一事务写入 `events.event_contexts` 与 `audit.audit_events`。

@@ -26,6 +26,31 @@ const SNAPSHOT = {
   data_health: "HEALTHY",
 };
 
+const EVENT_CONTEXT = {
+  schema_version: "1.0",
+  event_context_id: "evtctx_test",
+  trading_date: "2026-07-20",
+  generated_at_utc: "2026-07-20T13:45:00Z",
+  available: true,
+  source_documents: ["macro", "holdings", "earnings", "news"].map((category) => ({
+    category,
+    source: "test-source",
+    source_timestamp_utc: "2026-07-20T13:40:00Z",
+    received_at_utc: "2026-07-20T13:41:00Z",
+    confidence: 1,
+    raw_ref: `fixture://${category}`,
+  })),
+  event_day_type: "Normal",
+  macro_events: [],
+  earnings_events: [],
+  news_events: [],
+  qqq_weighted_event_score: "0.0000",
+  minutes_to_major_event: 1440,
+  event_released: false,
+  risk_flags: ["NO_NAKED_0DTE"],
+  deterministic_context_summary: "day=Normal; fixture",
+};
+
 // A LIVE cockpit frame (data/decision dimension) mirroring cockpit_state.json.
 function frame(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -49,6 +74,7 @@ function frame(overrides: Record<string, unknown> = {}): Record<string, unknown>
       reason: ["Trend + IV cheap/fair + breakout in allowed window"],
       rule_version: "phase1-test",
     },
+    event_context: EVENT_CONTEXT,
     risk_flags: [],
     ...overrides,
   };

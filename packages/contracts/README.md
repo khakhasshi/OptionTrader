@@ -43,3 +43,5 @@ rule_version     生成时的规则包版本
 ## 首批冻结契约 (schema_version 1.0)
 
 MarketSnapshot、OptionSnapshot、Signal、CandidateTradePlan、EventContext、DataHealth、BrokerHealth。
+Phase 2 事件输入另冻结 `macro_events`、`qqq_holdings`、`qqq_top20_earnings`、
+`qqq_top20_news_events` 四个严格契约；未知字段、缺来源元数据或错误枚举均拒绝导入。

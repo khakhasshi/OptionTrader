@@ -239,6 +239,34 @@ def test_upstream_error_publishes_disconnected_frame() -> None:
     assert frames[-1]["new_position_allowed"] is False
 
 
+def test_upstream_silence_publishes_disconnected_and_reconnects() -> None:
+    class _SilentSource:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(self, _sid: str, _resume: int = 0) -> AsyncIterator[tuple[str, Any]]:
+            self.calls += 1
+            await asyncio.sleep(1)
+            yield ("end", "unreachable")
+
+    async def run() -> tuple[dict[str, Any], int]:
+        source = _SilentSource()
+        hub = SessionHub(_config("silent"), source=source, stream_silence_seconds=0.02)
+        gen = hub.subscribe()
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=1)
+        await asyncio.sleep(0.08)
+        calls = source.calls
+        await gen.aclose()
+        hub.stop()
+        return frame, calls
+
+    frame, calls = asyncio.run(run())
+    assert frame["connection"] == "DISCONNECTED"
+    assert frame["new_position_allowed"] is False
+    assert "upstream silent" in frame["risk_flags"][0]
+    assert calls >= 2
+
+
 def test_hub_reconnects_after_upstream_end_with_higher_seq() -> None:
     """Review P1: the same SessionHub must reconnect after upstream end/error,
     keep its projector, and resume LIVE at a strictly higher seq."""

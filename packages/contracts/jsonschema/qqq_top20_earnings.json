@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/qqq_top20_earnings.json",
+  "title": "QqqTop20EarningsDocument",
+  "$defs": {
+    "earningsEvent": {
+      "type": "object",
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1 },
+        "symbol": { "type": "string", "pattern": "^[A-Z][A-Z0-9.-]*$" },
+        "scheduled_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "timing": { "type": "string", "enum": ["BMO", "AMC", "DURING_MARKET", "UNKNOWN"] },
+        "confirmed": { "type": "boolean" },
+        "source": { "type": "string", "minLength": 1 },
+        "source_timestamp_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "received_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "raw_ref": { "type": "string", "minLength": 1 }
+      },
+      "required": ["event_id", "symbol", "scheduled_at_utc", "timing", "confirmed", "source", "source_timestamp_utc", "received_at_utc", "confidence", "raw_ref"],
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "source": { "type": "string", "minLength": 1 },
+    "source_timestamp_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "received_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "raw_ref": { "type": "string", "minLength": 1 },
+    "coverage_start": { "type": "string", "format": "date" },
+    "coverage_end": { "type": "string", "format": "date" },
+    "events": { "type": "array", "items": { "$ref": "#/$defs/earningsEvent" } }
+  },
+  "required": ["schema_version", "source", "source_timestamp_utc", "received_at_utc", "confidence", "raw_ref", "coverage_start", "coverage_end", "events"],
+  "additionalProperties": false
+}

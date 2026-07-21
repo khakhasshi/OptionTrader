@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/macro_events.json",
+  "title": "MacroEventsDocument",
+  "$defs": {
+    "macroEvent": {
+      "type": "object",
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "event_kind": { "type": "string", "enum": ["FOMC", "CPI", "PCE", "NFP", "GDP", "OTHER"] },
+        "scheduled_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "importance": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH"] },
+        "confirmed": { "type": "boolean" },
+        "source": { "type": "string", "minLength": 1 },
+        "source_timestamp_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "received_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "raw_ref": { "type": "string", "minLength": 1 }
+      },
+      "required": ["event_id", "name", "event_kind", "scheduled_at_utc", "importance", "confirmed", "source", "source_timestamp_utc", "received_at_utc", "confidence", "raw_ref"],
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "source": { "type": "string", "minLength": 1 },
+    "source_timestamp_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "received_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "raw_ref": { "type": "string", "minLength": 1 },
+    "coverage_start": { "type": "string", "format": "date" },
+    "coverage_end": { "type": "string", "format": "date" },
+    "events": { "type": "array", "items": { "$ref": "#/$defs/macroEvent" } }
+  },
+  "required": ["schema_version", "source", "source_timestamp_utc", "received_at_utc", "confidence", "raw_ref", "coverage_start", "coverage_end", "events"],
+  "additionalProperties": false
+}

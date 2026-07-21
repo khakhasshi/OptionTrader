@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "source": "Issuer IR calendars",
+  "source_timestamp_utc": "2026-07-20T12:00:00Z",
+  "received_at_utc": "2026-07-20T12:05:00Z",
+  "confidence": 1.0,
+  "raw_ref": "fixture://issuer-ir/qqq-top20-2026-07-20",
+  "coverage_start": "2026-07-20",
+  "coverage_end": "2026-07-24",
+  "events": [
+    {
+      "event_id": "earn_nvda_20260720",
+      "symbol": "NVDA",
+      "scheduled_at_utc": "2026-07-20T20:10:00Z",
+      "timing": "AMC",
+      "confirmed": true,
+      "source": "NVIDIA IR",
+      "source_timestamp_utc": "2026-07-10T20:00:00Z",
+      "received_at_utc": "2026-07-20T12:05:00Z",
+      "confidence": 1.0,
+      "raw_ref": "fixture://nvidia-ir/earnings-20260720"
+    }
+  ]
+}

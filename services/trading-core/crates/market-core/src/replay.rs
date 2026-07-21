@@ -4,9 +4,10 @@
 //! authority feeding the gRPC stream. No wall clock, no RNG: identical input
 //! yields an identical snapshot sequence.
 //!
-//! `SnapshotSource` abstracts the origin so the live ThetaData adapter can slot
-//! in behind the same interface once entitlement is verified; until then
-//! `LiveThetaSource` fails closed with `Unavailable`.
+//! `SnapshotSource` owns finite deterministic replay. The asynchronous ThetaData
+//! WebSocket adapter lives in `theta.rs` and feeds the runtime one finalized bar
+//! at a time; forcing a live stream through this finite interface would hide
+//! disconnect/reconnect semantics.
 
 use crate::features::{opening_range, session_vwap};
 use crate::health::{DataHealthMachine, HealthConfig};
@@ -201,18 +202,6 @@ fn worst(a: DataHealth, b: DataHealth) -> DataHealth {
     }
 }
 
-/// Live ThetaData snapshot source. Interface placeholder until real-time
-/// entitlement + field mapping are verified (TASKS.md). Fails closed.
-pub struct LiveThetaSource;
-
-impl SnapshotSource for LiveThetaSource {
-    fn snapshots(&self) -> Result<Vec<MarketSnapshot>, FeatureError> {
-        Err(FeatureError::InvalidArgument(
-            "live ThetaData source not yet entitled/verified",
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,11 +309,6 @@ mod tests {
             .join("\n");
         let src = ReplaySnapshotSource::from_ndjson(&ndjson, cfg(2)).unwrap();
         assert_eq!(src.snapshots().unwrap().len(), 4);
-    }
-
-    #[test]
-    fn live_source_fails_closed() {
-        assert!(LiveThetaSource.snapshots().is_err());
     }
 
     #[test]

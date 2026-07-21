@@ -27,10 +27,13 @@ from app.persistence import (
     audit_events,
     build_signal_contract,
     build_signal_rows,
+    event_contexts,
     metadata,
     persist_signal,
+    persist_event_context,
     signals,
 )
+from app.events import unavailable_event_context
 from app.regime import CHAOS, EVENT, NO_TRADE as REGIME_NO_TRADE, RANGE, TREND, RegimeState
 from app.strategy import (
     EVENT_VOL_CRUSH,
@@ -255,10 +258,32 @@ def engine() -> Engine:
         cur = dbapi_conn.cursor()
         cur.execute("ATTACH DATABASE ':memory:' AS trading")
         cur.execute("ATTACH DATABASE ':memory:' AS audit")
+        cur.execute("ATTACH DATABASE ':memory:' AS events")
         cur.close()
 
     metadata.create_all(eng)
     return eng
+
+
+def test_persist_event_context_writes_context_and_audit_idempotently(engine: Engine) -> None:
+    context = unavailable_event_context(
+        datetime(2026, 7, 20, 13, 45, tzinfo=UTC), "calendar not loaded"
+    )
+    assert persist_event_context(engine, "sess-events", context) is True
+    assert persist_event_context(engine, "sess-events", context) is False
+
+    with engine.connect() as conn:
+        event_rows = conn.execute(select(event_contexts)).mappings().all()
+        audits = (
+            conn.execute(select(audit_events).where(audit_events.c.action == "EVENT_CONTEXT_BUILT"))
+            .mappings()
+            .all()
+        )
+    assert len(event_rows) == 1
+    assert event_rows[0]["category"] == "HighRisk"
+    assert event_rows[0]["payload"]["available"] is False
+    assert len(audits) == 1
+    assert audits[0]["to_status"] == "UNAVAILABLE"
 
 
 def test_persist_writes_signal_and_audit(engine: Engine) -> None:

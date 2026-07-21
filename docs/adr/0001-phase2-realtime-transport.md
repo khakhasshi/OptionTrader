@@ -12,8 +12,9 @@ Phase 0/1 的 Rust→Python→React 链路是 HTTP 轮询 + fixture 快照。Pha
 streaming），React↔Python 用 WebSocket；进入交易许可链的 MarketSnapshot 与
 DataHealth 权威唯一在 Rust Market Core。
 
-数据源方面，TASKS.md 记录 ThetaData 实时 entitlement/字段映射尚未验收，当前为
-研究/开发环境。
+数据源方面，代码支持 Theta Terminal v3 的股票 TRADE WebSocket 与当日 OHLC REST
+回补；真实 Standard entitlement、字段样本和完整交易日 soak 仍需在运行 Terminal 的
+现场环境验收。
 
 ## 决策
 
@@ -33,27 +34,33 @@ DataHealth 权威唯一在 Rust Market Core。
    （间隔/乱序/断流/重连）驱动 HEALTHY→DEGRADED→STALE→DISCONNECTED→
    RECONCILING；首记录前为 RECONCILING，永不默认 HEALTHY，fail closed。
 
-4. **可插拔数据源**（`SnapshotSource` trait）：`ReplaySnapshotSource` 读标准化
-   NDJSON bar（复用 features.rs）确定性回放；`LiveThetaSource` 为实时适配器
-   占位，entitlement 验收前 fail closed。用 NDJSON 而非让 Rust 读 Parquet，
-   避免引入 arrow/parquet 重依赖；真实 Parquet 回放后续经适配器补。
+4. **可插拔数据源**：`ReplaySnapshotSource` 读标准化 NDJSON bar（复用
+   features.rs）确定性回放；`OPTIONTRADER_MARKET_SOURCE=theta` 启用唯一 Theta
+   WebSocket 生产者。实时源订阅 QQQ STOCK/TRADE，严格校验 symbol、状态、sequence、
+   价格和 RTH 时间，再聚合一分钟 OHLCV/VWAP。
 
-5. **gRPC 与 HTTP 同进程并存**：trading-core-bin 内 axum :8080（Phase 0 REST
+5. **盘中启动/重连先回补再放行**：建立 WebSocket 并发送订阅后，请求 Theta v3
+   `/stock/history/ohlc` 的 Nasdaq Basic 当日 09:30 至上一完整分钟 bars；当前分钟消息
+   在 socket 中缓冲。回补必须从 09:30 覆盖到目标分钟，并与已发布前缀完全一致；失败、
+   缺口或冲突均保持 RECONCILING/STALE。回补 records 以 BACKFILL 交付，追平后的新
+   WebSocket bar 才可能为 LIVE。
+
+6. **gRPC 与 HTTP 同进程并存**：trading-core-bin 内 axum :8080（Phase 0 REST
    不破坏）+ tonic :50051，tokio::select 并发。
 
-6. **Python 双角色**：gRPC 客户端消费流→引擎→CockpitState；FastAPI
+7. **Python 双角色**：gRPC 客户端消费流→引擎→CockpitState；FastAPI
    `WS /api/v1/stream/cockpit`（增量推送）+ `GET /api/v1/cockpit/state`
    （重连快照恢复）。
 
-7. **codegen 不入仓**：Rust 经 crates/proto 的 build.rs（tonic-build）编译期
+8. **codegen 不入仓**：Rust 经 crates/proto 的 build.rs（tonic-build）编译期
    生成；Python 经 scripts/gen_python_grpc.sh 生成到 app/grpc_gen/（git 忽略、
    排除出 mypy/ruff gate）。生成物不提交，避免与 proto 漂移。
 
-8. **双维 fail-closed 交易许可**：React 端 cockpitCanTrade 要求数据维（帧 LIVE
+9. **双维 fail-closed 交易许可**：React 端 cockpitCanTrade 要求数据维（帧 LIVE
    + new_position_allowed + snapshot HEALTHY）AND broker 维（/core/health 的
    canOpenNewPosition）。断流时清空 frame，重连窗口内不放行陈旧 LIVE 帧。
 
-9. **断线回补与应用重启恢复**：`StreamRequest.resume_after_sequence` 请求 Rust
+10. **断线回补与应用重启恢复**：`StreamRequest.resume_after_sequence` 请求 Rust
    session buffer 回放缺失记录。Rust 对落后订阅者标记 `BACKFILL`；Python 仍按序
    追加 bar 并重建引擎，但强制 CockpitState 为 STALE/No Trade。只有追平后新产生
    的 `LIVE` 记录，且 DataHealth=HEALTHY，才可恢复新开仓许可。Projector 另以
@@ -61,22 +68,23 @@ DataHealth 权威唯一在 Rust Market Core。
    high-watermark 合法、单调且已经越过恢复目标；目标记录本身仍禁止新开仓，避免
    单独信任上游 `LIVE` 标签。
 
-10. **跨语言 smoke 是根门禁的一部分**：`make test-integration` 先构建当前
+11. **跨语言 smoke 是根门禁的一部分**：`make test-integration` 先构建当前
     `trading-core` 二进制，再以 `OPTIONTRADER_REQUIRE_INTEGRATION=1` 执行真实
     Rust→gRPC→Python smoke；`make test` 必须包含该目标，不允许因二进制缺失而跳过。
 
-11. **watermark 回退保持粘滞闭锁**：同一 `session_id` 下 Trading Core 重启会令
+12. **watermark 回退保持粘滞闭锁**：同一 `session_id` 下 Trading Core 重启会令
     内存 cursor 回退，既有 Projector 不自动接受新的低 watermark。当前受支持的恢复
     方式是确认 Core 健康后重启 Application API；具体步骤见 `docs/RUNBOOK.md`。未来
     以显式 `session_epoch` 区分合法的新数据世代。
 
 ## 影响
 
-- 新增依赖栈：Rust tonic/prost/tokio-stream；Python grpcio/grpcio-tools/
-  protobuf。
+- 新增依赖栈：Rust tonic/prost/tokio-stream/tokio-tungstenite/reqwest；Python
+  grpcio/grpcio-tools/protobuf。
 - proto 契约包含 MarketTick/MarketBar、DeliveryPhase、resume cursor 与
   high-watermark；proto 与 jsonschema 各守其边界。
-- 事件上下文导入、真实 ThetaData 实时接入是骨架之后的独立批次。
+- 四类事件文件通过严格 JSON Schema/Pydantic 导入，生成 EventContext 并注入
+  Strategy/Cockpit；缺失、陈旧、未来时间或低置信度输入禁开新仓。
 
 ## 备选与否决
 
