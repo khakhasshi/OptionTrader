@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "plan_id": "plan_demo_001",
   "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "idempotency_key": "idem_demo_001",
@@ -27,7 +27,8 @@
         "gamma": "0.08",
         "theta": "-0.12",
         "vega": "0.05",
-        "chain_snapshot_id": "opt_demo_001"
+        "chain_snapshot_id": "opt_demo_001",
+        "provider": "THETADATA"
       },
       "broker_contract_id": "123456789",
       "symbol": "QQQ",
@@ -46,5 +47,6 @@
   "data_snapshot_ids": ["mkt_demo_001", "opt_demo_001"],
   "manual_confirmation_required": true,
   "order_side": "BUY",
-  "order_type": "LIMIT"
+  "order_type": "LIMIT",
+  "market_data_provider": "THETADATA"
 }

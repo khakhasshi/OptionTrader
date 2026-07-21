@@ -34,9 +34,10 @@
         "gamma": { "$ref": "common.json#/$defs/decimal" },
         "theta": { "$ref": "common.json#/$defs/decimal" },
         "vega": { "$ref": "common.json#/$defs/decimal" },
-        "chain_snapshot_id": { "type": "string", "minLength": 1 }
+        "chain_snapshot_id": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "const": "THETADATA" }
       },
-      "required": ["bid", "ask", "bid_size", "ask_size", "occurred_at_utc", "delta", "gamma", "theta", "vega", "chain_snapshot_id"],
+      "required": ["bid", "ask", "bid_size", "ask_size", "occurred_at_utc", "delta", "gamma", "theta", "vega", "chain_snapshot_id", "provider"],
       "additionalProperties": false
     },
     "adaptiveLimit": {
@@ -52,7 +53,7 @@
     }
   },
   "properties": {
-    "schema_version": { "type": "string", "const": "1.1" },
+    "schema_version": { "type": "string", "const": "1.2" },
     "plan_id": { "type": "string" },
     "plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "idempotency_key": { "type": "string" },
@@ -77,12 +78,13 @@
     ,"order_side": { "$ref": "common.json#/$defs/orderSide" }
     ,"order_type": { "type": "string", "enum": ["MARKET", "LIMIT", "ADAPTIVE_LIMIT"] }
     ,"adaptive_limit": { "$ref": "#/$defs/adaptiveLimit" }
+    ,"market_data_provider": { "type": "string", "const": "THETADATA" }
   },
   "required": [
     "schema_version", "plan_id", "plan_hash", "idempotency_key", "session_id",
     "signal_id", "broker_id", "strategy", "execution_mode", "created_at_utc", "legs",
     "limit_price", "max_loss", "expires_at_utc", "rule_version", "data_snapshot_ids",
-    "manual_confirmation_required", "order_side", "order_type"
+    "manual_confirmation_required", "order_side", "order_type", "market_data_provider"
   ],
   "allOf": [
     {

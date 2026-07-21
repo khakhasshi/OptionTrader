@@ -27,6 +27,12 @@
     "expires_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
     "updated_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
     "state_version": { "type": "integer", "minimum": 1 },
+    "broker_child_order_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "residual_exposure": { "type": "boolean" },
     "risk_reason_codes": {
       "type": "array",
       "uniqueItems": true,
@@ -51,7 +57,7 @@
     "schema_version", "order_id", "plan_id", "plan_hash", "idempotency_key",
     "session_id", "broker_id", "execution_mode", "state", "total_quantity",
     "filled_quantity", "broker_order_id", "expires_at_utc", "updated_at_utc", "state_version",
-    "risk_reason_codes"
+    "risk_reason_codes", "broker_child_order_ids", "residual_exposure"
   ],
   "additionalProperties": false
 }

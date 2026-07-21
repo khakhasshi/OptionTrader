@@ -74,6 +74,7 @@ pub struct OptionQuoteProof {
     pub theta: Decimal,
     pub vega: Decimal,
     pub chain_snapshot_id: String,
+    pub provider: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +119,7 @@ pub struct CandidatePlan {
     pub order_side: OrderSide,
     pub order_type: BrokerOrderType,
     pub adaptive_policy_valid: bool,
+    pub market_data_provider: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -287,6 +289,7 @@ fn candidate_shape_valid(plan: &CandidatePlan) -> bool {
         || plan.expires_at <= plan.created_at
         || !plan.manual_confirmation_required
         || !plan.adaptive_policy_valid
+        || plan.market_data_provider != "THETADATA"
     {
         return false;
     }
@@ -320,6 +323,7 @@ fn quote_reasons(input: &FinalRiskInput, reasons: &mut BTreeSet<RiskReasonCode>)
             || quote.bid_size == 0
             || quote.ask_size == 0
             || quote.occurred_at > input.evaluated_at
+            || quote.provider != "THETADATA"
         {
             reasons.insert(RiskReasonCode::QuoteProofInvalid);
             continue;
@@ -394,7 +398,9 @@ fn strategy_and_broker_shape_valid(plan: &CandidatePlan) -> bool {
         }
     };
     let broker_valid = match plan.broker_id {
-        BrokerId::Longbridge => plan.legs.len() == 1,
+        // Longbridge has no native combo order. The Rust adapter accepts only
+        // strategy-valid packages and executes all BUY legs before SELL legs.
+        BrokerId::Longbridge => true,
         BrokerId::Ibkr => plan.legs.iter().all(|leg| {
             leg.broker_contract_id
                 .as_deref()
@@ -582,6 +588,7 @@ mod tests {
                         theta: Decimal::from_str("-0.12").unwrap(),
                         vega: Decimal::from_str("0.05").unwrap(),
                         chain_snapshot_id: "opt-1".into(),
+                        provider: "THETADATA".into(),
                     },
                     broker_contract_id: Some("123456".into()),
                     symbol: "QQQ".into(),
@@ -596,6 +603,7 @@ mod tests {
                 order_side: OrderSide::Buy,
                 order_type: BrokerOrderType::Limit,
                 adaptive_policy_valid: true,
+                market_data_provider: "THETADATA".into(),
             },
             event_context: EventRiskContext {
                 event_context_id: "event-1".into(),
@@ -793,5 +801,20 @@ mod tests {
         ] {
             assert!(reasons.contains(&expected), "missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn non_thetadata_plan_or_quote_proof_is_rejected() {
+        let mut wrong_plan = input();
+        wrong_plan.plan.market_data_provider = "BROKER".into();
+        assert!(final_risk_check(&wrong_plan)
+            .reasons
+            .contains(&RiskReasonCode::PlanInvalid));
+
+        let mut wrong_quote = input();
+        wrong_quote.plan.legs[0].quote.provider = "BROKER".into();
+        assert!(final_risk_check(&wrong_quote)
+            .reasons
+            .contains(&RiskReasonCode::QuoteProofInvalid));
     }
 }

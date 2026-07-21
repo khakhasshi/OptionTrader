@@ -2,7 +2,7 @@ import type { ExecutionTicket } from "./execution";
 
 export const EXECUTION_TICKET_FIXTURE = {
   plan: {
-    schema_version: "1.1",
+    schema_version: "1.2",
     plan_id: "plan-1",
     plan_hash: "a".repeat(64),
     idempotency_key: "idem-1",
@@ -14,7 +14,7 @@ export const EXECUTION_TICKET_FIXTURE = {
     created_at_utc: "2099-07-21T14:30:00Z",
     legs: [{
       side: "BUY", type: "CALL", contract_id: "QQQ-20990721-C-500", expiry: "2099-07-21", strike: "500", quantity: 1,
-      quote: { bid: "2.40", ask: "2.50", bid_size: 20, ask_size: 25, occurred_at_utc: "2099-07-21T14:29:59.800Z", delta: "0.52", gamma: "0.08", theta: "-0.12", vega: "0.05", chain_snapshot_id: "opt-1" },
+      quote: { bid: "2.40", ask: "2.50", bid_size: 20, ask_size: 25, occurred_at_utc: "2099-07-21T14:29:59.800Z", delta: "0.52", gamma: "0.08", theta: "-0.12", vega: "0.05", chain_snapshot_id: "opt-1", provider: "THETADATA" },
       broker_contract_id: "123456", symbol: "QQQ", exchange: "SMART",
     }],
     limit_price: "2.50",
@@ -25,6 +25,7 @@ export const EXECUTION_TICKET_FIXTURE = {
     manual_confirmation_required: true,
     order_side: "BUY",
     order_type: "LIMIT",
+    market_data_provider: "THETADATA",
   },
   order: {
     schema_version: "1.0",
@@ -42,6 +43,8 @@ export const EXECUTION_TICKET_FIXTURE = {
     expires_at_utc: "2099-07-21T14:31:00Z",
     updated_at_utc: "2099-07-21T14:30:01Z",
     state_version: 1,
+    broker_child_order_ids: [],
+    residual_exposure: false,
     risk_reason_codes: [],
   },
 } satisfies ExecutionTicket;

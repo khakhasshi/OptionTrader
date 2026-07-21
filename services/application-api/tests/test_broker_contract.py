@@ -41,6 +41,7 @@ def test_broker_order_round_trip_preserves_all_combo_legs() -> None:
                 broker_contract_id="101",
                 symbol="QQQ",
                 exchange="SMART",
+                submitted_price="1.50",
             ),
             broker_pb2.BrokerOrderLeg(
                 contract_id="QQQ-20260721-C-501",
@@ -49,6 +50,7 @@ def test_broker_order_round_trip_preserves_all_combo_legs() -> None:
                 broker_contract_id="102",
                 symbol="QQQ",
                 exchange="SMART",
+                submitted_price="0.50",
             ),
         ],
     )
@@ -58,3 +60,4 @@ def test_broker_order_round_trip_preserves_all_combo_legs() -> None:
         "QQQ-20260721-C-500",
         "QQQ-20260721-C-501",
     ]
+    assert [leg.submitted_price for leg in restored.legs] == ["1.50", "0.50"]

@@ -55,6 +55,7 @@ class OptionQuoteProof(StrictModel):
     theta: DecimalString
     vega: DecimalString
     chain_snapshot_id: str = Field(min_length=1)
+    provider: Literal["THETADATA"]
 
 
 class AdaptiveLimitPolicy(StrictModel):
@@ -65,7 +66,7 @@ class AdaptiveLimitPolicy(StrictModel):
 
 
 class CandidateTradePlan(StrictModel):
-    schema_version: Literal["1.1"]
+    schema_version: Literal["1.2"]
     plan_id: str = Field(min_length=1)
     plan_hash: Hash
     idempotency_key: str = Field(min_length=1)
@@ -90,6 +91,7 @@ class CandidateTradePlan(StrictModel):
     order_side: Literal["BUY", "SELL"]
     order_type: Literal["MARKET", "LIMIT", "ADAPTIVE_LIMIT"]
     adaptive_limit: AdaptiveLimitPolicy | None = None
+    market_data_provider: Literal["THETADATA"]
 
     @model_validator(mode="after")
     def identifiers_and_times_are_consistent(self) -> CandidateTradePlan:
@@ -191,6 +193,8 @@ class ExecutionOrder(StrictModel):
     expires_at_utc: UtcTimestamp
     updated_at_utc: UtcTimestamp
     state_version: int = Field(ge=1)
+    broker_child_order_ids: list[str]
+    residual_exposure: bool
     risk_reason_codes: list[RiskReason]
 
     @model_validator(mode="after")
@@ -199,6 +203,15 @@ class ExecutionOrder(StrictModel):
             raise ValueError("filled quantity exceeds total quantity")
         if len(set(self.risk_reason_codes)) != len(self.risk_reason_codes):
             raise ValueError("risk reason codes must be unique")
+        if len(set(self.broker_child_order_ids)) != len(self.broker_child_order_ids):
+            raise ValueError("broker child order ids must be unique")
+        if self.residual_exposure and self.state not in {
+            "PARTIAL_FILL",
+            "RECONCILE_PENDING",
+            "CANCEL_PENDING",
+            "CANCELLED",
+        }:
+            raise ValueError("residual exposure requires a non-flat execution state")
         return self
 
 

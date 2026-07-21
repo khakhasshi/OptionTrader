@@ -170,8 +170,12 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
           <div className="execution-meta">
             <code title={ticket.plan.plan_hash}>Plan {ticket.plan.plan_hash.slice(0, 12)}</code>
             <code>Rule {ticket.plan.rule_version}</code>
+            <code>Data {ticket.plan.market_data_provider}</code>
             {ticket.order.broker_order_id && <code>Broker {ticket.order.broker_order_id}</code>}
           </div>
+          {ticket.order.residual_exposure && (
+            <p className="alert-line" role="alert"><ShieldAlert size={16} aria-hidden="true" /> Residual exposure · reconciliation required</p>
+          )}
           {ticket.order.risk_reason_codes.length > 0 && (
             <p className="alert-line"><ShieldAlert size={16} aria-hidden="true" /> {ticket.order.risk_reason_codes.join(" · ")}</p>
           )}

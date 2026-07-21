@@ -73,6 +73,8 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
    必须展示 plan hash、全部腿、最大损失、Broker、模式和到期时间，并由操作者勾选。
 4. 确认后 Rust 重新执行 Final Risk Check。市场、事件、账户、限额、规则版本、快照或
    TTL 任一变化都可否决，不得通过再次点击或修改前端状态覆盖。
+   Candidate 1.2 的计划级和每腿 provider 必须均为 `THETADATA`；Broker quote 不得进入
+   计划或自适应定价。受信任 option snapshot registry 上线前不得启用真实提交。
 5. 当前 PAPER/MANUAL_CONFIRM 只进入内存 PaperBroker；真实 Longbridge/IBKR adapter
    未启用，`LIVE_TRADING_ENABLED=false` 必须保持不变。Broker sidecar 仅绑定本机。
 6. Trading Core 重启会丢失 workflow；Application API 重启后可读取共享密文 capability，
@@ -90,6 +92,16 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
 Longbridge 原生 adapter 从 `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、
 `LONGBRIDGE_ACCESS_TOKEN` 读取凭证。不要把值写入 compose、日志或提交。当前 workflow 不会
 实例化真实 adapter；仅在独立 paper 认证进程中显式启用提交。
+
+Longbridge 多腿认证还需设置并记录以下参数；非法值会阻止 adapter 启动：
+
+```text
+OPTIONTRADER_LONGBRIDGE_LEG_FILL_TIMEOUT_MS=8000
+OPTIONTRADER_LONGBRIDGE_LEG_POLL_INTERVAL_MS=250
+```
+
+逐腿日志必须证明 BUY 完整成交先于任何 SELL。出现 partial、unknown 或
+`residual_exposure=true` 时停止新开仓并先完成 Broker 对账。
 
 IBKR sidecar 必须先在 TWS 或 Gateway 中启用 socket client、关闭 Read-Only API，并核对
 paper/live 端口。配置至少包含：

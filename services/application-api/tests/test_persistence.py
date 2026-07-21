@@ -334,6 +334,8 @@ def _staged_models() -> tuple[CandidateTradePlan, StageCandidateResult]:
         expires_at_utc=plan.expires_at_utc,
         updated_at_utc="2026-07-20T14:30:01Z",
         state_version=1,
+        broker_child_order_ids=[],
+        residual_exposure=False,
         risk_reason_codes=[],
     )
     return plan, StageCandidateResult(

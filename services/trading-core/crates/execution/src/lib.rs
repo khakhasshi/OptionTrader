@@ -70,6 +70,8 @@ pub struct OrderRecord {
     pub total_quantity: u32,
     pub filled_quantity: u32,
     pub broker_order_id: Option<String>,
+    pub broker_child_order_ids: Vec<String>,
+    pub residual_exposure: bool,
     pub confirmation_id: Option<String>,
     pub events: Vec<OrderEvent>,
 }
@@ -96,6 +98,8 @@ impl OrderRecord {
             total_quantity,
             filled_quantity: 0,
             broker_order_id: None,
+            broker_child_order_ids: Vec::new(),
+            residual_exposure: false,
             confirmation_id: None,
             events: Vec::new(),
         })
@@ -211,6 +215,9 @@ impl OrderRecord {
             BrokerOrderStatus::Filled => (OrderState::Filled, "BROKER_FILLED"),
             BrokerOrderStatus::Cancelled => (OrderState::Cancelled, "BROKER_CANCELLED"),
             BrokerOrderStatus::Rejected => (OrderState::Rejected, "BROKER_REJECTED"),
+            BrokerOrderStatus::ReconcilePending => {
+                (OrderState::ReconcilePending, "BROKER_RECONCILE_PENDING")
+            }
         };
         if self.state == target
             && order.filled_quantity != previous_filled_quantity
@@ -219,6 +226,12 @@ impl OrderRecord {
             return Err(ExecutionError::DuplicateConflict);
         }
         self.broker_order_id = Some(order.broker_order_id.clone());
+        self.broker_child_order_ids = order
+            .child_orders
+            .iter()
+            .map(|child| child.broker_order_id.clone())
+            .collect();
+        self.residual_exposure = order.residual_exposure;
         self.filled_quantity = order.filled_quantity;
         if self.state == target {
             if order.filled_quantity == previous_filled_quantity {
@@ -353,6 +366,7 @@ mod tests {
             broker_contract_id: None,
             symbol: Some("QQQ".into()),
             exchange: None,
+            submitted_price: Some(Decimal::new(250, 2)),
         }]
     }
 
@@ -484,7 +498,10 @@ mod tests {
                 broker_contract_id: None,
                 symbol: Some("QQQ".into()),
                 exchange: None,
+                submitted_price: Some(Decimal::ONE),
             }],
+            child_orders: Vec::new(),
+            residual_exposure: false,
         };
         record.apply_broker_order(&partial, now()).unwrap();
         let first_version = record.events.len();

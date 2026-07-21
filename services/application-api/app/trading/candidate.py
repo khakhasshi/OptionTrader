@@ -53,6 +53,7 @@ class QuotedLeg:
     broker_contract_id: str | None = None
     symbol: str = "QQQ"
     exchange: str | None = None
+    quote_provider: str = "THETADATA"
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,7 @@ class CandidateInputs:
     adaptive_max_attempts: int = 3
     adaptive_max_quote_age_ms: int = 500
     adaptive_max_spread_bps: int = 2_000
+    market_data_provider: str = "THETADATA"
 
 
 def _unit_economics(inputs: CandidateInputs) -> tuple[Decimal, Decimal]:
@@ -204,6 +206,7 @@ def _to_proto(
                     theta=leg.quote.theta,
                     vega=leg.quote.vega,
                     chain_snapshot_id=leg.quote.chain_snapshot_id,
+                    provider=leg.quote.provider,
                 ),
                 broker_contract_id=leg.broker_contract_id or "",
                 symbol=leg.symbol,
@@ -228,6 +231,7 @@ def _to_proto(
             else execution_pb2.ORDER_SIDE_SELL
         ),
         order_type=order_type,
+        market_data_provider=plan.market_data_provider,
         **({"adaptive_limit": adaptive} if adaptive is not None else {}),
     )
 
@@ -259,6 +263,8 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
         raise ValueError("candidate TTL must be between 1 and 120 seconds")
     if inputs.order_type not in {"MARKET", "LIMIT", "ADAPTIVE_LIMIT"}:
         raise ValueError("candidate order type is unmapped")
+    if inputs.market_data_provider != "THETADATA":
+        raise ValueError("candidate market data provider must be THETADATA")
     for leg in inputs.quoted_legs:
         if leg.quote_at_utc.tzinfo is None:
             raise ValueError("option quote time must be timezone-aware")
@@ -268,13 +274,12 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
             raise ValueError("option quote sizes must be positive")
         if leg.chain_snapshot_id not in inputs.data_snapshot_ids:
             raise ValueError("option chain snapshot must be part of plan proof")
+        if leg.quote_provider != "THETADATA":
+            raise ValueError("option quote and Greeks provider must be THETADATA")
         if not leg.broker_contract_id:
             raise ValueError("broker-native contract id is required")
         if inputs.broker_id == "ibkr" and not leg.broker_contract_id.isdigit():
             raise ValueError("IBKR contract id must be a numeric conId")
-    if inputs.broker_id == "longbridge" and len(inputs.quoted_legs) != 1:
-        raise ValueError("Longbridge does not support multi-leg option orders")
-
     limit_price, unit_max_loss = _unit_economics(inputs)
     risk_budget = _decimal(inputs.risk_budget, "risk budget")
     if inputs.max_contracts < 1:
@@ -294,7 +299,7 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
     )
     placeholder_hash = "0" * 64
     plan = CandidateTradePlan(
-        schema_version="1.1",
+        schema_version="1.2",
         plan_id="pending",
         plan_hash=placeholder_hash,
         idempotency_key="pending",
@@ -325,6 +330,7 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
                     theta=leg.theta,
                     vega=leg.vega,
                     chain_snapshot_id=leg.chain_snapshot_id,
+                    provider="THETADATA",
                 ),
                 broker_contract_id=leg.broker_contract_id or "",
                 symbol=leg.symbol,
@@ -355,6 +361,7 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
             if inputs.order_type == "ADAPTIVE_LIMIT"
             else None
         ),
+        market_data_provider="THETADATA",
     )
     digest = canonical_plan_hash(plan)
     return plan.model_copy(

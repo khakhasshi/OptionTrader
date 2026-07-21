@@ -45,6 +45,7 @@ enum BrokerOrderStatus {
   BROKER_ORDER_STATUS_FILLED = 3;
   BROKER_ORDER_STATUS_CANCELLED = 4;
   BROKER_ORDER_STATUS_REJECTED = 5;
+  BROKER_ORDER_STATUS_RECONCILE_PENDING = 6;
 }
 
 message AccountSnapshot {
@@ -72,6 +73,19 @@ message BrokerOrderLeg {
   string broker_contract_id = 4;
   string symbol = 5;
   string exchange = 6;
+  // Rust-authoritative per-leg price for sequential execution. Empty only for MKT.
+  string submitted_price = 7;
+}
+
+message BrokerChildOrderSnapshot {
+  string broker_order_id = 1;
+  uint32 leg_index = 2;
+  string contract_id = 3;
+  OrderSide side = 4;
+  uint32 quantity = 5;
+  uint32 filled_quantity = 6;
+  BrokerOrderStatus status = 7;
+  string submitted_price = 8;
 }
 
 message BrokerOrderSnapshot {
@@ -88,6 +102,8 @@ message BrokerOrderSnapshot {
   OrderSide side = 9;
   BrokerOrderType order_type = 10;
   AdaptivePriority adaptive_priority = 11;
+  repeated BrokerChildOrderSnapshot child_orders = 12;
+  bool residual_exposure = 13;
 }
 
 message FillSnapshot {

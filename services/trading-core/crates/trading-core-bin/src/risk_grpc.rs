@@ -390,7 +390,11 @@ fn decimal(value: &str, label: &'static str) -> Result<Decimal, &'static str> {
     Decimal::from_str_exact(value).map_err(|_| label)
 }
 
-fn broker_legs(raw_plan: &ProtoPlan) -> Result<Vec<BrokerOrderLeg>, &'static str> {
+fn broker_legs(
+    raw_plan: &ProtoPlan,
+    order_type: AdapterOrderType,
+    now: DateTime<Utc>,
+) -> Result<Vec<BrokerOrderLeg>, BrokerError> {
     raw_plan
         .legs
         .iter()
@@ -398,7 +402,47 @@ fn broker_legs(raw_plan: &ProtoPlan) -> Result<Vec<BrokerOrderLeg>, &'static str
             let side = match ProtoSide::try_from(leg.side) {
                 Ok(ProtoSide::Buy) => AdapterOrderSide::Buy,
                 Ok(ProtoSide::Sell) => AdapterOrderSide::Sell,
-                _ => return Err("staged leg side is invalid"),
+                _ => return Err(BrokerError::InvalidOrderType),
+            };
+            let quote = leg.quote.as_ref().ok_or(BrokerError::QuoteUnavailable)?;
+            let bid =
+                decimal(&quote.bid, "quote bid").map_err(|_| BrokerError::QuoteUnavailable)?;
+            let ask =
+                decimal(&quote.ask, "quote ask").map_err(|_| BrokerError::QuoteUnavailable)?;
+            let occurred_at = utc(&quote.occurred_at_utc, "quote time")
+                .map_err(|_| BrokerError::QuoteUnavailable)?;
+            let submitted_price = match order_type {
+                AdapterOrderType::Market => None,
+                AdapterOrderType::Limit => Some(match side {
+                    AdapterOrderSide::Buy => ask,
+                    AdapterOrderSide::Sell => bid,
+                }),
+                AdapterOrderType::AdaptiveLimit => {
+                    let raw_policy = raw_plan
+                        .adaptive_limit
+                        .as_ref()
+                        .ok_or(BrokerError::InvalidOrderType)?;
+                    let policy = AdapterAdaptivePolicy {
+                        initial_aggressiveness_bps: raw_policy.initial_aggressiveness_bps,
+                        max_attempts: raw_policy.max_attempts,
+                        max_quote_age_ms: raw_policy.max_quote_age_ms,
+                        max_spread_bps: raw_policy.max_spread_bps,
+                    };
+                    let quote = QuoteProof {
+                        bid,
+                        ask,
+                        tick_size: Decimal::new(1, 2),
+                        occurred_at,
+                    };
+                    let protection = match side {
+                        AdapterOrderSide::Buy => ask,
+                        AdapterOrderSide::Sell => bid,
+                    };
+                    Some(
+                        price_adaptive_limit(side, &quote, &policy, 0, protection, now)
+                            .map_err(map_adaptive_error)?,
+                    )
+                }
             };
             Ok(BrokerOrderLeg {
                 contract_id: leg.contract_id.clone(),
@@ -408,6 +452,7 @@ fn broker_legs(raw_plan: &ProtoPlan) -> Result<Vec<BrokerOrderLeg>, &'static str
                     .then(|| leg.broker_contract_id.clone()),
                 symbol: (!leg.symbol.is_empty()).then(|| leg.symbol.clone()),
                 exchange: (!leg.exchange.is_empty()).then(|| leg.exchange.clone()),
+                submitted_price,
             })
         })
         .collect()
@@ -416,7 +461,15 @@ fn broker_legs(raw_plan: &ProtoPlan) -> Result<Vec<BrokerOrderLeg>, &'static str
 fn priced_broker_order(
     raw: &ProtoPlan,
     now: DateTime<Utc>,
-) -> Result<(AdapterOrderSide, AdapterOrderType, Option<Decimal>), BrokerError> {
+) -> Result<
+    (
+        AdapterOrderSide,
+        AdapterOrderType,
+        Option<Decimal>,
+        Vec<BrokerOrderLeg>,
+    ),
+    BrokerError,
+> {
     let side = match ProtoSide::try_from(raw.order_side).ok() {
         Some(ProtoSide::Buy) => AdapterOrderSide::Buy,
         Some(ProtoSide::Sell) => AdapterOrderSide::Sell,
@@ -424,9 +477,9 @@ fn priced_broker_order(
     };
     let protection =
         decimal(&raw.limit_price, "limit_price").map_err(|_| BrokerError::InvalidPrice)?;
-    match ProtoOrderType::try_from(raw.order_type).ok() {
-        Some(ProtoOrderType::Market) => Ok((side, AdapterOrderType::Market, None)),
-        Some(ProtoOrderType::Limit) => Ok((side, AdapterOrderType::Limit, Some(protection))),
+    let (order_type, submitted_price) = match ProtoOrderType::try_from(raw.order_type).ok() {
+        Some(ProtoOrderType::Market) => (AdapterOrderType::Market, None),
+        Some(ProtoOrderType::Limit) => (AdapterOrderType::Limit, Some(protection)),
         Some(ProtoOrderType::AdaptiveLimit) => {
             let policy = raw
                 .adaptive_limit
@@ -474,10 +527,34 @@ fn priced_broker_order(
             };
             let price = price_adaptive_limit(side, &quote, &policy, 0, protection, now)
                 .map_err(map_adaptive_error)?;
-            Ok((side, AdapterOrderType::AdaptiveLimit, Some(price)))
+            (AdapterOrderType::AdaptiveLimit, Some(price))
         }
-        _ => Err(BrokerError::InvalidOrderType),
+        _ => return Err(BrokerError::InvalidOrderType),
+    };
+    let legs = broker_legs(raw, order_type, now)?;
+    if let Some(package_price) = submitted_price {
+        let mut buys = Decimal::ZERO;
+        let mut sells = Decimal::ZERO;
+        for leg in &legs {
+            let price = leg.submitted_price.ok_or(BrokerError::InvalidPrice)?;
+            match leg.side {
+                AdapterOrderSide::Buy => buys += price,
+                AdapterOrderSide::Sell => sells += price,
+            }
+        }
+        let legged_price = match side {
+            AdapterOrderSide::Buy => buys - sells,
+            AdapterOrderSide::Sell => sells - buys,
+        };
+        let violates_protection = match side {
+            AdapterOrderSide::Buy => legged_price > package_price,
+            AdapterOrderSide::Sell => legged_price < package_price,
+        };
+        if violates_protection {
+            return Err(BrokerError::InvalidPrice);
+        }
     }
+    Ok((side, order_type, submitted_price, legs))
 }
 
 fn map_adaptive_error(error: AdaptivePriceError) -> BrokerError {
@@ -564,7 +641,10 @@ fn adaptive_policy_valid(raw: &ProtoPlan, order_type: BrokerOrderType) -> bool {
 }
 
 fn plan(raw: &ProtoPlan) -> Result<CandidatePlan, &'static str> {
-    if raw.schema_version != "1.1" || raw.plan_hash.len() != 64 {
+    if raw.schema_version != "1.2"
+        || raw.plan_hash.len() != 64
+        || raw.market_data_provider != "THETADATA"
+    {
         return Err("plan contract");
     }
     let expected_hash = digest(raw, |value| {
@@ -598,6 +678,7 @@ fn plan(raw: &ProtoPlan) -> Result<CandidatePlan, &'static str> {
                     theta: decimal(&quote.theta, "theta")?,
                     vega: decimal(&quote.vega, "vega")?,
                     chain_snapshot_id: quote.chain_snapshot_id.clone(),
+                    provider: quote.provider.clone(),
                 },
                 broker_contract_id: (!leg.broker_contract_id.is_empty())
                     .then(|| leg.broker_contract_id.clone()),
@@ -628,6 +709,7 @@ fn plan(raw: &ProtoPlan) -> Result<CandidatePlan, &'static str> {
         order_side: map_side(raw.order_side)?,
         order_type,
         adaptive_policy_valid: adaptive_policy_valid(raw, order_type),
+        market_data_provider: raw.market_data_provider.clone(),
     })
 }
 
@@ -796,6 +878,8 @@ fn order_proto(staged: &StagedOrder, now: DateTime<Utc>) -> ProtoOrder {
         updated_at_utc: updated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         risk_reason_codes: staged.risk_reasons.clone(),
         state_version: staged.record.events.len() as u64,
+        broker_child_order_ids: staged.record.broker_child_order_ids.clone(),
+        residual_exposure: staged.record.residual_exposure,
     }
 }
 
@@ -929,7 +1013,6 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
         let decision = self
             .evaluate_raw(Some(&stored_plan), raw.event_context.as_ref(), now)
             .await?;
-        let adapter_legs = broker_legs(&stored_plan).map_err(Status::internal)?;
         let mut workflow = workflow_lock(self)
             .map_err(|()| Status::internal("execution workflow lock poisoned"))?;
         let Workflow {
@@ -973,7 +1056,7 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
                 staged.record.begin_submit(now).map_err(|error| {
                     Status::failed_precondition(format!("submit blocked: {error:?}"))
                 })?;
-                let (order_side, order_type, submitted_price) = match priced {
+                let (order_side, order_type, submitted_price, adapter_legs) = match priced {
                     Ok(value) => value,
                     Err(_) => {
                         staged
@@ -1189,9 +1272,38 @@ mod tests {
         assert!(parse_boolean("FLAG", Some("0"), false).is_err());
     }
 
+    #[test]
+    fn longbridge_credit_spread_gets_independent_thetadata_leg_prices() {
+        let mut raw = candidate(ProtoMode::Paper);
+        raw.broker_id = ProtoBrokerId::Longbridge as i32;
+        raw.strategy = ProtoStrategy::ShortPremium as i32;
+        raw.order_side = ProtoSide::Sell as i32;
+        raw.limit_price = "1.00".into();
+        let mut hedge = raw.legs[0].clone();
+        hedge.contract_id = "QQQ-20260720-C-505".into();
+        hedge.broker_contract_id = "QQQ260720C00505000.US".into();
+        hedge.strike = "505".into();
+        hedge.quote.as_mut().unwrap().bid = "0.45".into();
+        hedge.quote.as_mut().unwrap().ask = "0.50".into();
+        let mut short = raw.legs[0].clone();
+        short.side = ProtoSide::Sell as i32;
+        short.contract_id = "QQQ-20260720-C-500".into();
+        short.broker_contract_id = "QQQ260720C00500000.US".into();
+        short.quote.as_mut().unwrap().bid = "1.50".into();
+        short.quote.as_mut().unwrap().ask = "1.55".into();
+        raw.legs = vec![short, hedge];
+
+        let (side, order_type, parent_price, legs) = priced_broker_order(&raw, now()).unwrap();
+        assert_eq!(side, AdapterOrderSide::Sell);
+        assert_eq!(order_type, AdapterOrderType::Limit);
+        assert_eq!(parent_price, Some(Decimal::new(100, 2)));
+        assert_eq!(legs[0].submitted_price, Some(Decimal::new(150, 2)));
+        assert_eq!(legs[1].submitted_price, Some(Decimal::new(50, 2)));
+    }
+
     fn candidate(mode: ProtoMode) -> ProtoPlan {
         let mut value = ProtoPlan {
-            schema_version: "1.1".into(),
+            schema_version: "1.2".into(),
             plan_id: String::new(),
             plan_hash: String::new(),
             idempotency_key: String::new(),
@@ -1219,6 +1331,7 @@ mod tests {
                     theta: "-0.12".into(),
                     vega: "0.05".into(),
                     chain_snapshot_id: "opt-1".into(),
+                    provider: "THETADATA".into(),
                 }),
                 broker_contract_id: "123456".into(),
                 symbol: "QQQ".into(),
@@ -1238,6 +1351,7 @@ mod tests {
             order_side: ProtoSide::Buy as i32,
             order_type: ProtoOrderType::Limit as i32,
             adaptive_limit: None,
+            market_data_provider: "THETADATA".into(),
         };
         let hash = digest(&value, |plan| {
             plan.plan_id.clear();

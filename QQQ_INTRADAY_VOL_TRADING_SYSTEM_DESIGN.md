@@ -141,6 +141,8 @@ React Trading Cockpit
 12. BrokerHealth 不为 HEALTHY，或账户、订单、持仓与本地账本未完成对账，禁止新开仓。
 13. CandidateTradePlan 已过期、plan hash 不匹配或规则版本落后，禁止提交。
 14. 一个 CandidateTradePlan 只能提交给其指定的唯一 broker_id。
+15. 行情、期权报价、Greeks、期权链及执行定价证明不是 ThetaData，禁止提交。
+16. Longbridge 拆腿时，所有 BUY 保护腿未确认完整成交前，禁止提交任何 SELL 腿；partial 或 unknown 立即进入残仓/对账状态。
 ```
 
 风控必须执行两次：
@@ -622,7 +624,7 @@ LLM 输出必须结构化：
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.2",
   "review_id": "llm_review_20260720_094501",
   "plan_id": "plan_20260720_094501",
   "review_status": "COMPLETED | UNAVAILABLE | INVALID",
@@ -974,24 +976,41 @@ Preliminary Regime
 {
   "schema_version": "1.0",
   "plan_id": "plan_20260720_094501",
-  "plan_hash": "sha256:example",
+  "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "idempotency_key": "plan_20260720_094501_submit_1",
   "session_id": "session_20260720",
   "signal_id": "sig_20260720_094500",
   "broker_id": "longbridge",
   "strategy": "LongGamma",
+  "execution_mode": "PAPER",
+  "created_at_utc": "2026-07-20T13:45:00Z",
   "legs": [
     {
       "side": "BUY",
       "type": "CALL",
       "expiry": "2026-07-20",
-      "strike": 500,
-      "quantity": 1
+      "strike": "500",
+      "quantity": 1,
+      "quote": {
+        "bid": "2.30",
+        "ask": "2.35",
+        "bid_size": 20,
+        "ask_size": 25,
+        "occurred_at_utc": "2026-07-20T13:45:00Z",
+        "delta": "0.52",
+        "gamma": "0.08",
+        "theta": "-0.12",
+        "vega": "0.05",
+        "provider": "THETADATA",
+        "chain_snapshot_id": "opt_20260720_094500_000456"
+      },
+      "broker_contract_id": "QQQ260720C00500000.US",
+      "symbol": "QQQ"
     }
   ],
-  "limit_price": 2.35,
-  "max_loss": 0.35,
-  "take_profit": 0.55,
+  "limit_price": "2.35",
+  "max_loss": "235.00",
+  "take_profit": "94.00",
   "time_stop_minutes": 15,
   "expires_at_utc": "2026-07-20T13:46:00Z",
   "rule_version": "rules_0.2.0",
@@ -999,7 +1018,10 @@ Preliminary Regime
     "mkt_20260720_094500_000123",
     "opt_20260720_094500_000456"
   ],
-  "manual_confirmation_required": true
+  "manual_confirmation_required": true,
+  "order_side": "BUY",
+  "order_type": "LIMIT",
+  "market_data_provider": "THETADATA"
 }
 ```
 

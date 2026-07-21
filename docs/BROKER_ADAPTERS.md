@@ -4,6 +4,9 @@
 
 Rust 是价格权威。Broker adapter 只接收已经确定的订单级方向、类型和提交价：
 
+- 行情、期权报价、Greeks、期权链和每腿定价证明只能来自 ThetaData；Broker 只提供
+  账户、持仓、订单与成交事实，不允许用 Broker quote 覆盖 Candidate。
+
 - `MARKET`：不带提交价。adapter 支持映射，但新开仓硬风控固定拒绝。
 - `LIMIT`：提交人工批准的保护价。
 - `ADAPTIVE_LIMIT`：Rust 以 `mid ± aggressiveness × half_spread` 定价；买单向 ask
@@ -17,9 +20,20 @@ Rust 是价格权威。Broker adapter 只接收已经确定的订单级方向、
 
 - 使用官方 Rust SDK `longbridge 4.3.3` 的 blocking TradeContext。
 - 凭证仅由 SDK 从 `LONGBRIDGE_*`（兼容 `LONGPORT_*`）环境变量读取。
-- 支持账户购买力、持仓、单腿期权市价/限价/自适应限价映射、撤单。
-- Longbridge OpenAPI 当前不支持多腿期权组合。两腿及以上请求返回
-  `UnsupportedOrderShape`，绝不拆腿提交。
+- 支持账户购买力、持仓、期权市价/限价/自适应限价映射、撤单。
+- Longbridge OpenAPI 当前不支持原生多腿组合，因此由 Rust 执行受控拆腿：按 Candidate
+  原始腿保存审计顺序，但提交顺序固定为全部 BUY 腿在前、SELL 腿在后。每条 BUY 腿必须
+  查询到完整成交后才允许下一条腿；partial/unfilled/rejected/unknown 立即停止，不再提交卖腿。
+  `PartialFilled` 会先撤销该子单剩余数量，并等待 `PartialWithdrawal/Cancelled/Filled`；撤单
+  结果未知时进入 `RECONCILE_PENDING`，不把“已发撤单”当成“撤单已完成”。
+- 每腿限价由 Rust 基于 ThetaData quote 独立计算。买腿使用不高于 ask 的保护价，卖腿使用
+  不低于 bid 的保护价，并再次验证组合净价不突破人工确认的 package protection。
+- 子订单使用 `plan_hash + leg_index` remark，并投影到 `broker_child_order_ids`。中途已有成交时
+  标记 `residual_exposure=true`；提交结果未知也按“可能有残仓”处理。重连时按精确 remark、
+  symbol、side、quantity 扫描当日订单恢复 child ID；零匹配或多匹配均保持闭锁。系统保留
+  受保护的多头残仓并要求对账，不自动市价砍仓。
+- `OPTIONTRADER_LONGBRIDGE_LEG_FILL_TIMEOUT_MS` 默认 8000（1000-60000），轮询间隔
+  `OPTIONTRADER_LONGBRIDGE_LEG_POLL_INTERVAL_MS` 默认 250（50-1000）；非法配置拒绝启动。
 - `broker_contract_id` 必须是 Longbridge SDK 原生期权 symbol；`contract_id` 仅作跨数据源审计标识。
 - SDK error 不写入日志正文，连接或未知提交结果使 adapter 进入未对账状态。
 
@@ -42,7 +56,8 @@ Rust 是价格权威。Broker adapter 只接收已经确定的订单级方向、
 
 1. 两家 broker 的 account/position/open-order/fill 全量快照与 PostgreSQL 投影对账。
 2. 进程重启、1100/1101/1102/1300、未知提交结果、部分成交、拒单、撤单竞争的故障演练。
-3. Longbridge 单腿和 IBKR BAG 在 paper 账户完成市价、限价、自适应限价现场认证。
+3. Longbridge 单腿/受控拆腿和 IBKR BAG 在 paper 账户完成限价、自适应限价现场认证。
+   必须注入买腿部分成交、卖腿拒绝、查询超时、撤单竞争和进程重启。
 4. 完整 RTH soak、API pacing、订单事件流和审计链检查。
 5. Q3 风控参数、策略白名单和 live submission 开关书面批准。
 

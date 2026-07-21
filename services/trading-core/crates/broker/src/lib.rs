@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 mod pricing;
 pub use pricing::{price_adaptive_limit, AdaptivePriceError};
+mod sequential;
+pub use sequential::{execute_buy_first, SequentialExecutionConfig, SequentialLegGateway};
 
 #[cfg(feature = "longbridge-sdk")]
 pub mod longbridge;
@@ -40,6 +42,7 @@ pub enum BrokerOrderStatus {
     Filled,
     Cancelled,
     Rejected,
+    ReconcilePending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +106,21 @@ pub struct BrokerOrderLeg {
     pub broker_contract_id: Option<String>,
     pub symbol: Option<String>,
     pub exchange: Option<String>,
+    /// Rust-authoritative price for this leg when a broker cannot submit the
+    /// package natively. None is valid only for MARKET.
+    pub submitted_price: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerChildOrder {
+    pub broker_order_id: String,
+    pub leg_index: usize,
+    pub contract_id: String,
+    pub side: OrderSide,
+    pub quantity: u32,
+    pub filled_quantity: u32,
+    pub status: BrokerOrderStatus,
+    pub submitted_price: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +147,10 @@ pub struct BrokerOrder {
     pub filled_quantity: u32,
     pub submitted_price: Option<Decimal>,
     pub legs: Vec<BrokerOrderLeg>,
+    pub child_orders: Vec<BrokerChildOrder>,
+    /// True when at least one child fill exists but the intended package is
+    /// incomplete. New risk must remain closed until broker reconciliation.
+    pub residual_exposure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +169,7 @@ pub enum BrokerError {
     OrderNotFound,
     TerminalOrder,
     LiveSubmissionDisabled,
+    InvalidConfiguration,
 }
 
 /// Contract implemented by paper and, after certification, live adapters.
@@ -207,6 +230,9 @@ impl PaperBroker {
             .orders
             .get_mut(broker_order_id)
             .ok_or(BrokerError::OrderNotFound)?;
+        if order.status == BrokerOrderStatus::ReconcilePending {
+            return Err(BrokerError::NotReconciled);
+        }
         if matches!(
             order.status,
             BrokerOrderStatus::Filled | BrokerOrderStatus::Cancelled | BrokerOrderStatus::Rejected
@@ -238,6 +264,9 @@ impl PaperBroker {
             .orders
             .get_mut(broker_order_id)
             .ok_or(BrokerError::OrderNotFound)?;
+        if order.status == BrokerOrderStatus::ReconcilePending {
+            return Err(BrokerError::NotReconciled);
+        }
         if order.filled_quantity > 0 || order.status != BrokerOrderStatus::Working {
             return Err(BrokerError::TerminalOrder);
         }
@@ -292,9 +321,14 @@ impl BrokerAdapter for PaperBroker {
             return Err(BrokerError::InvalidQuantity);
         }
         match (request.order_type, request.submitted_price) {
-            (BrokerOrderType::Market, None) => {}
+            (BrokerOrderType::Market, None)
+                if request.legs.iter().all(|leg| leg.submitted_price.is_none()) => {}
             (BrokerOrderType::Limit | BrokerOrderType::AdaptiveLimit, Some(price))
-                if price > Decimal::ZERO => {}
+                if price > Decimal::ZERO
+                    && request.legs.iter().all(|leg| {
+                        leg.submitted_price
+                            .is_some_and(|value| value > Decimal::ZERO)
+                    }) => {}
             _ => return Err(BrokerError::InvalidPrice),
         }
         if let Some(order_id) = self.order_by_key.get(&request.idempotency_key) {
@@ -326,6 +360,8 @@ impl BrokerAdapter for PaperBroker {
             filled_quantity: 0,
             submitted_price: request.submitted_price,
             legs: request.legs,
+            child_orders: Vec::new(),
+            residual_exposure: false,
         };
         self.order_by_key
             .insert(request.idempotency_key, broker_order_id.clone());
@@ -341,6 +377,9 @@ impl BrokerAdapter for PaperBroker {
             .orders
             .get_mut(broker_order_id)
             .ok_or(BrokerError::OrderNotFound)?;
+        if order.status == BrokerOrderStatus::ReconcilePending {
+            return Err(BrokerError::NotReconciled);
+        }
         if matches!(
             order.status,
             BrokerOrderStatus::Filled | BrokerOrderStatus::Cancelled | BrokerOrderStatus::Rejected
@@ -441,6 +480,7 @@ mod tests {
                     broker_contract_id: None,
                     symbol: Some("QQQ".into()),
                     exchange: None,
+                    submitted_price: Some(Decimal::new(130, 2)),
                 },
                 BrokerOrderLeg {
                     contract_id: "QQQ-20260721-C-501".into(),
@@ -449,6 +489,7 @@ mod tests {
                     broker_contract_id: None,
                     symbol: Some("QQQ".into()),
                     exchange: None,
+                    submitted_price: Some(Decimal::new(5, 2)),
                 },
             ],
         }

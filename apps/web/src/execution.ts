@@ -37,6 +37,7 @@ export interface OptionQuoteProof {
   theta: string;
   vega: string;
   chain_snapshot_id: string;
+  provider: "THETADATA";
 }
 
 export interface AdaptiveLimitPolicy {
@@ -47,7 +48,7 @@ export interface AdaptiveLimitPolicy {
 }
 
 export interface CandidateTradePlan {
-  schema_version: "1.1";
+  schema_version: "1.2";
   plan_id: string;
   plan_hash: string;
   idempotency_key: string;
@@ -67,6 +68,7 @@ export interface CandidateTradePlan {
   order_side: "BUY" | "SELL";
   order_type: "MARKET" | "LIMIT" | "ADAPTIVE_LIMIT";
   adaptive_limit?: AdaptiveLimitPolicy;
+  market_data_provider: "THETADATA";
 }
 
 export interface ExecutionOrder {
@@ -85,6 +87,8 @@ export interface ExecutionOrder {
   expires_at_utc: string;
   updated_at_utc: string;
   state_version: number;
+  broker_child_order_ids: string[];
+  residual_exposure: boolean;
   risk_reason_codes: string[];
 }
 
@@ -147,7 +151,8 @@ function parseQuote(value: unknown): OptionQuoteProof | null {
     !decimal(value.theta) ||
     !decimal(value.vega) ||
     typeof value.chain_snapshot_id !== "string" ||
-    value.chain_snapshot_id.length === 0
+    value.chain_snapshot_id.length === 0 ||
+    value.provider !== "THETADATA"
   ) return null;
   return value as unknown as OptionQuoteProof;
 }
@@ -204,7 +209,7 @@ function parseLeg(value: unknown): CandidateLeg | null {
 }
 
 function parsePlan(value: unknown): CandidateTradePlan | null {
-  if (!record(value) || value.schema_version !== "1.1") return null;
+  if (!record(value) || value.schema_version !== "1.2") return null;
   const legs = Array.isArray(value.legs) ? value.legs.map(parseLeg) : [];
   const adaptive = value.adaptive_limit === undefined ? null : parseAdaptiveLimit(value.adaptive_limit);
   if (
@@ -231,10 +236,11 @@ function parsePlan(value: unknown): CandidateTradePlan | null {
     !["MARKET", "LIMIT", "ADAPTIVE_LIMIT"].includes(String(value.order_type)) ||
     (value.order_type === "ADAPTIVE_LIMIT" && !adaptive) ||
     (value.order_type !== "ADAPTIVE_LIMIT" && value.adaptive_limit !== undefined)
+    || value.market_data_provider !== "THETADATA"
   )
     return null;
   return {
-    schema_version: "1.1",
+    schema_version: "1.2",
     plan_id: value.plan_id,
     plan_hash: value.plan_hash,
     idempotency_key: value.idempotency_key,
@@ -253,6 +259,7 @@ function parsePlan(value: unknown): CandidateTradePlan | null {
     manual_confirmation_required: true,
     order_side: value.order_side as CandidateTradePlan["order_side"],
     order_type: value.order_type as CandidateTradePlan["order_type"],
+    market_data_provider: "THETADATA",
     ...(adaptive
       ? { adaptive_limit: adaptive }
       : {}),
@@ -280,6 +287,10 @@ function parseOrder(value: unknown): ExecutionOrder | null {
     !utc(value.updated_at_utc) ||
     !Number.isInteger(value.state_version) ||
     Number(value.state_version) < 1 ||
+    !Array.isArray(value.broker_child_order_ids) ||
+    !value.broker_child_order_ids.every((item) => typeof item === "string" && item.length > 0) ||
+    new Set(value.broker_child_order_ids).size !== value.broker_child_order_ids.length ||
+    typeof value.residual_exposure !== "boolean" ||
     !Array.isArray(value.risk_reason_codes) ||
     !value.risk_reason_codes.every((item) => typeof item === "string")
   )
@@ -321,6 +332,8 @@ export function isNewerExecutionOrder(current: ExecutionOrder, incoming: Executi
   return (
     incoming.state === current.state &&
     incoming.filled_quantity >= current.filled_quantity &&
+    incoming.residual_exposure === current.residual_exposure &&
+    incoming.broker_child_order_ids.join("\u0000") === current.broker_child_order_ids.join("\u0000") &&
     Date.parse(incoming.updated_at_utc) >= Date.parse(current.updated_at_utc)
   );
 }

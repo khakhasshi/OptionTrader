@@ -55,6 +55,21 @@ describe("parseExecutionTicket", () => {
     expect(
       parseExecutionTicket({
         ...TICKET,
+        plan: {
+          ...TICKET.plan,
+          legs: [{ ...TICKET.plan.legs[0], quote: { ...TICKET.plan.legs[0].quote, provider: "BROKER" } }],
+        },
+      }),
+    ).toBeNull();
+    expect(
+      parseExecutionTicket({
+        ...TICKET,
+        plan: { ...TICKET.plan, market_data_provider: "BROKER" },
+      }),
+    ).toBeNull();
+    expect(
+      parseExecutionTicket({
+        ...TICKET,
         plan: { ...TICKET.plan, order_type: "ADAPTIVE_LIMIT" },
       }),
     ).toBeNull();
@@ -84,6 +99,14 @@ describe("parseExecutionTicket", () => {
         state: "PARTIAL_FILL",
         state_version: 5,
         filled_quantity: 0,
+        updated_at_utc: "2099-07-21T14:30:02Z",
+      }),
+    ).toBe(false);
+    expect(
+      isNewerExecutionOrder(current, {
+        ...current,
+        residual_exposure: true,
+        broker_child_order_ids: ["child-1"],
         updated_at_utc: "2099-07-21T14:30:02Z",
       }),
     ).toBe(false);

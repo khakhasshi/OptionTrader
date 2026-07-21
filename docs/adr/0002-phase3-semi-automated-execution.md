@@ -37,11 +37,12 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
    React 跨不可用窗口保留 last-known 锚点并拒绝旧版本、成交量回退或同版本冲突。
 10. Rust workflow 原地推进订单，不在可失败步骤前从账本 remove。内部不一致会保留订单
     并进入 `RECONCILE_PENDING`，以便后续人工或 Broker 对账恢复。
-11. CandidateTradePlan 1.1 为每条腿携带报价时间、bid/ask size、Greeks 和 chain snapshot
-    proof。Rust 在 Stage/Confirm 检查报价时效、点差、Greeks、策略白名单和美东开仓窗口；
-    市价新开仓固定拒绝。
+11. CandidateTradePlan 1.2 为每条腿携带报价时间、bid/ask size、Greeks、chain snapshot
+    proof 与 `provider=THETADATA`，计划级 `market_data_provider` 也固定为 `THETADATA`；二者
+    都进入确定性 hash。Python 构造和 Rust Stage/Confirm 分别拒绝其他来源。市价新开仓固定拒绝。
 12. 自适应限价由 Rust 计算并受原计划保护价约束。adapter 只做确定性映射，不得用坏报价
-    退化到 touch/market。Longbridge 多腿 fail closed；IBKR 多腿使用 BAG。
+    退化到 touch/market。IBKR 多腿使用 BAG；Longbridge 按 Rust 计算的每腿价格受控拆腿，
+    所有 BUY 腿完整成交后才允许 SELL，partial/unknown 停止并投影残仓或要求对账。
 
 ## 当前限制
 
@@ -50,8 +51,9 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
 - capability 密文只有持有同一 Fernet 密钥的 API 实例可解密；缺失、错误或轮换不当均
   fail closed。密钥轮换与多密钥解密尚未实现。
 - Broker snapshot 尚未成为账户风险字段的动态来源；首个切片仍由启动配置注入。
-- Candidate 已携带并由 Rust 校验期权证明，但证明仍来自候选输入；Rust 直连的实时期权报价
-  权威源尚未落地，因此不能把该校验视为 live Gate。
+- Candidate 1.2 强制声明 ThetaData 来源并由 Rust 校验，但证明仍来自候选输入；受信任的
+  ThetaData option snapshot registry 尚未进入 Rust 权威状态，因此不能把来源字符串视为
+  paper/live Gate，真实提交继续禁用。
 - Longbridge/IBKR SDK 映射已开始，订单/成交全量流、sidecar gRPC、自动重启对账、持仓管理
   和保护性退出仍待后续切片。
 

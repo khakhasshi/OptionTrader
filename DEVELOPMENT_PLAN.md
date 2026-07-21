@@ -783,8 +783,10 @@ live        受控实盘，默认关闭
 任务：
 
 - CandidateTradePlan、仓位计算和 SOP 检查。
+- Candidate 计划级与每腿 quote/Greeks/chain proof 强制来自 ThetaData，并进入 hash。
 - Rust 硬风控、订单状态机、幂等与审计。
 - Longbridge/IBKR 账户、持仓、订单和成交适配。
+- Longbridge 无原生 combo 时由 Rust BUY-first 逐腿确认；IBKR 优先使用 BAG。
 - UI 人工确认、超时、取消和订单状态展示。
 - 先接 paper/shadow，实盘提交开关保持关闭。
 
@@ -793,6 +795,7 @@ live        受控实盘，默认关闭
 - 同一计划重复提交不会产生重复订单。
 - 部分成交、拒单、撤单、断线恢复和对账测试通过。
 - 所有订单可追溯到 signal、snapshot、规则版本和用户确认。
+- 任一非 ThetaData 行情证明、买腿未完整成交或拆腿状态未知都禁止提交卖腿。
 
 ### Phase 4：LLM 辅助与复盘（1-2 周）
 
@@ -857,7 +860,7 @@ live        受控实盘，默认关闭
 
 ### P2：验证后
 
-- 多腿执行优化和动态限价策略。
+- 多腿 cancel/replace 优化、跨腿实时净价复核和动态限价策略。
 - NATS JetStream 解耦实时消费者。
 - 更完整的 VIX term structure、VVIX 和跨市场确认。
 - LLM 盘中审核与规则研究助手。

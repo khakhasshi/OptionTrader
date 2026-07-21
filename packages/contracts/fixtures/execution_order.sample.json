@@ -14,5 +14,7 @@
   "expires_at_utc": "2026-07-21T14:31:00Z",
   "updated_at_utc": "2026-07-21T14:30:01Z",
   "state_version": 1,
+  "broker_child_order_ids": [],
+  "residual_exposure": false,
   "risk_reason_codes": []
 }

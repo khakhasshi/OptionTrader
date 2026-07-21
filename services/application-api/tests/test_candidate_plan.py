@@ -195,9 +195,31 @@ def test_adaptive_limit_policy_is_hash_bound_and_schema_valid() -> None:
     assert list(_validator().iter_errors(plan.model_dump(mode="json", exclude_none=True))) == []
 
 
-def test_missing_native_contract_and_longbridge_combo_fail_closed() -> None:
+def test_native_contract_required_and_longbridge_combo_is_buy_first_eligible() -> None:
     leg = _inputs().quoted_legs[0]
     with pytest.raises(ValueError, match="broker-native"):
         build_candidate_plan(_inputs(quoted_legs=(replace(leg, broker_contract_id=None),)))
-    with pytest.raises(ValueError, match="does not support multi-leg"):
-        build_candidate_plan(_inputs(broker_id="longbridge", quoted_legs=(leg, leg)))
+    hedge = replace(
+        leg,
+        contract_id="QQQ-20260720-505-C",
+        strike="505",
+        broker_contract_id="QQQ260720C00505000.US",
+    )
+    plan = build_candidate_plan(
+        _inputs(
+            broker_id="longbridge",
+            quoted_legs=(
+                replace(leg, broker_contract_id="QQQ260720C00500000.US"),
+                hedge,
+            ),
+        )
+    )
+    assert len(plan.legs) == 2
+
+
+def test_non_thetadata_market_or_option_proof_fails_closed() -> None:
+    with pytest.raises(ValueError, match="market data provider"):
+        build_candidate_plan(_inputs(market_data_provider="BROKER"))
+    leg = replace(_inputs().quoted_legs[0], quote_provider="BROKER")
+    with pytest.raises(ValueError, match="quote and Greeks provider"):
+        build_candidate_plan(_inputs(quoted_legs=(leg,)))

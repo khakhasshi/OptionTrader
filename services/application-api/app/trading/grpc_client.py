@@ -173,6 +173,8 @@ def order_from_proto(raw: Any) -> ExecutionOrder:
             "expires_at_utc": raw.expires_at_utc,
             "updated_at_utc": raw.updated_at_utc,
             "state_version": raw.state_version,
+            "broker_child_order_ids": list(raw.broker_child_order_ids),
+            "residual_exposure": raw.residual_exposure,
             "risk_reason_codes": reasons,
         }
     )

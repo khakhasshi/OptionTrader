@@ -114,4 +114,4 @@ gRPC（Python↔Rust）：已实现 StreamMarketSnapshots、GetDataHealth、Eval
 
 ## 11. 当前进度
 
-Phase 0、1 已完成，Phase 2 代码签收且完整 RTH 现场 soak 待执行。Phase 3 已进入开发：Candidate 1.1、两阶段 Rust 风控、期权报价/Greeks/chain proof、paper/shadow 状态机、PostgreSQL 审计、UI 人工确认和 Broker SDK 适配首批已完成；真实期权报价权威源、Broker 订单/成交流、动态账户快照、自动重启对账恢复及 paper 现场认证仍在进行。详见 `TASKS.md`。
+Phase 0、1 已完成，Phase 2 代码签收且完整 RTH 现场 soak 待执行。Phase 3 已进入开发：Candidate 1.2 已强制 ThetaData 行情来源，两阶段 Rust 风控、期权报价/Greeks/chain proof、Rust package/每腿定价、Longbridge BUY-first 受控拆腿、IBKR BAG、paper/shadow 状态机、PostgreSQL 审计和 UI 人工确认已完成首批；受信任 ThetaData option snapshot registry、Broker 订单/成交流、动态账户快照、自动重启对账恢复及 paper 现场认证仍在进行。详见 `TASKS.md`。

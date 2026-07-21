@@ -136,6 +136,7 @@ message OptionQuoteProof {
   string theta = 8;
   string vega = 9;
   string chain_snapshot_id = 10;
+  string provider = 11;
 }
 
 message AdaptiveLimitPolicy {
@@ -171,6 +172,8 @@ message CandidateTradePlan {
   OrderSide order_side = 23;
   BrokerOrderType order_type = 24;
   optional AdaptiveLimitPolicy adaptive_limit = 25;
+  // Market, option quote, Greeks and chain truth must be THETADATA.
+  string market_data_provider = 26;
 }
 
 message EventSourceProof {
@@ -231,6 +234,8 @@ message ExecutionOrder {
   repeated RiskReasonCode risk_reason_codes = 15;
   // Monotonic per-order FSM transition count. Clients reject lower versions.
   uint64 state_version = 16;
+  repeated string broker_child_order_ids = 17;
+  bool residual_exposure = 18;
 }
 
 message StageCandidateResponse {
