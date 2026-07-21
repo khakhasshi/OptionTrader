@@ -219,14 +219,17 @@ impl MarketService for MarketServiceImpl {
 
     async fn stream_market_snapshots(
         &self,
-        _request: Request<StreamRequest>,
+        request: Request<StreamRequest>,
     ) -> Result<Response<Self::StreamMarketSnapshotsStream>, Status> {
         let feed = Arc::clone(&self.feed);
-        let mut cursor_rx = self.cursor_tx.subscribe();
-        // Join at the CURRENT cursor: a late subscriber / reconnect resumes from
-        // here and never re-ingests already-produced history.
-        let mut sent = *cursor_rx.borrow();
+        let cursor_rx = self.cursor_tx.subscribe();
         let n = feed.ticks.len();
+        // Resume/backfill: sequence_number is 1-based (record i has seq i+1), so a
+        // client that last consumed seq S resumes at index S. resume=0 (fresh or
+        // restarted client) replays from session open — missing records are never
+        // silently skipped. Clamp to n so an over-large resume can't panic.
+        let resume = request.into_inner().resume_after_sequence as usize;
+        let mut sent = resume.min(n);
         self.ensure_producer();
 
         let (tx, rx) = mpsc::channel(64);
@@ -299,11 +302,19 @@ mod tests {
     }
 
     async fn drain(svc: &MarketServiceImpl) -> Vec<optiontrader_proto::market_v1::MarketTick> {
+        drain_from(svc, 0).await
+    }
+
+    async fn drain_from(
+        svc: &MarketServiceImpl,
+        resume_after_sequence: u64,
+    ) -> Vec<optiontrader_proto::market_v1::MarketTick> {
         use tokio_stream::StreamExt;
         let resp = svc
             .stream_market_snapshots(Request::new(StreamRequest {
                 session_id: "s".into(),
                 speedup: 0.0,
+                resume_after_sequence,
             }))
             .await
             .unwrap();
@@ -313,6 +324,32 @@ mod tests {
             out.push(item.unwrap());
         }
         out
+    }
+
+    #[tokio::test]
+    async fn resume_after_sequence_backfills_only_missed_records() {
+        // A client that last saw seq=3 reconnects with resume_after_sequence=3
+        // and must receive exactly 4,5,6 — the records it missed, in order.
+        let svc = MarketServiceImpl::new(feed());
+        let seqs: Vec<u64> = drain_from(&svc, 3)
+            .await
+            .iter()
+            .map(|t| t.snapshot.as_ref().unwrap().sequence_number)
+            .collect();
+        assert_eq!(seqs, vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn resume_zero_replays_from_session_open() {
+        // A fresh/restarted client (resume=0) backfills from the very first
+        // record, so history is never silently skipped.
+        let svc = MarketServiceImpl::new(feed());
+        let seqs: Vec<u64> = drain_from(&svc, 0)
+            .await
+            .iter()
+            .map(|t| t.snapshot.as_ref().unwrap().sequence_number)
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[tokio::test]

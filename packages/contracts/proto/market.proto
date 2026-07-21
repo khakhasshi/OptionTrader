@@ -89,9 +89,16 @@ message MarketTick {
 // session for traceability; speedup lets replay run faster than wall clock
 // (0 or 1 = as-recorded cadence is bounded by the server, deterministic order
 // is preserved regardless).
+//
+// resume_after_sequence supports gap-free reconnect: the server replays every
+// record whose MarketSnapshot.sequence_number is strictly greater than this
+// value from its per-session buffer, so a reconnecting client backfills exactly
+// the records it missed. 0 (the default / a fresh client) replays from session
+// open, so history is never silently skipped.
 message StreamRequest {
   string session_id = 1;
   double speedup = 2;
+  uint64 resume_after_sequence = 3;
 }
 
 message GetDataHealthRequest {}
