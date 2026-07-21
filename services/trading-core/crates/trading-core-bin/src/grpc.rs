@@ -213,6 +213,27 @@ impl MarketServiceImpl {
     }
 }
 
+/// Classify the whole batch currently visible to one subscriber. Falling more
+/// than one record behind enters reconciliation; that batch remains BACKFILL.
+fn delivery_phase_for_batch(sent: usize, cursor: usize, reconciling: &mut bool) -> DeliveryPhase {
+    if !*reconciling && cursor.saturating_sub(sent) > 1 {
+        *reconciling = true;
+    }
+    if *reconciling {
+        DeliveryPhase::Backfill
+    } else {
+        DeliveryPhase::Live
+    }
+}
+
+/// Leave reconciliation only after the complete catch-up batch was emitted.
+/// A later producer advance is therefore the first batch eligible for LIVE.
+fn finish_delivery_batch(sent: usize, cursor: usize, reconciling: &mut bool) {
+    if *reconciling && sent >= cursor {
+        *reconciling = false;
+    }
+}
+
 #[tonic::async_trait]
 impl MarketService for MarketServiceImpl {
     type StreamMarketSnapshotsStream = ReceiverStream<Result<ProtoTick, Status>>;
@@ -240,22 +261,14 @@ impl MarketService for MarketServiceImpl {
         tokio::spawn(async move {
             loop {
                 let cursor = *cursor_rx.borrow();
-                // A subscriber that falls more than one record behind has left
-                // the live edge. Treat the entire current batch as BACKFILL;
-                // only a later record produced after catch-up may be LIVE.
-                if !reconciling && cursor.saturating_sub(sent) > 1 {
-                    reconciling = true;
-                }
+                let delivery_phase =
+                    delivery_phase_for_batch(sent, cursor, &mut reconciling) as i32;
                 while sent < cursor {
                     let (snap, bar) = &feed.ticks[sent];
                     let tick = ProtoTick {
                         snapshot: Some(snapshot_to_proto(snap)),
                         bar: Some(bar_to_proto(bar)),
-                        delivery_phase: if reconciling {
-                            DeliveryPhase::Backfill as i32
-                        } else {
-                            DeliveryPhase::Live as i32
-                        },
+                        delivery_phase,
                         high_watermark_sequence: cursor as u64,
                     };
                     if tx.send(Ok(tick)).await.is_err() {
@@ -263,11 +276,7 @@ impl MarketService for MarketServiceImpl {
                     }
                     sent += 1;
                 }
-                if reconciling && sent >= cursor {
-                    // The catch-up batch itself remains BACKFILL. Only a later
-                    // record produced after this point may be emitted as LIVE.
-                    reconciling = false;
-                }
+                finish_delivery_batch(sent, cursor, &mut reconciling);
                 if sent >= n {
                     return; // replay exhausted -> end this stream
                 }
@@ -468,6 +477,18 @@ mod tests {
         for (i, (snap, _bar)) in f.ticks.iter().enumerate() {
             assert_eq!(snap.data_health, f.health_states[i].status);
         }
+    }
+
+    #[test]
+    fn caught_up_subscriber_marks_only_next_record_live() {
+        let mut reconciling = true;
+
+        let catch_up = delivery_phase_for_batch(1, 3, &mut reconciling);
+        assert_eq!(catch_up as i32, DeliveryPhase::Backfill as i32);
+
+        finish_delivery_batch(3, 3, &mut reconciling);
+        let next_record = delivery_phase_for_batch(3, 4, &mut reconciling);
+        assert_eq!(next_record as i32, DeliveryPhase::Live as i32);
     }
 
     #[tokio::test]

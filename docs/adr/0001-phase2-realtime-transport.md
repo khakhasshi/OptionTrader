@@ -65,6 +65,11 @@ DataHealth 权威唯一在 Rust Market Core。
     `trading-core` 二进制，再以 `OPTIONTRADER_REQUIRE_INTEGRATION=1` 执行真实
     Rust→gRPC→Python smoke；`make test` 必须包含该目标，不允许因二进制缺失而跳过。
 
+11. **watermark 回退保持粘滞闭锁**：同一 `session_id` 下 Trading Core 重启会令
+    内存 cursor 回退，既有 Projector 不自动接受新的低 watermark。当前受支持的恢复
+    方式是确认 Core 健康后重启 Application API；具体步骤见 `docs/RUNBOOK.md`。未来
+    以显式 `session_epoch` 区分合法的新数据世代。
+
 ## 影响
 
 - 新增依赖栈：Rust tonic/prost/tokio-stream；Python grpcio/grpcio-tools/
