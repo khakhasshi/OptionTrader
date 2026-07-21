@@ -1301,4 +1301,33 @@ mod tests {
             Err(BrokerError::OrderNotFound)
         );
     }
+
+    #[test]
+    #[ignore = "requires explicitly supplied Longbridge demo credentials and network access"]
+    fn demo_account_read_only_reconciliation_smoke() {
+        assert_eq!(
+            std::env::var("OPTIONTRADER_RUN_LONGBRIDGE_DEMO_SMOKE").as_deref(),
+            Ok("true"),
+            "explicit demo smoke opt-in is required"
+        );
+        let mut adapter = LongbridgeBroker::from_env(false)
+            .expect("official Longbridge SDK must initialize from environment credentials");
+        let disabled_request =
+            request(vec![(OrderSide::Buy, Decimal::ONE)], BrokerOrderType::Limit);
+        assert_eq!(
+            adapter.submit(disabled_request),
+            Err(BrokerError::LiveSubmissionDisabled)
+        );
+
+        adapter
+            .reconcile()
+            .expect("demo account facts must form a complete reconciled snapshot");
+        let account = adapter.account();
+        assert_eq!(account.broker_id, BrokerId::Longbridge);
+        assert_eq!(account.health, BrokerHealth::Healthy);
+        assert!(account.reconciled);
+        assert!(!account.currency.trim().is_empty());
+        assert!(!account.buying_power.is_sign_negative());
+        assert!(!account.net_liquidation.is_sign_negative());
+    }
 }

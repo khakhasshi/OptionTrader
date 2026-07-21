@@ -921,4 +921,26 @@ mod tests {
             Err(BrokerRecoveryError::OrderConflict)
         );
     }
+
+    #[tokio::test]
+    #[ignore = "requires explicitly supplied Longbridge demo credentials and network access"]
+    async fn demo_account_longbridge_authority_snapshot_smoke() {
+        assert_eq!(
+            std::env::var("OPTIONTRADER_RUN_LONGBRIDGE_DEMO_SMOKE").as_deref(),
+            Ok("true"),
+            "explicit demo smoke opt-in is required"
+        );
+        let authority = BrokerSnapshotAuthority::from_env();
+        let validated = authority
+            .fetch_snapshot(BrokerId::Longbridge as i32, Utc::now())
+            .await
+            .expect("Longbridge authority must produce a validated read-only snapshot");
+        assert_eq!(validated.snapshot.schema_version, "1.0");
+        assert!(validated.snapshot.snapshot_sequence > 0);
+        assert_eq!(validated.snapshot_hash.len(), 64);
+        assert_eq!(
+            validated.snapshot.account.unwrap().broker_id,
+            BrokerId::Longbridge as i32
+        );
+    }
 }

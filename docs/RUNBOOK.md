@@ -112,6 +112,16 @@ Longbridge 原生 adapter 从 `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、
 启用真实提交；持续对账可实例化 `submission_enabled=false` 的只读 adapter，且只允许读取事实和
 重建内存身份账本。仅在独立 paper 认证进程中显式启用提交。
 
+凭证写入 Git 忽略且权限为 `600` 的根目录 `.env` 后，可显式执行两条只读 demo smoke。测试
+默认 `ignored`，且内部再次要求 opt-in；第一条先断言 submit 返回 `LiveSubmissionDisabled`，
+第二条验证统一 BrokerSnapshot、sequence 和 SHA-256，不打印账户明细或凭证：
+
+```bash
+set -a; source .env; set +a
+OPTIONTRADER_RUN_LONGBRIDGE_DEMO_SMOKE=true cargo test --manifest-path services/trading-core/Cargo.toml -p broker longbridge::tests::demo_account_read_only_reconciliation_smoke -- --ignored --exact
+OPTIONTRADER_RUN_LONGBRIDGE_DEMO_SMOKE=true cargo test --manifest-path services/trading-core/Cargo.toml -p trading-core-bin broker_registry::tests::demo_account_longbridge_authority_snapshot_smoke -- --ignored --exact
+```
+
 Longbridge 多腿认证还需设置并记录以下参数；非法值会阻止 adapter 启动：
 
 ```text
