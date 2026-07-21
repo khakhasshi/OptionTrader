@@ -101,14 +101,14 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ plan_hash: ticket.plan.plan_hash }),
       });
-      if (!response.ok) throw new Error(response.status === 409 ? "RECONCILIATION REQUIRED" : "CONFIRM FAILED");
+      if (!response.ok) throw new Error(response.status === 409 ? "需要重新对账 · RECONCILIATION REQUIRED" : "确认失败 · CONFIRM FAILED");
       const parsed = parseExecutionTicket({ plan: ticket.plan, order: await response.json() });
-      if (!parsed) throw new Error("INVALID GATEWAY RESPONSE");
-      if (!updateActionOrder(parsed.order)) throw new Error("RECONCILIATION REQUIRED");
+      if (!parsed) throw new Error("网关响应无效 · INVALID GATEWAY RESPONSE");
+      if (!updateActionOrder(parsed.order)) throw new Error("需要重新对账 · RECONCILIATION REQUIRED");
       setReviewOpen(false);
       setAcknowledged(false);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "CONFIRM FAILED");
+      setError(cause instanceof Error ? cause.message : "确认失败 · CONFIRM FAILED");
     } finally {
       setPending(null);
     }
@@ -122,12 +122,12 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
       const response = await fetch(`/api/v1/trading/orders/${ticket.order.order_id}/cancel`, {
         method: "POST",
       });
-      if (!response.ok) throw new Error("CANCEL FAILED");
+      if (!response.ok) throw new Error("撤单失败 · CANCEL FAILED");
       const parsed = parseExecutionTicket({ plan: ticket.plan, order: await response.json() });
-      if (!parsed) throw new Error("INVALID GATEWAY RESPONSE");
-      if (!updateActionOrder(parsed.order)) throw new Error("RECONCILIATION REQUIRED");
+      if (!parsed) throw new Error("网关响应无效 · INVALID GATEWAY RESPONSE");
+      if (!updateActionOrder(parsed.order)) throw new Error("需要重新对账 · RECONCILIATION REQUIRED");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "CANCEL FAILED");
+      setError(cause instanceof Error ? cause.message : "撤单失败 · CANCEL FAILED");
     } finally {
       setPending(null);
     }
@@ -137,35 +137,35 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
     <section className="execution-band" aria-labelledby="execution-heading">
       <div className="section-heading-row">
         <div>
-          <h2 id="execution-heading">Execution</h2>
-          <span className="section-kicker">Rust authority · paper/shadow only</span>
+          <h2 id="execution-heading">执行控制</h2>
+          <span className="section-kicker">Rust 权威控制 · 仅模拟与影子模式</span>
         </div>
-        <button className="icon-button" title="Refresh execution state" onClick={() => void refresh()}>
+        <button className="icon-button" title="刷新执行状态" onClick={() => void refresh()}>
           <RefreshCw size={17} aria-hidden="true" />
-          <span className="sr-only">Refresh execution state</span>
+          <span className="sr-only">刷新执行状态</span>
         </button>
       </div>
 
-      {loadState === "LOADING" && <p className="muted-line">Loading order state…</p>}
-      {loadState === "EMPTY" && <p className="muted-line">No staged candidate</p>}
+      {loadState === "LOADING" && <p className="muted-line">正在加载订单状态…</p>}
+      {loadState === "EMPTY" && <p className="muted-line">暂无待确认候选订单</p>}
       {loadState === "UNAVAILABLE" && (
         <p className="alert-line" role="status">
-          <ShieldAlert size={16} aria-hidden="true" /> Execution audit unavailable
+          <ShieldAlert size={16} aria-hidden="true" /> 执行审计不可用
         </p>
       )}
       {ticket && loadState === "READY" && (
         <>
           <div className="execution-summary">
-            <div><span>State</span><strong className={`state state-${ticket.order.state.toLowerCase()}`}>{ticket.order.state}</strong></div>
-            <div><span>Strategy / effect</span><strong>{ticket.plan.strategy} · {ticket.plan.position_effect}</strong></div>
-            <div><span>Broker / mode</span><strong>{ticket.plan.broker_id.toUpperCase()} · {ticket.plan.execution_mode}</strong></div>
-            <div><span>Order / protection</span><strong>{ticket.plan.order_type} · {ticket.plan.limit_price}</strong></div>
-            <div><span>Filled</span><strong>{ticket.order.filled_quantity} / {ticket.order.total_quantity}</strong></div>
-            <div><span>TTL</span><strong className={remaining === 0 ? "danger-text" : ""}><Clock3 size={14} aria-hidden="true" /> {remaining}s</strong></div>
+            <div><span>状态</span><strong className={`state state-${ticket.order.state.toLowerCase()}`}>{ticket.order.state}</strong></div>
+            <div><span>策略 / 开平</span><strong>{ticket.plan.strategy} · {ticket.plan.position_effect}</strong></div>
+            <div><span>券商 / 模式</span><strong>{ticket.plan.broker_id.toUpperCase()} · {ticket.plan.execution_mode}</strong></div>
+            <div><span>订单 / 保护价</span><strong>{ticket.plan.order_type} · {ticket.plan.limit_price}</strong></div>
+            <div><span>已成交</span><strong>{ticket.order.filled_quantity} / {ticket.order.total_quantity}</strong></div>
+            <div><span>剩余时间</span><strong className={remaining === 0 ? "danger-text" : ""}><Clock3 size={14} aria-hidden="true" /> {remaining}秒</strong></div>
           </div>
 
-          <div className="legs-table" role="table" aria-label="Candidate option legs">
-            <div className="legs-head" role="row"><span>Side</span><span>Contract</span><span>Strike</span><span>Qty</span></div>
+          <div className="legs-table" role="table" aria-label="候选期权组合腿">
+            <div className="legs-head" role="row"><span>方向</span><span>合约</span><span>行权价</span><span>数量</span></div>
             {ticket.plan.legs.map((leg) => (
               <div className="legs-row" role="row" key={leg.contract_id}>
                 <span className={leg.side === "BUY" ? "buy-text" : "sell-text"}>{leg.side}</span>
@@ -175,14 +175,14 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
           </div>
 
           <div className="execution-meta">
-            <code title={ticket.plan.plan_hash}>Plan {ticket.plan.plan_hash.slice(0, 12)}</code>
-            <code>Rule {ticket.plan.rule_version}</code>
-            <code>Data {ticket.plan.market_data_provider}</code>
-            {ticket.order.broker_order_id && <code>Broker {ticket.order.broker_order_id}</code>}
+            <code title={ticket.plan.plan_hash}>计划 {ticket.plan.plan_hash.slice(0, 12)}</code>
+            <code>规则 {ticket.plan.rule_version}</code>
+            <code>数据源 {ticket.plan.market_data_provider}</code>
+            {ticket.order.broker_order_id && <code>券商单号 {ticket.order.broker_order_id}</code>}
           </div>
           {ticket.order.broker_child_orders.length > 0 && (
-            <div className="legs-table" role="table" aria-label="Broker child orders">
-              <div className="legs-head" role="row"><span>Child</span><span>Side</span><span>Filled</span><span>State</span></div>
+            <div className="legs-table" role="table" aria-label="券商子订单">
+              <div className="legs-head" role="row"><span>子单</span><span>方向</span><span>成交</span><span>状态</span></div>
               {ticket.order.broker_child_orders.map((child) => (
                 <div className="legs-row" role="row" key={child.broker_order_id}>
                   <span title={child.broker_order_id}>{child.broker_order_id.slice(0, 12)}</span>
@@ -194,7 +194,7 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
             </div>
           )}
           {ticket.order.residual_exposure && (
-            <p className="alert-line" role="alert"><ShieldAlert size={16} aria-hidden="true" /> Residual exposure · {ticket.order.broker_child_orders.reduce((sum, child) => sum + child.filled_quantity, 0)} child contracts filled · reconciliation required</p>
+            <p className="alert-line" role="alert"><ShieldAlert size={16} aria-hidden="true" /> 存在残余敞口 · 已成交 {ticket.order.broker_child_orders.reduce((sum, child) => sum + child.filled_quantity, 0)} 张子单合约 · 必须重新对账</p>
           )}
           {ticket.order.risk_reason_codes.length > 0 && (
             <p className="alert-line"><ShieldAlert size={16} aria-hidden="true" /> {ticket.order.risk_reason_codes.join(" · ")}</p>
@@ -203,10 +203,10 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
 
           <div className="execution-actions">
             <button className="primary-command" disabled={!confirmable} onClick={() => setReviewOpen(true)}>
-              <CheckCircle2 size={17} aria-hidden="true" /> Confirm
+              <CheckCircle2 size={17} aria-hidden="true" /> 确认执行
             </button>
             <button className="secondary-command" disabled={!cancellable} onClick={() => void cancel()}>
-              <XCircle size={17} aria-hidden="true" /> {pending === "cancel" ? "Cancelling" : "Cancel"}
+              <XCircle size={17} aria-hidden="true" /> {pending === "cancel" ? "正在撤单" : "取消订单"}
             </button>
           </div>
         </>
@@ -216,23 +216,23 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
         <div className="modal-scrim" role="presentation">
           <div className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
             <div className="dialog-icon"><ShieldAlert size={20} aria-hidden="true" /></div>
-            <h3 id="confirm-title">Confirm exact plan</h3>
+            <h3 id="confirm-title">确认精确执行计划</h3>
             <dl>
-              <div><dt>Strategy</dt><dd>{ticket.plan.strategy}</dd></div>
-              <div><dt>Position effect</dt><dd>{ticket.plan.position_effect}</dd></div>
-              <div><dt>Order</dt><dd>{ticket.plan.order_side} {ticket.plan.order_type}</dd></div>
-              <div><dt>Protection</dt><dd>{ticket.plan.limit_price}</dd></div>
-              <div><dt>Max loss</dt><dd>{ticket.plan.max_loss}</dd></div>
-              <div><dt>Mode</dt><dd>{ticket.plan.execution_mode}</dd></div>
+              <div><dt>策略</dt><dd>{ticket.plan.strategy}</dd></div>
+              <div><dt>开平标记</dt><dd>{ticket.plan.position_effect}</dd></div>
+              <div><dt>订单</dt><dd>{ticket.plan.order_side} {ticket.plan.order_type}</dd></div>
+              <div><dt>保护价格</dt><dd>{ticket.plan.limit_price}</dd></div>
+              <div><dt>最大亏损</dt><dd>{ticket.plan.max_loss}</dd></div>
+              <div><dt>执行模式</dt><dd>{ticket.plan.execution_mode}</dd></div>
             </dl>
             <label className="confirm-check">
               <input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} />
-              <span>I verified position effect, contracts, protection and maximum loss.</span>
+              <span>我已核对开平标记、合约、保护价格与最大亏损。</span>
             </label>
             <div className="dialog-actions">
-              <button className="secondary-command" onClick={() => { setReviewOpen(false); setAcknowledged(false); }}>Back</button>
+              <button className="secondary-command" onClick={() => { setReviewOpen(false); setAcknowledged(false); }}>返回</button>
               <button className="primary-command" disabled={!acknowledged || pending !== null} onClick={() => void confirm()}>
-                <CheckCircle2 size={17} aria-hidden="true" /> {pending === "confirm" ? "Submitting" : "Confirm exact hash"}
+                <CheckCircle2 size={17} aria-hidden="true" /> {pending === "confirm" ? "正在提交" : "提交精确哈希"}
               </button>
             </div>
           </div>

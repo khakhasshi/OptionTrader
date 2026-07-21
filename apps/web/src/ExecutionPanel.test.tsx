@@ -29,11 +29,11 @@ describe("ExecutionPanel", () => {
     vi.stubGlobal("fetch", fetchMock);
     render(<ExecutionPanel sessionId="live" canTrade />);
 
-    const confirm = await screen.findByRole("button", { name: "Confirm" });
+    const confirm = await screen.findByRole("button", { name: "确认执行" });
     expect(screen.getByText("LongGamma · OPEN")).toBeInTheDocument();
     expect(confirm).toBeEnabled();
     fireEvent.click(confirm);
-    const finalButton = screen.getByRole("button", { name: "Confirm exact hash" });
+    const finalButton = screen.getByRole("button", { name: "提交精确哈希" });
     expect(finalButton).toBeDisabled();
     fireEvent.click(screen.getByRole("checkbox"));
     expect(finalButton).toBeEnabled();
@@ -54,7 +54,7 @@ describe("ExecutionPanel", () => {
       vi.fn(async () => ({ ok: true, status: 200, json: async () => TICKET }) as Response),
     );
     render(<ExecutionPanel sessionId="live" canTrade={false} />);
-    expect(await screen.findByRole("button", { name: "Confirm" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "确认执行" })).toBeDisabled();
   });
 
   it("does not let the new-position UI gate block a protective close", async () => {
@@ -74,7 +74,7 @@ describe("ExecutionPanel", () => {
       vi.fn(async () => ({ ok: true, status: 200, json: async () => closeTicket }) as Response),
     );
     render(<ExecutionPanel sessionId="live" canTrade={false} />);
-    expect(await screen.findByRole("button", { name: "Confirm" })).toBeEnabled();
+    expect(await screen.findByRole("button", { name: "确认执行" })).toBeEnabled();
   });
 
   it("fails closed on malformed or unavailable audit responses", async () => {
@@ -83,8 +83,8 @@ describe("ExecutionPanel", () => {
       vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ bad: true }) }) as Response),
     );
     render(<ExecutionPanel sessionId="live" canTrade />);
-    expect(await screen.findByText("Execution audit unavailable")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Confirm" })).not.toBeInTheDocument();
+    expect(await screen.findByText("执行审计不可用")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "确认执行" })).not.toBeInTheDocument();
   });
 
   it("does not regress after a stale polling response", async () => {
@@ -110,12 +110,12 @@ describe("ExecutionPanel", () => {
       }),
     );
     render(<ExecutionPanel sessionId="live" canTrade />);
-    fireEvent.click(await screen.findByRole("button", { name: "Confirm" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认执行" }));
     fireEvent.click(screen.getByRole("checkbox"));
-    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Confirm exact hash" })));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "提交精确哈希" })));
     await waitFor(() => expect(screen.getByText("WORKING")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole("button", { name: "Refresh execution state" }));
+    fireEvent.click(screen.getByRole("button", { name: "刷新执行状态" }));
     await waitFor(() => expect(getCount).toBeGreaterThan(1));
     expect(screen.getByText("WORKING")).toBeInTheDocument();
     expect(screen.queryByText("AWAITING_CONFIRMATION")).not.toBeInTheDocument();
@@ -144,13 +144,13 @@ describe("ExecutionPanel", () => {
     render(<ExecutionPanel sessionId="live" canTrade />);
     expect(await screen.findByText("WORKING")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Refresh execution state" }));
-    expect(await screen.findByText("Execution audit unavailable")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Refresh execution state" }));
+    fireEvent.click(screen.getByRole("button", { name: "刷新执行状态" }));
+    expect(await screen.findByText("执行审计不可用")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "刷新执行状态" }));
 
     expect(await screen.findByText("WORKING")).toBeInTheDocument();
     expect(screen.queryByText("AWAITING_CONFIRMATION")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "确认执行" })).toBeDisabled();
   });
 
   it("surfaces a same-version action conflict instead of silently keeping stale state", async () => {
@@ -168,10 +168,10 @@ describe("ExecutionPanel", () => {
       }),
     );
     render(<ExecutionPanel sessionId="live" canTrade />);
-    fireEvent.click(await screen.findByRole("button", { name: "Confirm" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认执行" }));
     fireEvent.click(screen.getByRole("checkbox"));
-    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Confirm exact hash" })));
-    expect(await screen.findByText("RECONCILIATION REQUIRED")).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "提交精确哈希" })));
+    expect(await screen.findByText("需要重新对账 · RECONCILIATION REQUIRED")).toBeInTheDocument();
     expect(screen.getByText("AWAITING_CONFIRMATION")).toBeInTheDocument();
   });
 });
