@@ -34,7 +34,7 @@
     },
     "ServiceHealth": {
       "type": "object",
-      "description": "Runtime /health payload served by trading-core and proxied by the Application BFF to the Cockpit. Single source of truth for the fail-closed trading gate. new_position_allowed MUST equal (data_health==HEALTHY AND broker_health==HEALTHY AND reconciled).",
+      "description": "Runtime /health payload served by trading-core and proxied by the Application BFF to the Cockpit. Single source of truth for the fail-closed trading gate. new_position_allowed MAY be false because of additional authoritative account limits, cooldowns, kill switches, or rule-version checks; when true, data and broker health MUST be HEALTHY and reconciliation MUST be complete.",
       "properties": {
         "schema_version": { "type": "string", "const": "1.0" },
         "status": { "type": "string", "enum": ["ok", "unreachable"] },

@@ -13,6 +13,7 @@ import {
   type SignalView,
 } from "./cockpitState";
 import { useCockpitStream } from "./useCockpitStream";
+import { ExecutionPanel } from "./ExecutionPanel";
 
 /**
  * Phase 2 real-time Cockpit. Two independent channels feed the fail-closed
@@ -167,6 +168,8 @@ export function Cockpit() {
           None
         </p>
       )}
+
+      <ExecutionPanel sessionId={SESSION_ID} canTrade={canTrade} />
 
       <h2 style={{ marginTop: 28, fontSize: 18 }}>Signal Log</h2>
       <SignalLog entries={signalLog} />

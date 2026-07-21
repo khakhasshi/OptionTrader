@@ -10,12 +10,16 @@ drifts from the migration, the insert fails loudly rather than writing garbage.
 from __future__ import annotations
 
 from sqlalchemy import (
+    BigInteger,
     Column,
     Date,
     DateTime,
+    Integer,
     MetaData,
+    Numeric,
     Table,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.types import JSON
@@ -25,6 +29,7 @@ metadata = MetaData()
 # Use JSONB on Postgres, plain JSON elsewhere (SQLite in tests). variant() keeps
 # one definition working across both without a second table.
 _JSON = JSONB().with_variant(JSON(), "sqlite")
+_BIGINT = BigInteger().with_variant(Integer(), "sqlite")
 
 # trading.signals — one row per engine tick: the selected strategy (or No Trade)
 # with the regime/vol context and the No-Trade reason for review.
@@ -77,4 +82,78 @@ event_contexts = Table(
     schema="events",
 )
 
-__all__ = ["metadata", "signals", "audit_events", "event_contexts"]
+candidate_trade_plans = Table(
+    "candidate_trade_plans",
+    metadata,
+    Column("plan_id", Text, primary_key=True),
+    Column("signal_id", Text, nullable=False),
+    Column("session_id", Text, nullable=False),
+    Column("status", Text, nullable=False),
+    Column("strategy_kind", Text, nullable=False),
+    Column("plan_hash", Text, nullable=False, unique=True),
+    Column("idempotency_key", Text, nullable=False, unique=True),
+    Column("execution_mode", Text, nullable=False),
+    Column("expires_at_utc", DateTime(timezone=True), nullable=False),
+    Column("created_at_utc", DateTime(timezone=True)),
+    Column("payload", _JSON, nullable=False),
+    schema="trading",
+)
+
+orders = Table(
+    "orders",
+    metadata,
+    Column("order_id", Text, primary_key=True),
+    Column("plan_id", Text, nullable=False),
+    Column("session_id", Text, nullable=False),
+    Column("idempotency_key", Text, nullable=False),
+    Column("status", Text, nullable=False),
+    Column("side", Text, nullable=False),
+    Column("quantity", Numeric, nullable=False),
+    Column("filled_quantity", Numeric, nullable=False),
+    Column("limit_price", Numeric),
+    Column("broker_order_id", Text, unique=True),
+    Column("payload", _JSON),
+    Column("created_at_utc", DateTime(timezone=True)),
+    Column("updated_at_utc", DateTime(timezone=True)),
+    UniqueConstraint("idempotency_key"),
+    schema="trading",
+)
+
+order_events = Table(
+    "order_events",
+    metadata,
+    Column("id", _BIGINT, primary_key=True, autoincrement=True),
+    Column("order_id", Text, nullable=False),
+    Column("occurred_at_utc", DateTime(timezone=True), nullable=False),
+    Column("event_type", Text, nullable=False),
+    Column("from_status", Text),
+    Column("to_status", Text),
+    Column("payload", _JSON),
+    Column("created_at_utc", DateTime(timezone=True)),
+    schema="trading",
+)
+
+risk_decisions = Table(
+    "risk_decisions",
+    metadata,
+    Column("id", _BIGINT, primary_key=True, autoincrement=True),
+    Column("plan_id", Text, nullable=False),
+    Column("session_id", Text, nullable=False),
+    Column("occurred_at_utc", DateTime(timezone=True), nullable=False),
+    Column("decision", Text, nullable=False),
+    Column("reason_code", Text),
+    Column("payload", _JSON),
+    Column("created_at_utc", DateTime(timezone=True)),
+    schema="risk",
+)
+
+__all__ = [
+    "audit_events",
+    "candidate_trade_plans",
+    "event_contexts",
+    "metadata",
+    "order_events",
+    "orders",
+    "risk_decisions",
+    "signals",
+]

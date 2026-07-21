@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Annotated, Literal
+from functools import lru_cache
+from threading import RLock
+from typing import Annotated, Literal, Mapping
 
+import grpc
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import (
     AfterValidator,
@@ -28,20 +31,101 @@ from pydantic import (
     StringConstraints,
     ValidationError,
 )
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
+from app.persistence import (
+    latest_execution_ticket,
+    persist_confirmation_intent,
+    persist_order_projection,
+    persist_staged_candidate,
+    staged_plan_projection,
+)
 from app.realtime.projector import ProjectorConfig
 from app.realtime.session import current_event_context, get_hub, latest_frame
+from app.trading.grpc_client import (
+    cancel_order as grpc_cancel_order,
+    confirm_candidate as grpc_confirm_candidate,
+    get_order as grpc_get_order,
+    stage_candidate as grpc_stage_candidate,
+)
+from app.trading.models import CandidateTradePlan, ExecutionOrder, RiskDecision
 
 __all__ = ["app", "httpx"]
+
+
+def _validate_single_worker_configuration(environment: Mapping[str, str]) -> None:
+    """Opaque confirmation capabilities are process-local by design."""
+    for name in ("OPTIONTRADER_API_WORKERS", "WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        raw = environment.get(name)
+        if raw is None:
+            continue
+        try:
+            workers = int(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be the integer 1") from exc
+        if workers != 1:
+            raise RuntimeError(f"{name}=1 is required while confirmation tokens are process-local")
+
+
+_validate_single_worker_configuration(os.environ)
 
 app = FastAPI(title="OptionTrader Application API", version="0.0.0")
 
 TRADING_CORE_URL = os.getenv("TRADING_CORE_URL", "http://localhost:8080")
 _TIMEOUT = 1.5
-_RULE_VERSION = os.getenv("OPTIONTRADER_RULE_VERSION", "phase1-2026-07-21")
+_RULE_VERSION = os.getenv("OPTIONTRADER_RULE_VERSION", "UNCONFIRMED")
 
 DataHealth = Literal["HEALTHY", "DEGRADED", "STALE", "DISCONNECTED", "RECONCILING"]
 BrokerHealth = Literal["HEALTHY", "DEGRADED", "DISCONNECTED", "RECONCILING"]
+
+
+@lru_cache(maxsize=1)
+def _execution_engine(database_url: str) -> Engine:
+    url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return create_engine(url, pool_pre_ping=True)
+
+
+def _require_execution_engine() -> Engine:
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise HTTPException(status_code=503, detail="execution_audit_unavailable")
+    return _execution_engine(database_url)
+
+
+def _grpc_http_error(exc: grpc.RpcError) -> HTTPException:
+    code = exc.code()
+    status = {
+        grpc.StatusCode.NOT_FOUND: 404,
+        grpc.StatusCode.PERMISSION_DENIED: 403,
+        grpc.StatusCode.FAILED_PRECONDITION: 409,
+    }.get(code, 503)
+    return HTTPException(status_code=status, detail=f"execution_gateway_{code.name.lower()}")
+
+
+class ConfirmOrderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    plan_hash: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
+
+
+class StagedCandidateView(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    initial_risk_decision: RiskDecision
+    order: ExecutionOrder | None
+
+
+class ExecutionTicket(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    plan: CandidateTradePlan
+    order: ExecutionOrder
+
+
+_CONFIRMATION_TOKENS: dict[str, str] = {}
+_CONFIRMATION_TOKENS_LOCK = RLock()
 
 
 def _check_utc(v: str) -> str:
@@ -235,6 +319,125 @@ def event_context() -> JSONResponse:
     """Current deterministic EventContext; unavailable inputs remain HTTP 200 but fail closed."""
     context = current_event_context()
     return JSONResponse(status_code=200, content=context.model_dump(mode="json"))
+
+
+@app.post("/api/v1/trading/candidates/stage", response_model=StagedCandidateView)
+def stage_trading_candidate(plan: CandidateTradePlan) -> StagedCandidateView:
+    """Run Rust Initial Risk, issue a hash-bound confirmation challenge, and audit it."""
+    engine = _require_execution_engine()
+    try:
+        existing = staged_plan_projection(engine, plan.plan_id)
+        if existing is not None:
+            _status, durable_order = existing
+            if durable_order is None:
+                raise HTTPException(status_code=409, detail="candidate_already_audited")
+            try:
+                gateway_order = grpc_get_order(durable_order.order_id)
+            except grpc.RpcError as exc:
+                if exc.code() == grpc.StatusCode.NOT_FOUND:
+                    raise HTTPException(
+                        status_code=409, detail="execution_reconciliation_required"
+                    ) from exc
+                raise
+            if (
+                gateway_order.plan_hash != durable_order.plan_hash
+                or gateway_order.idempotency_key != durable_order.idempotency_key
+            ):
+                raise HTTPException(status_code=409, detail="execution_reconciliation_required")
+        result = grpc_stage_candidate(plan, current_event_context())
+        persist_staged_candidate(engine, plan, result)
+        if result.order is not None:
+            with _CONFIRMATION_TOKENS_LOCK:
+                _CONFIRMATION_TOKENS[result.order.order_id] = result.confirmation_token
+        return StagedCandidateView(
+            initial_risk_decision=result.initial_risk_decision,
+            order=result.order,
+        )
+    except grpc.RpcError as exc:
+        raise _grpc_http_error(exc) from exc
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="execution_audit_write_failed") from exc
+
+
+@app.post("/api/v1/trading/orders/{order_id}/confirm", response_model=ExecutionOrder)
+def confirm_trading_order(order_id: str, body: ConfirmOrderRequest) -> ExecutionOrder:
+    """Audit intent, then ask Rust to rerun Final Risk and submit paper/shadow."""
+    engine = _require_execution_engine()
+    try:
+        with _CONFIRMATION_TOKENS_LOCK:
+            confirmation_token = _CONFIRMATION_TOKENS.get(order_id)
+        if confirmation_token is None:
+            raise HTTPException(status_code=409, detail="confirmation_reconciliation_required")
+        recorded = persist_confirmation_intent(engine, order_id, body.plan_hash, "local-operator")
+        if not recorded:
+            existing = grpc_get_order(order_id)
+            if existing.state != "AWAITING_CONFIRMATION":
+                with _CONFIRMATION_TOKENS_LOCK:
+                    _CONFIRMATION_TOKENS.pop(order_id, None)
+                return existing
+        order = grpc_confirm_candidate(
+            order_id,
+            body.plan_hash,
+            confirmation_token,
+            current_event_context(),
+        )
+        persist_order_projection(
+            engine,
+            order,
+            action="ORDER_CONFIRM_RESULT",
+            actor="rust-execution-gateway",
+        )
+        if order.state != "AWAITING_CONFIRMATION":
+            with _CONFIRMATION_TOKENS_LOCK:
+                _CONFIRMATION_TOKENS.pop(order_id, None)
+        return order
+    except grpc.RpcError as exc:
+        raise _grpc_http_error(exc) from exc
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="execution_audit_write_failed") from exc
+
+
+@app.post("/api/v1/trading/orders/{order_id}/cancel", response_model=ExecutionOrder)
+def cancel_trading_order(order_id: str) -> ExecutionOrder:
+    engine = _require_execution_engine()
+    try:
+        order = grpc_cancel_order(order_id)
+        persist_order_projection(
+            engine, order, action="ORDER_CANCEL_RESULT", actor="rust-execution-gateway"
+        )
+        return order
+    except grpc.RpcError as exc:
+        raise _grpc_http_error(exc) from exc
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="execution_audit_write_failed") from exc
+
+
+@app.get("/api/v1/trading/orders/{order_id}", response_model=ExecutionOrder)
+def trading_order(order_id: str) -> ExecutionOrder:
+    engine = _require_execution_engine()
+    try:
+        order = grpc_get_order(order_id)
+        persist_order_projection(
+            engine, order, action="ORDER_RECONCILED", actor="rust-execution-gateway"
+        )
+        return order
+    except grpc.RpcError as exc:
+        raise _grpc_http_error(exc) from exc
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="execution_audit_write_failed") from exc
+
+
+@app.get("/api/v1/trading/orders", response_model=ExecutionTicket)
+def latest_trading_order(session_id: str | None = None) -> ExecutionTicket:
+    engine = _require_execution_engine()
+    try:
+        ticket = latest_execution_ticket(engine, session_id=session_id)
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="execution_audit_read_failed") from exc
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="order_not_found")
+    plan, order = ticket
+    return ExecutionTicket(plan=plan, order=order)
 
 
 @app.websocket("/api/v1/stream/cockpit")

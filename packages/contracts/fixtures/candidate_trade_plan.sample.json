@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0",
+  "plan_id": "plan_demo_001",
+  "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "idempotency_key": "idem_demo_001",
+  "session_id": "session_2026-07-20",
+  "signal_id": "signal_demo_001",
+  "broker_id": "ibkr",
+  "strategy": "LongGamma",
+  "execution_mode": "PAPER",
+  "created_at_utc": "2026-07-20T14:30:00Z",
+  "legs": [
+    {
+      "side": "BUY",
+      "type": "CALL",
+      "contract_id": "QQQ-20260720-500-C",
+      "expiry": "2026-07-20",
+      "strike": "500",
+      "quantity": 1
+    }
+  ],
+  "limit_price": "2.50",
+  "max_slippage": "0.10",
+  "max_loss": "250.00",
+  "take_profit": "100.00",
+  "stop_loss": "75.00",
+  "time_stop_minutes": 30,
+  "invalidation_rules": ["underlying_reenters_opening_range"],
+  "expires_at_utc": "2026-07-20T14:31:00Z",
+  "rule_version": "rules_p3_1.0.0",
+  "data_snapshot_ids": ["mkt_demo_001", "opt_demo_001"],
+  "manual_confirmation_required": true
+}

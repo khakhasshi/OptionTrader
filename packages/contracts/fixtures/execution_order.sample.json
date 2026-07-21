@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "order_id": "order_0123456789abcdef01234567",
+  "plan_id": "plan_0123456789abcdef01234567",
+  "plan_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "idempotency_key": "submit_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "session_id": "session_20260721",
+  "broker_id": "ibkr",
+  "execution_mode": "PAPER",
+  "state": "AWAITING_CONFIRMATION",
+  "total_quantity": 1,
+  "filled_quantity": 0,
+  "broker_order_id": null,
+  "expires_at_utc": "2026-07-21T14:31:00Z",
+  "updated_at_utc": "2026-07-21T14:30:01Z",
+  "state_version": 1,
+  "risk_reason_codes": []
+}

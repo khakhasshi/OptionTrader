@@ -25,12 +25,19 @@ from sqlalchemy.engine import Engine
 from app.persistence import (
     SignalContext,
     audit_events,
+    candidate_trade_plans,
     build_signal_contract,
     build_signal_rows,
     event_contexts,
     metadata,
+    order_events,
+    orders,
+    persist_confirmation_intent,
+    persist_order_projection,
     persist_signal,
     persist_event_context,
+    persist_staged_candidate,
+    risk_decisions,
     signals,
 )
 from app.events import unavailable_event_context
@@ -43,6 +50,12 @@ from app.strategy import (
     StrategyDecision,
 )
 from app.vol import IV_CHEAP, IV_RICH, VolState
+from app.trading.models import (
+    CandidateTradePlan,
+    ExecutionOrder,
+    RiskDecision,
+    StageCandidateResult,
+)
 
 UTC = timezone.utc
 _ROOT = Path(__file__).resolve().parents[3]
@@ -259,6 +272,7 @@ def engine() -> Engine:
         cur.execute("ATTACH DATABASE ':memory:' AS trading")
         cur.execute("ATTACH DATABASE ':memory:' AS audit")
         cur.execute("ATTACH DATABASE ':memory:' AS events")
+        cur.execute("ATTACH DATABASE ':memory:' AS risk")
         cur.close()
 
     metadata.create_all(eng)
@@ -284,6 +298,141 @@ def test_persist_event_context_writes_context_and_audit_idempotently(engine: Eng
     assert event_rows[0]["payload"]["available"] is False
     assert len(audits) == 1
     assert audits[0]["to_status"] == "UNAVAILABLE"
+
+
+def _staged_models() -> tuple[CandidateTradePlan, StageCandidateResult]:
+    fixture_dir = _ROOT / "packages/contracts/fixtures"
+    plan = CandidateTradePlan.model_validate(
+        json.loads((fixture_dir / "candidate_trade_plan.sample.json").read_text())
+    )
+    decision = RiskDecision.model_validate(
+        json.loads((fixture_dir / "risk_decision.sample.json").read_text())
+    )
+    order = ExecutionOrder(
+        schema_version="1.0",
+        order_id="order_demo_001",
+        plan_id=plan.plan_id,
+        plan_hash=plan.plan_hash,
+        idempotency_key=plan.idempotency_key,
+        session_id=plan.session_id,
+        broker_id=plan.broker_id,
+        execution_mode=plan.execution_mode,
+        state="AWAITING_CONFIRMATION",
+        total_quantity=1,
+        filled_quantity=0,
+        broker_order_id=None,
+        expires_at_utc=plan.expires_at_utc,
+        updated_at_utc="2026-07-20T14:30:01Z",
+        state_version=1,
+        risk_reason_codes=[],
+    )
+    return plan, StageCandidateResult(
+        initial_risk_decision=decision,
+        order=order,
+        confirmation_token="never-persist-this",
+    )
+
+
+def test_execution_persistence_is_atomic_idempotent_and_omits_token(engine: Engine) -> None:
+    plan, result = _staged_models()
+    assert persist_staged_candidate(engine, plan, result) is True
+    assert persist_staged_candidate(engine, plan, result) is False
+
+    with engine.connect() as conn:
+        plan_row = conn.execute(select(candidate_trade_plans)).mappings().one()
+        risk_row = conn.execute(select(risk_decisions)).mappings().one()
+        order_row = conn.execute(select(orders)).mappings().one()
+        event_row = conn.execute(select(order_events)).mappings().one()
+        audit_rows = conn.execute(select(audit_events)).mappings().all()
+    serialized = json.dumps(
+        [
+            plan_row["payload"],
+            risk_row["payload"],
+            event_row["payload"],
+            [row["payload"] for row in audit_rows],
+        ]
+    )
+    assert "never-persist-this" not in serialized
+    assert order_row["status"] == "AWAITING_CONFIRMATION"
+
+
+def test_confirmation_intent_precedes_order_projection_and_is_idempotent(engine: Engine) -> None:
+    plan, result = _staged_models()
+    persist_staged_candidate(engine, plan, result)
+    assert persist_confirmation_intent(engine, "order_demo_001", plan.plan_hash, "local-operator")
+    assert not persist_confirmation_intent(
+        engine, "order_demo_001", plan.plan_hash, "local-operator"
+    )
+    assert result.order is not None
+    working = result.order.model_copy(
+        update={
+            "state": "WORKING",
+            "state_version": 4,
+            "broker_order_id": "paper-order-1",
+            "updated_at_utc": "2026-07-20T14:30:02Z",
+        }
+    )
+    assert persist_order_projection(
+        engine, working, action="ORDER_CONFIRMED", actor="rust-execution-gateway"
+    )
+    assert not persist_order_projection(
+        engine, working, action="ORDER_CONFIRMED", actor="rust-execution-gateway"
+    )
+    with engine.connect() as conn:
+        assert conn.execute(select(orders.c.status)).scalar_one() == "WORKING"
+        actions = conn.execute(select(audit_events.c.action)).scalars().all()
+    assert "CONFIRMATION_REQUESTED" in actions
+    assert "ORDER_CONFIRMED" in actions
+
+
+def test_order_projection_rejects_stale_or_conflicting_versions(engine: Engine) -> None:
+    plan, result = _staged_models()
+    persist_staged_candidate(engine, plan, result)
+    assert result.order is not None
+    working = result.order.model_copy(
+        update={
+            "state": "WORKING",
+            "state_version": 4,
+            "broker_order_id": "paper-order-1",
+            "updated_at_utc": "2026-07-20T14:30:04Z",
+        }
+    )
+    assert persist_order_projection(engine, working, action="WORKING", actor="gateway")
+
+    assert not persist_order_projection(
+        engine,
+        result.order,
+        action="STALE_STAGE",
+        actor="gateway",
+    )
+    conflict = working.model_copy(update={"state": "FILLED"})
+    with pytest.raises(ValueError, match="state_version"):
+        persist_order_projection(engine, conflict, action="CONFLICT", actor="gateway")
+
+    partial = working.model_copy(
+        update={
+            "state": "PARTIAL_FILL",
+            "state_version": 5,
+            "filled_quantity": 1,
+            "updated_at_utc": "2026-07-20T14:30:05Z",
+        }
+    )
+    assert persist_order_projection(engine, partial, action="PARTIAL", actor="gateway")
+    second_partial = partial.model_copy(
+        update={
+            "state_version": 6,
+            "filled_quantity": 2,
+            "updated_at_utc": "2026-07-20T14:30:06Z",
+        }
+    )
+    assert persist_order_projection(
+        engine, second_partial, action="PARTIAL_PROGRESS", actor="gateway"
+    )
+    with engine.connect() as conn:
+        row = conn.execute(select(orders)).mappings().one()
+    assert row["status"] == "PARTIAL_FILL"
+    assert row["filled_quantity"] == 2
+    assert row["payload"]["state_version"] == 6
 
 
 def test_persist_writes_signal_and_audit(engine: Engine) -> None:

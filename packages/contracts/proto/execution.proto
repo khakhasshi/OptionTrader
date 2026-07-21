@@ -1,0 +1,222 @@
+syntax = "proto3";
+
+// Python proposes candidates; Rust is the sole authority that approves or
+// rejects them. No free text in this contract can alter hard risk policy.
+package optiontrader.execution.v1;
+
+enum BrokerId {
+  BROKER_ID_UNSPECIFIED = 0;
+  BROKER_ID_LONGBRIDGE = 1;
+  BROKER_ID_IBKR = 2;
+}
+
+enum StrategyKind {
+  STRATEGY_KIND_UNSPECIFIED = 0;
+  STRATEGY_KIND_LONG_GAMMA = 1;
+  STRATEGY_KIND_SHORT_PREMIUM = 2;
+  STRATEGY_KIND_EVENT_VOL_CRUSH = 3;
+}
+
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_REPLAY = 1;
+  EXECUTION_MODE_SHADOW = 2;
+  EXECUTION_MODE_PAPER = 3;
+  EXECUTION_MODE_MANUAL_CONFIRM = 4;
+  EXECUTION_MODE_CONTROLLED_AUTO = 5;
+}
+
+enum OrderSide {
+  ORDER_SIDE_UNSPECIFIED = 0;
+  ORDER_SIDE_BUY = 1;
+  ORDER_SIDE_SELL = 2;
+}
+
+enum OptionRight {
+  OPTION_RIGHT_UNSPECIFIED = 0;
+  OPTION_RIGHT_CALL = 1;
+  OPTION_RIGHT_PUT = 2;
+}
+
+enum EventRiskFlag {
+  EVENT_RISK_FLAG_UNSPECIFIED = 0;
+  EVENT_RISK_FLAG_NO_SHORT_PREMIUM_BEFORE_EVENT = 1;
+  EVENT_RISK_FLAG_SIZE_HALF = 2;
+  EVENT_RISK_FLAG_WAIT_AFTER_RELEASE = 3;
+  EVENT_RISK_FLAG_ELEVATED_EVENT_RISK = 4;
+  EVENT_RISK_FLAG_NO_NAKED_0DTE = 5;
+}
+
+enum RiskDecisionKind {
+  RISK_DECISION_KIND_UNSPECIFIED = 0;
+  RISK_DECISION_KIND_APPROVED = 1;
+  RISK_DECISION_KIND_REJECTED = 2;
+}
+
+enum RiskReasonCode {
+  RISK_REASON_CODE_UNSPECIFIED = 0;
+  RISK_REASON_CODE_DATA_NOT_HEALTHY = 1;
+  RISK_REASON_CODE_BROKER_NOT_HEALTHY = 2;
+  RISK_REASON_CODE_BROKER_NOT_RECONCILED = 3;
+  RISK_REASON_CODE_EVENT_CONTEXT_UNAVAILABLE = 4;
+  RISK_REASON_CODE_EVENT_CONTEXT_INVALID = 5;
+  RISK_REASON_CODE_EVENT_POLICY_BLOCK = 6;
+  RISK_REASON_CODE_PLAN_EXPIRED = 7;
+  RISK_REASON_CODE_PLAN_INVALID = 8;
+  RISK_REASON_CODE_PLAN_HASH_MISMATCH = 9;
+  RISK_REASON_CODE_SNAPSHOT_NOT_CURRENT = 10;
+  RISK_REASON_CODE_EXECUTION_MODE_BLOCKED = 11;
+  RISK_REASON_CODE_DUPLICATE_CONFLICT = 12;
+  RISK_REASON_CODE_RISK_LIMITS_UNCONFIRMED = 13;
+  RISK_REASON_CODE_KILL_SWITCH_ACTIVE = 14;
+  RISK_REASON_CODE_DAILY_LOSS_LIMIT = 15;
+  RISK_REASON_CODE_MAX_TRADES_REACHED = 16;
+  RISK_REASON_CODE_LOSS_COOLDOWN_ACTIVE = 17;
+  RISK_REASON_CODE_PLAN_RISK_LIMIT = 18;
+  RISK_REASON_CODE_OPEN_RISK_LIMIT = 19;
+  RISK_REASON_CODE_BUYING_POWER_INSUFFICIENT = 20;
+  RISK_REASON_CODE_MAX_CONTRACTS_EXCEEDED = 21;
+  RISK_REASON_CODE_RULE_VERSION_MISMATCH = 22;
+}
+
+enum ExecutionOrderState {
+  EXECUTION_ORDER_STATE_UNSPECIFIED = 0;
+  EXECUTION_ORDER_STATE_AWAITING_CONFIRMATION = 1;
+  EXECUTION_ORDER_STATE_RISK_REJECTED = 2;
+  EXECUTION_ORDER_STATE_APPROVED = 3;
+  EXECUTION_ORDER_STATE_SUBMITTING = 4;
+  EXECUTION_ORDER_STATE_WORKING = 5;
+  EXECUTION_ORDER_STATE_PARTIAL_FILL = 6;
+  EXECUTION_ORDER_STATE_FILLED = 7;
+  EXECUTION_ORDER_STATE_CANCEL_PENDING = 8;
+  EXECUTION_ORDER_STATE_CANCELLED = 9;
+  EXECUTION_ORDER_STATE_REJECTED = 10;
+  EXECUTION_ORDER_STATE_EXPIRED = 11;
+  EXECUTION_ORDER_STATE_RECONCILE_PENDING = 12;
+  EXECUTION_ORDER_STATE_SHADOWED = 13;
+}
+
+message CandidateLeg {
+  OrderSide side = 1;
+  OptionRight option_right = 2;
+  string contract_id = 3;
+  string expiry = 4;
+  string strike = 5;
+  uint32 quantity = 6;
+}
+
+message CandidateTradePlan {
+  string schema_version = 1;
+  string plan_id = 2;
+  string plan_hash = 3;
+  string idempotency_key = 4;
+  string session_id = 5;
+  string signal_id = 6;
+  BrokerId broker_id = 7;
+  StrategyKind strategy = 8;
+  ExecutionMode execution_mode = 9;
+  string created_at_utc = 10;
+  repeated CandidateLeg legs = 11;
+  string limit_price = 12;
+  string max_slippage = 13;
+  string max_loss = 14;
+  string take_profit = 15;
+  string stop_loss = 16;
+  uint32 time_stop_minutes = 17;
+  repeated string invalidation_rules = 18;
+  string expires_at_utc = 19;
+  string rule_version = 20;
+  repeated string data_snapshot_ids = 21;
+  bool manual_confirmation_required = 22;
+}
+
+message EventSourceProof {
+  string category = 1;
+  string source_timestamp_utc = 2;
+  string received_at_utc = 3;
+  double confidence = 4;
+  string raw_ref = 5;
+}
+
+message EventRiskContext {
+  string event_context_id = 1;
+  string trading_date = 2;
+  string generated_at_utc = 3;
+  bool available = 4;
+  repeated EventSourceProof source_documents = 5;
+  repeated EventRiskFlag risk_flags = 6;
+  optional int32 minutes_to_major_event = 7;
+  bool event_released = 8;
+  string context_hash = 9;
+}
+
+message EvaluateCandidateRequest {
+  CandidateTradePlan plan = 1;
+  EventRiskContext event_context = 2;
+}
+
+message RiskDecision {
+  string schema_version = 1;
+  string decision_id = 2;
+  string plan_id = 3;
+  string plan_hash = 4;
+  string session_id = 5;
+  string occurred_at_utc = 6;
+  RiskDecisionKind decision = 7;
+  repeated RiskReasonCode reason_codes = 8;
+  bool manual_confirmation_required = 9;
+  string rule_version = 10;
+}
+
+message ExecutionOrder {
+  string schema_version = 1;
+  string order_id = 2;
+  string plan_id = 3;
+  string plan_hash = 4;
+  string idempotency_key = 5;
+  string session_id = 6;
+  BrokerId broker_id = 7;
+  ExecutionMode execution_mode = 8;
+  ExecutionOrderState state = 9;
+  // Number of combo units. Every leg quantity MUST equal this value; this is
+  // never the sum of leg quantities.
+  uint32 total_quantity = 10;
+  uint32 filled_quantity = 11;
+  string broker_order_id = 12;
+  string expires_at_utc = 13;
+  string updated_at_utc = 14;
+  repeated RiskReasonCode risk_reason_codes = 15;
+  // Monotonic per-order FSM transition count. Clients reject lower versions.
+  uint64 state_version = 16;
+}
+
+message StageCandidateResponse {
+  RiskDecision initial_risk_decision = 1;
+  optional ExecutionOrder order = 2;
+  // Opaque one-use capability bound to plan_hash and TTL. Never persisted in
+  // audit payloads or logs.
+  string confirmation_token = 3;
+}
+
+message ConfirmCandidateRequest {
+  string order_id = 1;
+  string confirmed_plan_hash = 2;
+  string confirmation_token = 3;
+  EventRiskContext event_context = 4;
+}
+
+message CancelOrderRequest {
+  string order_id = 1;
+}
+
+message GetOrderRequest {
+  string order_id = 1;
+}
+
+service RiskExecutionService {
+  rpc EvaluateCandidate(EvaluateCandidateRequest) returns (RiskDecision);
+  rpc StageCandidate(EvaluateCandidateRequest) returns (StageCandidateResponse);
+  rpc ConfirmCandidate(ConfirmCandidateRequest) returns (ExecutionOrder);
+  rpc CancelOrder(CancelOrderRequest) returns (ExecutionOrder);
+  rpc GetOrder(GetOrderRequest) returns (ExecutionOrder);
+}

@@ -146,6 +146,53 @@ def test_future_received_source_fails_closed() -> None:
         )
 
 
+@pytest.mark.parametrize(("document_index", "label"), [(0, "macro"), (2, "earnings"), (3, "news")])
+def test_low_document_confidence_fails_closed(document_index: int, label: str) -> None:
+    docs = list(_docs())
+    docs[document_index] = docs[document_index].model_copy(update={"confidence": 0.0})
+    with pytest.raises(ValueError, match=f"{label}.*confidence"):
+        build_event_context(
+            datetime(2026, 7, 20, 13, 45, tzinfo=timezone.utc),
+            *cast(Any, docs),
+        )
+
+
+def test_low_confidence_relevant_event_fails_closed() -> None:
+    macro, holdings, earnings, news = _docs()
+    low = macro.events[0].model_copy(update={"confidence": 0.5})
+    with pytest.raises(ValueError, match="critical event confidence"):
+        build_event_context(
+            datetime(2026, 7, 20, 13, 45, tzinfo=timezone.utc),
+            macro.model_copy(update={"events": [low]}),
+            holdings,
+            earnings,
+            news,
+        )
+
+
+def test_event_times_must_match_declared_coverage_and_trading_date() -> None:
+    macro, holdings, earnings, news = _docs()
+    outside = macro.events[0].model_copy(update={"scheduled_at_utc": "2026-08-20T14:00:00Z"})
+    with pytest.raises(ValueError, match="outside.*coverage"):
+        build_event_context(
+            datetime(2026, 7, 20, 13, 45, tzinfo=timezone.utc),
+            macro.model_copy(update={"events": [outside]}),
+            holdings,
+            earnings,
+            news,
+        )
+
+    future_news = news.events[0].model_copy(update={"event_at_utc": "2026-07-20T15:00:00Z"})
+    with pytest.raises(ValueError, match="future"):
+        build_event_context(
+            datetime(2026, 7, 20, 13, 45, tzinfo=timezone.utc),
+            macro,
+            holdings,
+            earnings,
+            news.model_copy(update={"events": [future_news]}),
+        )
+
+
 def test_event_context_api_aliases_return_the_same_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

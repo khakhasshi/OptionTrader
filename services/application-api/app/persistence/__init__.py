@@ -6,18 +6,46 @@ transactional, idempotent write. Pure serialization is separated from I/O so
 the row shapes are testable without a database.
 """
 
-from app.persistence.repository import persist_event_context, persist_signal
+from app.persistence.repository import (
+    latest_order_projection,
+    latest_execution_ticket,
+    persist_confirmation_intent,
+    persist_event_context,
+    persist_order_projection,
+    persist_signal,
+    persist_staged_candidate,
+    staged_plan_projection,
+)
 from app.persistence.serialize import SignalContext, build_signal_contract, build_signal_rows
-from app.persistence.tables import audit_events, event_contexts, metadata, signals
+from app.persistence.tables import (
+    audit_events,
+    candidate_trade_plans,
+    event_contexts,
+    metadata,
+    order_events,
+    orders,
+    risk_decisions,
+    signals,
+)
 
 __all__ = [
     "SignalContext",
     "audit_events",
+    "candidate_trade_plans",
     "build_signal_contract",
     "build_signal_rows",
     "event_contexts",
     "metadata",
+    "latest_order_projection",
+    "latest_execution_ticket",
+    "order_events",
+    "orders",
+    "persist_confirmation_intent",
     "persist_event_context",
+    "persist_order_projection",
     "persist_signal",
+    "persist_staged_candidate",
+    "risk_decisions",
+    "staged_plan_projection",
     "signals",
 ]

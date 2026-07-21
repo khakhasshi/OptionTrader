@@ -16,7 +16,7 @@
 
 ## 进行中
 
-- ⬜ Phase 1：历史数据与离线回放（待细化）。Phase 0 已通过 Gate Review，可正式开始。
+- 🔄 Phase 3：候选交易与半自动闭环。首个 paper/shadow 闭环已实现；Broker 实盘适配、动态账户快照、重启对账和真实期权报价证明仍待完成。
 
 ---
 
@@ -56,6 +56,19 @@
 ## Phase 2-6：见 PROJECT_PLAN.md 第 9 节
 
 Phase 2 事件上下文与实时驾驶舱 / Phase 3 候选交易与半自动闭环 / Phase 4 LLM 辅助与复盘 / Phase 5 Shadow 与 Paper 验证 / Phase 6 受控实盘。各阶段任务在前一阶段收尾时展开。
+
+### Phase 3 候选交易与半自动闭环（开发中）
+
+| 任务 | 状态 | 说明 |
+|---|---|---|
+| P3-A 执行契约 | ✅ | Candidate/Risk/Order JSON Schema，`execution.proto` 两阶段风控与订单 RPC，`broker.proto` 账户/持仓/订单/成交/提交/撤单/对账 sidecar 契约。 |
+| P3-B 候选计划与仓位 | ✅ | Python 确定性组合定价、defined-risk 校验、风险预算取整、最大张数、TTL、Protobuf hash/idempotency key；CONTROLLED_AUTO 禁用。 |
+| P3-C Rust 两阶段硬风控 | 🔄 | 已覆盖市场/Broker/EventContext、快照/hash/TTL、定义风险、限额、日亏、交易次数、连亏冷却、buying power、规则版本、kill switch；期权 quote age/spread/Greeks/chain 证明、策略白名单和尾盘窗口待补。 |
+| P3-D 状态机与 paper adapter | 🔄 | 已覆盖确认、幂等、提交、部分成交、拒单、撤单、断线与 ReconcilePending；paper 请求携带完整等量多腿。workflow 原地推进，错误路径不移除订单。进程重启重建和真实 broker 对账未完成。 |
+| P3-E PostgreSQL 审计与恢复保护 | 🔄 | 计划/风险/订单/确认意图/状态事件事务化，唯一约束与数据库先行闸门完成；确认能力不落库并强制单 worker，重启后 fail closed；Rust `state_version` 阻止陈旧/冲突投影。自动对账恢复/outbox 待补。 |
+| P3-F React 人工确认 | ✅ | 精确计划 hash 确认、TTL、Cockpit 双闸门、取消、状态/成交显示、异常响应 fail closed；request generation + `state_version` 防迟到轮询回退；浏览器视觉回归仍待环境修复后执行。 |
+| P3-G Longbridge/IBKR adapter | ⬜ | 领域 trait 与 sidecar 契约已定；真实账户/持仓/订单/成交读取、错误映射、paper 现场认证尚未接入，live 提交保持禁用。 |
+| P3-H Gate/E2E | ⬜ | 需完成 Broker 部分成交/拒单/断线/重启对账 E2E、完整订单追溯、真实期权报价证明和 Q3 风控参数批准后签收。 |
 
 ### Phase 2 事件上下文与实时驾驶舱（开发完成；现场验收待执行）
 

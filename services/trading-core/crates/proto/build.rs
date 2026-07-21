@@ -14,13 +14,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(4)
         .expect("repo root above crates/proto");
     let proto_dir = repo_root.join("packages/contracts/proto");
-    let proto = proto_dir.join("market.proto");
+    let market_proto = proto_dir.join("market.proto");
+    let execution_proto = proto_dir.join("execution.proto");
+    let broker_proto = proto_dir.join("broker.proto");
+    let protos = [&market_proto, &execution_proto, &broker_proto];
 
-    println!("cargo:rerun-if-changed={}", proto.display());
+    for proto in &protos {
+        println!("cargo:rerun-if-changed={}", proto.display());
+    }
 
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&[proto], &[proto_dir])?;
+        .compile_protos(&[market_proto, execution_proto, broker_proto], &[proto_dir])?;
     Ok(())
 }

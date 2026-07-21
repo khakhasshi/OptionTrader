@@ -159,6 +159,7 @@ fn health_to_proto_state(rec: &DataHealthStateRecord) -> ProtoHealthState {
     }
 }
 
+#[derive(Clone)]
 pub struct MarketServiceImpl {
     feed: Arc<MarketFeed>,
     /// Number of records the single producer has emitted (0 = none yet).
@@ -213,6 +214,25 @@ impl MarketServiceImpl {
             // cleanly-ended stream and health reports DISCONNECTED, not HEALTHY.
             finished.store(true, Ordering::SeqCst);
         });
+    }
+
+    pub fn current_health_value(&self) -> DataHealth {
+        self.ensure_producer();
+        if self.finished.load(Ordering::SeqCst) {
+            return DataHealth::Disconnected;
+        }
+        let cursor = *self.cursor_tx.borrow();
+        if cursor == 0 {
+            DataHealth::Reconciling
+        } else {
+            self.feed.health_states[cursor - 1].status
+        }
+    }
+
+    pub fn latest_snapshot_value(&self) -> Option<MarketSnapshot> {
+        self.ensure_producer();
+        let cursor = *self.cursor_tx.borrow();
+        (cursor > 0).then(|| self.feed.ticks[cursor - 1].0.clone())
     }
 }
 

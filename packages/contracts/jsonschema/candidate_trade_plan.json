@@ -10,24 +10,27 @@
       "properties": {
         "side": { "$ref": "common.json#/$defs/orderSide" },
         "type": { "$ref": "common.json#/$defs/optionRight" },
+        "contract_id": { "type": "string", "minLength": 1 },
         "expiry": { "type": "string", "format": "date" },
         "strike": { "$ref": "common.json#/$defs/decimal" },
         "quantity": { "type": "integer", "minimum": 1 }
       },
-      "required": ["side", "type", "expiry", "strike", "quantity"],
+      "required": ["side", "type", "contract_id", "expiry", "strike", "quantity"],
       "additionalProperties": false
     }
   },
   "properties": {
     "schema_version": { "type": "string", "const": "1.0" },
     "plan_id": { "type": "string" },
-    "plan_hash": { "type": "string" },
+    "plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "idempotency_key": { "type": "string" },
     "session_id": { "type": "string" },
     "signal_id": { "type": "string" },
     "broker_id": { "$ref": "common.json#/$defs/brokerId" },
     "strategy": { "type": "string", "enum": ["LongGamma", "ShortPremium", "EventVolCrush"] },
-    "legs": { "type": "array", "items": { "$ref": "#/$defs/leg" }, "minItems": 1 },
+    "execution_mode": { "$ref": "common.json#/$defs/executionMode" },
+    "created_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "legs": { "type": "array", "items": { "$ref": "#/$defs/leg" }, "minItems": 1, "maxItems": 4, "description": "One to four unique option legs. All leg quantities represent combo units and must be equal; cross-item equality is enforced by Pydantic and Rust." },
     "limit_price": { "$ref": "common.json#/$defs/decimal" },
     "max_slippage": { "$ref": "common.json#/$defs/decimal" },
     "max_loss": { "$ref": "common.json#/$defs/decimal" },
@@ -37,13 +40,14 @@
     "invalidation_rules": { "type": "array", "items": { "type": "string" } },
     "expires_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
     "rule_version": { "type": "string" },
-    "data_snapshot_ids": { "type": "array", "items": { "type": "string" } },
-    "manual_confirmation_required": { "type": "boolean" }
+    "data_snapshot_ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
+    "manual_confirmation_required": { "type": "boolean", "const": true }
   },
   "required": [
     "schema_version", "plan_id", "plan_hash", "idempotency_key", "session_id",
-    "signal_id", "broker_id", "strategy", "legs", "limit_price", "max_loss",
-    "expires_at_utc", "rule_version", "manual_confirmation_required"
+    "signal_id", "broker_id", "strategy", "execution_mode", "created_at_utc", "legs",
+    "limit_price", "max_loss", "expires_at_utc", "rule_version", "data_snapshot_ids",
+    "manual_confirmation_required"
   ],
   "additionalProperties": false
 }

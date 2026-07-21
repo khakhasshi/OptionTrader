@@ -24,6 +24,9 @@ _ET = ZoneInfo("America/New_York")
 _NO_EVENT_HORIZON_MINUTES = 24 * 60
 _HOLDINGS_MAX_AGE_DAYS = 14
 _POST_RELEASE_WAIT_MINUTES = 15
+_DOCUMENT_MIN_CONFIDENCE = Decimal("0.8")
+_HOLDINGS_MIN_CONFIDENCE = Decimal("0.9")
+_CRITICAL_EVENT_MIN_CONFIDENCE = Decimal("0.8")
 _FLAG_ORDER = (
     "NO_SHORT_PREMIUM_BEFORE_EVENT",
     "WAIT_AFTER_RELEASE",
@@ -73,6 +76,14 @@ def _require_coverage(target: date, start: str, end: str, label: str) -> None:
         raise ValueError(f"{label} does not cover {target.isoformat()}")
 
 
+def _require_scheduled_within_coverage(
+    scheduled_at_utc: str, start: str, end: str, label: str
+) -> None:
+    scheduled_date = _parse_utc(scheduled_at_utc).astimezone(_ET).date()
+    if not date.fromisoformat(start) <= scheduled_date <= date.fromisoformat(end):
+        raise ValueError(f"{label} falls outside its document coverage")
+
+
 def _require_sane_source(item: SourceMetadata, now_utc: datetime, label: str) -> None:
     source_at = _parse_utc(item.source_timestamp_utc)
     received_at = _parse_utc(item.received_at_utc)
@@ -120,14 +131,38 @@ def build_event_context(
     _require_sane_source(macro, now_utc, "macro calendar document")
     _require_sane_source(earnings, now_utc, "earnings calendar document")
     _require_sane_source(news, now_utc, "news document")
-    if holdings.confidence < 0.9:
+    if Decimal(str(holdings.confidence)) < _HOLDINGS_MIN_CONFIDENCE:
         raise ValueError("QQQ holdings confidence is below 0.9")
+    for document, label in (
+        (macro, "macro calendar document"),
+        (earnings, "earnings calendar document"),
+        (news, "news document"),
+    ):
+        if Decimal(str(document.confidence)) < _DOCUMENT_MIN_CONFIDENCE:
+            raise ValueError(f"{label} confidence is below 0.8")
     for index, macro_item in enumerate(macro.events):
         _require_sane_source(macro_item, now_utc, f"macro event {index}")
+        _require_scheduled_within_coverage(
+            macro_item.scheduled_at_utc,
+            macro.coverage_start,
+            macro.coverage_end,
+            f"macro event {index}",
+        )
     for index, earnings_item in enumerate(earnings.events):
         _require_sane_source(earnings_item, now_utc, f"earnings event {index}")
+        _require_scheduled_within_coverage(
+            earnings_item.scheduled_at_utc,
+            earnings.coverage_start,
+            earnings.coverage_end,
+            f"earnings event {index}",
+        )
     for index, news_item in enumerate(news.events):
         _require_sane_source(news_item, now_utc, f"news event {index}")
+        event_at = _parse_utc(news_item.event_at_utc)
+        if event_at > now_utc + timedelta(minutes=5):
+            raise ValueError(f"news event {index} timestamp is in the future")
+        if event_at.astimezone(_ET).date() != trading_date:
+            raise ValueError(f"news event {index} falls outside its document trading date")
 
     top_holdings = sorted(holdings.holdings, key=lambda item: Decimal(item.weight), reverse=True)[
         :20
@@ -148,6 +183,12 @@ def build_event_context(
     news_today = [
         event for event in news.events if any(symbol in weights for symbol in event.symbols)
     ]
+    low_confidence_critical = any(
+        Decimal(str(event.confidence)) < _CRITICAL_EVENT_MIN_CONFIDENCE
+        for event in [*macro_today, *earnings_today, *news_today]
+    )
+    if low_confidence_critical:
+        raise ValueError("critical event confidence is below 0.8")
 
     major_instants: list[datetime] = []
     for macro_event in macro_today:

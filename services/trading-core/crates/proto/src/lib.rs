@@ -7,3 +7,11 @@
 pub mod market_v1 {
     tonic::include_proto!("optiontrader.market.v1");
 }
+
+pub mod execution_v1 {
+    tonic::include_proto!("optiontrader.execution.v1");
+}
+
+pub mod broker_v1 {
+    tonic::include_proto!("optiontrader.broker.v1");
+}

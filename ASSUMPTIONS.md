@@ -27,8 +27,8 @@
 | ID | 问题 | 为何关键 | 暂行默认 |
 |---|---|---|---|
 | Q1 | ThetaData 实时流的 Rust 接入形态及并发/速率限额仍待实测；历史接口已确认使用本地官方 Python/gRPC SDK | 决定 Rust Market Core 实时连接层、限流、缓存与回补设计 | Phase 1 历史下载由 Python Research Job 执行；生产标准化、DataHealth 和底层特征仍由 Rust 权威处理；实时接入在 Phase 2 前完成实测 |
-| Q2 | Longbridge / IBKR 下单接入方式：Longbridge OpenAPI SDK？IBKR 用 TWS/Gateway + ibapi 还是 Client Portal Web API？IBKR 是否需要 Rust 之外的 sidecar？ | 决定 broker adapter 架构（DEVELOPMENT_PLAN 提到「IBKR adapter/sidecar contract」但未定形态） | Longbridge 原生 SDK；IBKR 待定，先定义 adapter trait 与契约，实现留 Phase 3 |
-| Q3 | 账户货币、初始净值、最大张数、单笔最大损失等硬风控具体数值由谁提供？ | 硬风控数值是 config 而非架构，但 paper/live 前必须由人确认并双人批准 | 用占位默认值 + 显式标注 UNCONFIRMED，Phase 3 前锁定 |
+| Q2 | IBKR 最终采用 TWS/Gateway Python sidecar 还是其他官方接入形态，以及 Longbridge/IBKR paper 账户的现场认证步骤 | adapter 领域契约已固定，但决定进程部署、会话恢复和错误映射 | Longbridge 原生 Rust adapter；IBKR 本机 sidecar；两者统一 `broker.proto`。当前仅契约与 PaperBroker，真实连接仍待 Phase 3 后续切片 |
+| Q3 | 账户货币、初始净值、最大张数、单笔最大损失等硬风控具体数值由谁批准？ | 架构与闸门已落地，但 paper/live Gate 前必须由人确认并版本化 | 默认 `RISK_LIMITS_CONFIRMED=false`、规则 `UNCONFIRMED`、buying power=0；占位数值不能作为批准值 |
 | Q4 | LLM 供应商与模型（Anthropic/OpenAI/本地）、是否有可用密钥、成本预算？ | 决定 llm 模块的 client、Schema 校验、超时/重试/缓存策略 | Phase 4 才接入；先定义 Pydantic Schema 与 provider 无关接口 |
 | Q5 | 是否需要用户认证/多用户？权限分 Viewer/Trader/Risk Admin 如何落地（本地单人还是团队）？ | 决定 API 鉴权与前端权限模型 | 假定单用户本地部署，权限角色先建枚举，认证 Phase 3 细化 |
 | Q6 | 部署目标：纯本地开发机，还是需要云/服务器长时间运行 shadow/paper？ | 决定 infra、备份、RPO/RTO、监控栈选型 | 先本地 docker compose；shadow/paper 前再定 |
@@ -50,7 +50,7 @@
 
 ## D. 缺失信息清单
 
-- 缺 ThetaData / Longbridge / IBKR / LLM 的实际凭证与连接参数（不入 Git，用 secret 模板占位）。
+- 缺 Longbridge / IBKR / LLM 的现场认证结果与连接参数（凭证不入 Git，用 secret 模板占位）。ThetaData SDK 凭证短区间 smoke 已通过。
 - 缺具体硬风控数值表（见 Q3）。
 - 缺 QQQ top 20 持仓与财报的初始种子数据（Phase 2 用免费官方源补齐）。
 - 缺 RPO/RTO、备份策略的量化目标（paper 前确定）。

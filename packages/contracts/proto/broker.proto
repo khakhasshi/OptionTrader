@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+// Broker adapter/sidecar boundary. Rust Risk & Execution Gateway is the only
+// client allowed to invoke mutations; sidecars never evaluate strategy or risk.
+package optiontrader.broker.v1;
+
+enum BrokerId {
+  BROKER_ID_UNSPECIFIED = 0;
+  BROKER_ID_LONGBRIDGE = 1;
+  BROKER_ID_IBKR = 2;
+}
+
+enum OrderSide {
+  ORDER_SIDE_UNSPECIFIED = 0;
+  ORDER_SIDE_BUY = 1;
+  ORDER_SIDE_SELL = 2;
+}
+
+enum BrokerHealth {
+  BROKER_HEALTH_UNSPECIFIED = 0;
+  BROKER_HEALTH_HEALTHY = 1;
+  BROKER_HEALTH_DEGRADED = 2;
+  BROKER_HEALTH_DISCONNECTED = 3;
+  BROKER_HEALTH_RECONCILING = 4;
+}
+
+enum BrokerOrderStatus {
+  BROKER_ORDER_STATUS_UNSPECIFIED = 0;
+  BROKER_ORDER_STATUS_WORKING = 1;
+  BROKER_ORDER_STATUS_PARTIAL_FILL = 2;
+  BROKER_ORDER_STATUS_FILLED = 3;
+  BROKER_ORDER_STATUS_CANCELLED = 4;
+  BROKER_ORDER_STATUS_REJECTED = 5;
+}
+
+message AccountSnapshot {
+  BrokerId broker_id = 1;
+  string occurred_at_utc = 2;
+  BrokerHealth health = 3;
+  bool reconciled = 4;
+  string buying_power = 5;
+  string net_liquidation = 6;
+  string currency = 7;
+}
+
+message PositionSnapshot {
+  string contract_id = 1;
+  sint32 quantity = 2;
+  string average_price = 3;
+}
+
+message BrokerOrderLeg {
+  string contract_id = 1;
+  OrderSide side = 2;
+  uint32 quantity = 3;
+}
+
+message BrokerOrderSnapshot {
+  string broker_order_id = 1;
+  string idempotency_key = 2;
+  string plan_hash = 3;
+  BrokerOrderStatus status = 4;
+  // Number of combo units; each leg quantity must equal this value.
+  uint32 total_quantity = 5;
+  uint32 filled_quantity = 6;
+  string limit_price = 7;
+  repeated BrokerOrderLeg legs = 8;
+}
+
+message FillSnapshot {
+  string fill_id = 1;
+  string broker_order_id = 2;
+  string contract_id = 3;
+  OrderSide side = 4;
+  uint32 quantity = 5;
+  string price = 6;
+  string occurred_at_utc = 7;
+}
+
+message BrokerSnapshot {
+  string schema_version = 1;
+  uint64 snapshot_sequence = 2;
+  AccountSnapshot account = 3;
+  repeated PositionSnapshot positions = 4;
+  repeated BrokerOrderSnapshot orders = 5;
+  repeated FillSnapshot fills = 6;
+}
+
+message GetBrokerSnapshotRequest {
+  BrokerId broker_id = 1;
+}
+
+message SubmitBrokerOrderRequest {
+  BrokerId broker_id = 1;
+  string idempotency_key = 2;
+  string plan_hash = 3;
+  // Number of combo units; each leg quantity must equal this value.
+  uint32 total_quantity = 4;
+  string limit_price = 5;
+  repeated BrokerOrderLeg legs = 6;
+}
+
+message CancelBrokerOrderRequest {
+  BrokerId broker_id = 1;
+  string broker_order_id = 2;
+}
+
+message ReconcileBrokerRequest {
+  BrokerId broker_id = 1;
+  uint64 expected_snapshot_sequence = 2;
+}
+
+message ReconcileBrokerResponse {
+  BrokerSnapshot snapshot = 1;
+  bool matched = 2;
+  repeated string mismatch_codes = 3;
+}
+
+service BrokerAdapterService {
+  rpc GetBrokerSnapshot(GetBrokerSnapshotRequest) returns (BrokerSnapshot);
+  rpc SubmitBrokerOrder(SubmitBrokerOrderRequest) returns (BrokerOrderSnapshot);
+  rpc CancelBrokerOrder(CancelBrokerOrderRequest) returns (BrokerOrderSnapshot);
+  rpc ReconcileBroker(ReconcileBrokerRequest) returns (ReconcileBrokerResponse);
+}

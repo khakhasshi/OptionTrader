@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/risk_decision.json",
+  "title": "RiskDecision",
+  "description": "Immutable Rust Final Risk Check result for one exact CandidateTradePlan hash.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "decision_id": { "type": "string", "minLength": 1 },
+    "plan_id": { "type": "string", "minLength": 1 },
+    "plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "session_id": { "type": "string", "minLength": 1 },
+    "occurred_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "decision": { "type": "string", "enum": ["APPROVED", "REJECTED"] },
+    "reason_codes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "DATA_NOT_HEALTHY", "BROKER_NOT_HEALTHY", "BROKER_NOT_RECONCILED",
+          "EVENT_CONTEXT_UNAVAILABLE", "EVENT_CONTEXT_INVALID", "EVENT_POLICY_BLOCK",
+          "PLAN_EXPIRED", "PLAN_INVALID", "PLAN_HASH_MISMATCH", "SNAPSHOT_NOT_CURRENT",
+          "EXECUTION_MODE_BLOCKED", "DUPLICATE_CONFLICT", "RISK_LIMITS_UNCONFIRMED",
+          "KILL_SWITCH_ACTIVE", "DAILY_LOSS_LIMIT", "MAX_TRADES_REACHED",
+          "LOSS_COOLDOWN_ACTIVE", "PLAN_RISK_LIMIT", "OPEN_RISK_LIMIT",
+          "BUYING_POWER_INSUFFICIENT", "MAX_CONTRACTS_EXCEEDED", "RULE_VERSION_MISMATCH"
+        ]
+      }
+    },
+    "manual_confirmation_required": { "type": "boolean", "const": true },
+    "rule_version": { "type": "string", "minLength": 1 }
+  },
+  "required": [
+    "schema_version", "decision_id", "plan_id", "plan_hash", "session_id",
+    "occurred_at_utc", "decision", "reason_codes", "manual_confirmation_required",
+    "rule_version"
+  ],
+  "additionalProperties": false
+}
