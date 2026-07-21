@@ -160,6 +160,15 @@ pub struct MarketServiceImpl {
     feed: Arc<MarketFeed>,
     /// Number of records the single producer has emitted (0 = none yet).
     cursor_tx: watch::Sender<usize>,
+    /// A permanently-held receiver so `cursor_tx` always has ≥1 receiver: the
+    /// producer's cursor updates therefore never fail just because every client
+    /// happens to be momentarily disconnected. Producer life is independent of
+    /// subscriber count (Phase 2 review P0).
+    _keepalive: watch::Receiver<usize>,
+    /// Set once the producer has emitted the whole finite replay (or exited):
+    /// the feed has no more live data, so health reports DISCONNECTED, never a
+    /// stale HEALTHY.
+    finished: Arc<AtomicBool>,
     /// Producer starts lazily on the first subscription, exactly once.
     started: Arc<AtomicBool>,
     interval: Duration,
@@ -167,17 +176,21 @@ pub struct MarketServiceImpl {
 
 impl MarketServiceImpl {
     pub fn new(feed: Arc<MarketFeed>) -> Self {
-        let (cursor_tx, _rx) = watch::channel(0usize);
+        let (cursor_tx, keepalive) = watch::channel(0usize);
         MarketServiceImpl {
             feed,
             cursor_tx,
+            _keepalive: keepalive,
+            finished: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(false)),
             interval: replay_tick_interval(),
         }
     }
 
     /// Start the single producer clock once. It advances the shared cursor from
-    /// 0 to N at a fixed pace; this is the ONLY thing that "produces" records.
+    /// 0 to N at a fixed pace regardless of how many clients are attached; this
+    /// is the ONLY thing that "produces" records. On completion it flags the
+    /// feed finished so health degrades out of HEALTHY.
     fn ensure_producer(&self) {
         if self.started.swap(true, Ordering::SeqCst) {
             return;
@@ -185,13 +198,17 @@ impl MarketServiceImpl {
         let n = self.feed.ticks.len();
         let tx = self.cursor_tx.clone();
         let interval = self.interval;
+        let finished = Arc::clone(&self.finished);
         tokio::spawn(async move {
             for i in 1..=n {
                 tokio::time::sleep(interval).await;
-                if tx.send(i).is_err() {
-                    break; // no receivers and none will come
-                }
+                // send_replace cannot fail on zero receivers (we hold a
+                // keepalive receiver anyway) — the producer never dies early.
+                tx.send_replace(i);
             }
+            // Finite replay exhausted: mark the feed done. Late subscribers get a
+            // cleanly-ended stream and health reports DISCONNECTED, not HEALTHY.
+            finished.store(true, Ordering::SeqCst);
         });
     }
 }
@@ -242,6 +259,20 @@ impl MarketService for MarketServiceImpl {
         &self,
         _request: Request<GetDataHealthRequest>,
     ) -> Result<Response<ProtoHealthState>, Status> {
+        // Feed ended: no live data -> DISCONNECTED, never a stale HEALTHY.
+        if self.finished.load(Ordering::SeqCst) {
+            let last = self.feed.ticks.last().expect("non-empty feed");
+            return Ok(Response::new(ProtoHealthState {
+                schema_version: "1.0".into(),
+                occurred_at_utc: last.0.occurred_at_utc.clone(),
+                status: ProtoHealth::Disconnected as i32,
+                market_event_lag_ms: 0,
+                quote_age_ms: 0,
+                out_of_order_count: 0,
+                reconnect_count: 0,
+                reason: "replay feed ended".into(),
+            }));
+        }
         let cursor = *self.cursor_tx.borrow();
         let record = if cursor == 0 {
             self.feed.initial_health()
@@ -315,18 +346,13 @@ mod tests {
 
     #[tokio::test]
     async fn second_subscription_does_not_pollute_health() {
-        // The exact review scenario: after a full drain, a second subscription
-        // must NOT flip health to DEGRADED / bump out_of_order.
+        // The exact review scenario: a second subscription must NOT bump
+        // out_of_order or introduce lag — nothing a subscriber does can drive
+        // health. (After a full drain the feed is `finished`, so status becomes
+        // DISCONNECTED; the invariant under test here is the counters/pollution,
+        // which stay clean regardless of how many times we subscribe.)
         let svc = MarketServiceImpl::new(feed());
         let _ = drain(&svc).await;
-        let after_first = svc
-            .get_data_health(Request::new(GetDataHealthRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(after_first.status, ProtoHealth::Healthy as i32);
-        assert_eq!(after_first.out_of_order_count, 0);
-
         let _ = drain(&svc).await; // second subscription
         let after_second = svc
             .get_data_health(Request::new(GetDataHealthRequest {}))
@@ -334,24 +360,80 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(
-            after_second.status,
-            ProtoHealth::Healthy as i32,
-            "a second subscriber must not degrade global health"
+            after_second.out_of_order_count, 0,
+            "a second subscriber must not manufacture out-of-order records"
         );
-        assert_eq!(after_second.out_of_order_count, 0);
+    }
+
+    #[test]
+    fn snapshot_data_health_matches_health_states_by_construction() {
+        // The snapshot's data_health and the health record at the same index are
+        // pinned equal at construction, so a live GetDataHealth at cursor i can
+        // never contradict the snapshot delivered at record i.
+        let f = feed();
+        for (i, (snap, _bar)) in f.ticks.iter().enumerate() {
+            assert_eq!(snap.data_health, f.health_states[i].status);
+        }
     }
 
     #[tokio::test]
-    async fn snapshot_data_health_matches_get_data_health() {
+    async fn feed_ended_reports_disconnected_not_stale_healthy() {
         let svc = MarketServiceImpl::new(feed());
-        let ticks = drain(&svc).await;
-        let last_snap_health = ticks.last().unwrap().snapshot.as_ref().unwrap().data_health;
+        let _ = drain(&svc).await; // producer runs to completion -> finished
+                                   // Give the producer task a beat to flip `finished` after the last send.
+        tokio::time::sleep(Duration::from_millis(30)).await;
         let gdh = svc
             .get_data_health(Request::new(GetDataHealthRequest {}))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(last_snap_health, gdh.status);
+        assert_eq!(
+            gdh.status,
+            ProtoHealth::Disconnected as i32,
+            "an ended feed must not sit on a stale HEALTHY"
+        );
+    }
+
+    #[tokio::test]
+    async fn producer_survives_subscriber_cancel_and_late_subscriber_does_not_hang() {
+        // Review P0: first client takes one frame then drops -> momentary zero
+        // subscribers. The producer must keep advancing and NOT die; a later
+        // subscriber must get a cleanly-ended stream (not hang) and health must
+        // not be stuck HEALTHY.
+        use tokio_stream::StreamExt;
+        let svc = MarketServiceImpl::new(feed());
+        let resp = svc
+            .stream_market_snapshots(Request::new(StreamRequest {
+                session_id: "a".into(),
+                speedup: 0.0,
+            }))
+            .await
+            .unwrap();
+        let mut stream = resp.into_inner();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.snapshot.unwrap().sequence_number, 1);
+        drop(stream); // cancel -> zero subscribers
+
+        // Producer keeps running to completion despite zero subscribers.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Late subscriber: must terminate cleanly (bounded), never hang.
+        let late = tokio::time::timeout(Duration::from_secs(2), drain(&svc))
+            .await
+            .expect("late subscriber must not hang");
+        // It joins after completion, so it legitimately gets no more records.
+        assert!(late.len() <= feed().ticks.len());
+
+        let gdh = svc
+            .get_data_health(Request::new(GetDataHealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            gdh.status,
+            ProtoHealth::Disconnected as i32,
+            "health must not be stuck HEALTHY after the feed ends"
+        );
     }
 
     #[test]
