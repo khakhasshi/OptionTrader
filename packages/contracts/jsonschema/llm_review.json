@@ -92,8 +92,8 @@
         "latency_ms": { "type": "integer", "minimum": 0 },
         "attempts": { "type": "integer", "minimum": 0, "maximum": 4 },
         "cache_hit": { "type": "boolean" },
-        "input_tokens": { "type": "integer", "minimum": 0 },
-        "output_tokens": { "type": "integer", "minimum": 0 },
+        "input_tokens": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "output_tokens": { "type": "integer", "minimum": 0, "maximum": 65536 },
         "estimated_cost_usd": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$" }
       },
       "required": [
@@ -134,7 +134,7 @@
     "rule_hypotheses": { "type": "array", "maxItems": 5, "items": { "$ref": "#/$defs/ruleHypothesis" } },
     "unavailable_reason_code": {
       "type": ["string", "null"],
-      "enum": [null, "CONFIG_MISSING", "TIMEOUT", "RATE_LIMIT", "PROVIDER_ERROR", "INVALID_RESPONSE", "INPUT_REJECTED", "INITIAL_RISK_REQUIRED", "BUDGET_EXCEEDED"]
+      "enum": [null, "CONFIG_MISSING", "TIMEOUT", "RATE_LIMIT", "PROVIDER_ERROR", "INVALID_RESPONSE", "INPUT_REJECTED", "INITIAL_RISK_REQUIRED", "BUDGET_EXCEEDED", "COORDINATION_LEASE_EXPIRED", "COORDINATION_RECOVERY"]
     },
     "provider": { "$ref": "#/$defs/providerMetadata" },
     "source_refs": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/sourceReference" } }

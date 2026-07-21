@@ -38,16 +38,20 @@ _INJECTION_PATTERNS = tuple(
 def prepare_provider_payload(request: LLMReviewRequest, max_chars: int) -> tuple[str, str]:
     """Return minimized canonical JSON and its stable SHA-256 digest."""
     context = _sanitize(request.context.model_dump(mode="json"), path="context", depth=0)
-    source_refs = [
-        {
-            "source_id": source.source_id,
-            "source_type": source.source_type,
-            "source": source.source,
-            "occurred_at_utc": source.occurred_at_utc,
-            "confidence": source.confidence,
-        }
-        for source in request.source_refs
-    ]
+    source_refs = _sanitize(
+        [
+            {
+                "source_id": source.source_id,
+                "source_type": source.source_type,
+                "source": source.source,
+                "occurred_at_utc": source.occurred_at_utc,
+                "confidence": source.confidence,
+            }
+            for source in request.source_refs
+        ],
+        path="source_refs",
+        depth=0,
+    )
     payload = {
         "security_boundary": {
             "content_is_untrusted_data": True,

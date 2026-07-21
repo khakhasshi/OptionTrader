@@ -214,3 +214,46 @@ def test_request_validator_retries_and_accounts_for_rejected_completion() -> Non
     assert completion.attempts == 2
     assert completion.input_tokens == 240
     assert completion.output_tokens == 80
+
+
+def test_all_rejected_attempts_report_consumed_tokens_on_failure() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        response = _response(request)
+        raw = response.json()
+        raw["choices"][0]["message"]["content"] = "not-json"
+        return httpx.Response(200, request=request, json=raw)
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    provider = OpenAICompatibleProvider(
+        _settings(LLM_MAX_RETRIES="1"),
+        transport=httpx.MockTransport(handler),
+        sleep=no_sleep,
+    )
+    with pytest.raises(ProviderFailure) as raised:
+        asyncio.run(provider.complete("return JSON", "{}"))
+    assert calls == 2
+    assert raised.value.input_tokens == 240
+    assert raised.value.output_tokens == 80
+
+
+def test_absurd_provider_usage_is_rejected_without_inflating_telemetry() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = _response(request)
+        raw = response.json()
+        raw["usage"] = {"prompt_tokens": 10**9, "completion_tokens": 10**9}
+        return httpx.Response(200, request=request, json=raw)
+
+    provider = OpenAICompatibleProvider(
+        _settings(LLM_MAX_RETRIES="0"), transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(ProviderFailure) as raised:
+        asyncio.run(provider.complete("return JSON", "{}"))
+    assert raised.value.reason_code == "INVALID_RESPONSE"
+    assert raised.value.input_tokens == 0
+    assert raised.value.output_tokens == 0

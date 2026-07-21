@@ -59,7 +59,9 @@ SET request_id = review_row.review_id,
     review_status = 'UNAVAILABLE',
     trading_date = (review_row.occurred_at_utc AT TIME ZONE 'America/New_York')::date,
     plan_hash = plan_row.plan_hash,
-    input_hash = repeat('0', 64),
+    -- Per-row opaque legacy identity avoids collapsing unrelated rows in hash lookups.
+    input_hash = md5('legacy-input:v1:' || review_row.review_id)
+        || md5('legacy-input:v2:' || review_row.review_id),
     provider = 'legacy-unconfigured',
     prompt_version = 'legacy-unversioned',
     schema_version = '0.legacy',
@@ -80,7 +82,10 @@ SET request_id = COALESCE(request_id, review_id),
         trading_date,
         (occurred_at_utc AT TIME ZONE 'America/New_York')::date
     ),
-    input_hash = COALESCE(input_hash, repeat('0', 64)),
+    input_hash = COALESCE(
+        input_hash,
+        md5('legacy-input:v1:' || review_id) || md5('legacy-input:v2:' || review_id)
+    ),
     provider = COALESCE(provider, 'legacy-unconfigured'),
     prompt_version = COALESCE(prompt_version, 'legacy-unversioned'),
     schema_version = COALESCE(schema_version, '0.legacy'),
@@ -165,7 +170,9 @@ ALTER TABLE review.llm_reviews
     ADD CONSTRAINT ck_llm_review_input_hash CHECK (input_hash ~ '^[a-f0-9]{64}$'),
     ADD CONSTRAINT ck_llm_review_usage CHECK (
         latency_ms >= 0 AND attempts BETWEEN 0 AND 4
-        AND input_tokens >= 0 AND output_tokens >= 0 AND estimated_cost_usd >= 0
+        AND input_tokens BETWEEN 0 AND 1000000
+        AND output_tokens BETWEEN 0 AND 65536
+        AND estimated_cost_usd >= 0
     );
 
 CREATE INDEX ix_llm_reviews_input_hash
@@ -222,7 +229,9 @@ SET payload = jsonb_build_object(
         'model', 'legacy-unconfigured',
         'provider_request_id', NULL,
         'prompt_version', 'legacy-unversioned',
-        'input_hash', repeat('0', 64),
+        -- Daily legacy rows also receive a stable, non-active input identity.
+        'input_hash', md5('legacy-daily:v1:' || review_id)
+            || md5('legacy-daily:v2:' || review_id),
         'latency_ms', 0,
         'attempts', 0,
         'cache_hit', false,

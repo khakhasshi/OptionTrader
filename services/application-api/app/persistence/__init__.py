@@ -32,6 +32,7 @@ from app.persistence.repository import (
     rotate_confirmation_capabilities,
     staged_plan_projection,
     verified_initial_risk_context,
+    write_outbox,
 )
 from app.persistence.serialize import SignalContext, build_signal_contract, build_signal_rows
 from app.persistence.tables import (
@@ -98,4 +99,5 @@ __all__ = [
     "staged_plan_projection",
     "verified_initial_risk_context",
     "signals",
+    "write_outbox",
 ]

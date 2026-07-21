@@ -24,16 +24,22 @@
 6. 每次审阅原子写入 `review.llm_reviews`、审计事件和 outbox。盘后详情写入 daily review；研究
    假设固定 `activation_allowed=false`，数据库 check constraint 禁止越权激活。
 7. 缓存 key 包含 Provider、模型、prompt 版本、规则版本、阶段和输入 hash。成本预留包含完整
-   prompt，并按最大尝试数保守计算；另设并发、每日请求和每日估算金额上限。第一版缓存与
-   预算计数为单进程状态，多 worker 前必须迁移到共享 PostgreSQL 配额账本。
+   prompt，并按最大尝试数保守计算；另设并发、每日请求和每日估算金额上限。每日配额、
+   request-id single-flight、租约与最终结果由 PostgreSQL 全局协调；进程内仅保留内容缓存和
+   每 worker 并发信号量。固定 request id 的跨 worker 调用不会重复进入 Provider。
 8. 评测集必须报告结构化成功率、冲突召回、误报、漏报 case、注入阻断和不可用惰性降级。
    模型或 prompt 版本变化后重新运行，不以一次真实 smoke 替代长期漂移监控。
 
 ## 后果
 
+`0006` 迁移中的两段 MD5 仅用于为旧记录生成逐行不透明身份，不是安全摘要，
+不参与当前请求输入校验，也不替代现行请求路径使用的 SHA-256 输入摘要。
+
 - Provider 不可用只减少解释能力，不降低硬风控或退出能力。
 - LLM 可能建议 Wait/Cancel/Reduce Risk，但当前版本不会自动改变候选计划或执行状态。
-- 请求驱动五阶段能力已经接通；自动盘后聚合、交易日调度和盘中去抖触发另行实现。
-- 当前建议单 API worker；数据库唯一 request_id 保证落库不重复，但共享 single-flight 与
-  跨 worker 成本配额尚未实现。
+- 请求驱动五阶段能力和自动编排均已接通；自动编排默认关闭，只有显式 opt-in 才会消费预算。
+- 多 API worker 共享 PostgreSQL request-id single-flight 与每日估算配额；内容缓存和并发信号量
+  仍按 worker 隔离。租约在 Provider 状态未知时过期会生成惰性结果，不重新调用 Provider。
 - 新 Provider 必须通过相同契约、故障注入和评测 Gate，不能因兼容性放宽 Schema。
+
+自动复盘、盘中触发、outbox 和多 worker 协调的详细取舍见 ADR 0005。

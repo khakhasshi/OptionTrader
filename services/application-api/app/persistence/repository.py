@@ -87,7 +87,7 @@ def _write_outbox(
     occurred_at_utc: datetime,
     payload: dict[str, Any],
     created_at_utc: datetime,
-) -> None:
+) -> str:
     if not source_event_id or not topic or not aggregate_type or not aggregate_id:
         raise ValueError("outbox event identity is incomplete")
     row = {
@@ -124,6 +124,31 @@ def _write_outbox(
         ).first()
         if exists is None:
             conn.execute(outbox_events.insert().values(**row))
+    return str(row["event_id"])
+
+
+def write_outbox(
+    conn: Any,
+    *,
+    source_event_id: str,
+    topic: str,
+    aggregate_type: str,
+    aggregate_id: str,
+    occurred_at_utc: datetime,
+    payload: dict[str, Any],
+    created_at_utc: datetime,
+) -> str:
+    """Public transaction-scoped outbox writer for adjacent persistence modules."""
+    return _write_outbox(
+        conn,
+        source_event_id=source_event_id,
+        topic=topic,
+        aggregate_type=aggregate_type,
+        aggregate_id=aggregate_id,
+        occurred_at_utc=occurred_at_utc,
+        payload=payload,
+        created_at_utc=created_at_utc,
+    )
 
 
 @dataclass(frozen=True)
@@ -144,13 +169,19 @@ def claim_outbox_batch(
     limit: int = 50,
     lease_seconds: int = 30,
     now: datetime | None = None,
+    topics: tuple[str, ...] | None = None,
 ) -> list[OutboxMessage]:
     """Lease unpublished events for at-least-once delivery.
 
     PostgreSQL workers use ``FOR UPDATE SKIP LOCKED``. The event_id is the
     downstream idempotency key; consumers must deduplicate it.
     """
-    if not worker_id or not 1 <= limit <= 500 or not 5 <= lease_seconds <= 300:
+    if (
+        not worker_id
+        or not 1 <= limit <= 500
+        or not 5 <= lease_seconds <= 300
+        or (topics is not None and (not topics or any(not topic for topic in topics)))
+    ):
         raise ValueError("outbox claim parameters are invalid")
     claimed_at = now or _now_utc()
     if claimed_at.tzinfo is None:
@@ -171,6 +202,8 @@ def claim_outbox_batch(
             .order_by(outbox_events.c.available_at_utc, outbox_events.c.id)
             .limit(limit)
         )
+        if topics is not None:
+            query = query.where(outbox_events.c.topic.in_(topics))
         if conn.dialect.name == "postgresql":
             query = query.with_for_update(skip_locked=True)
         rows = conn.execute(query).mappings().all()
@@ -1626,4 +1659,5 @@ __all__ = [
     "latest_execution_ticket",
     "staged_plan_projection",
     "verified_initial_risk_context",
+    "write_outbox",
 ]

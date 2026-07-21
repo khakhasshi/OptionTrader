@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app import main
 from app.llm.models import LLMReview, LLMReviewRequest
 from app.llm.security import review_input_hash
+from app.llm.service import InFlightReviewConflict
 from app.trading.models import CandidateTradePlan, RiskDecision
 
 
@@ -246,3 +247,31 @@ def test_reused_request_id_with_changed_input_fails_before_provider(
     assert response.status_code == 409
     assert response.json()["detail"] == "llm_request_id_conflict"
     assert service.calls == 0
+
+
+def test_inflight_request_identity_conflict_maps_to_http_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ConflictService:
+        async def review(
+            self, _request: LLMReviewRequest, *, initial_risk_verified: bool = False
+        ) -> LLMReview:
+            del initial_risk_verified
+            raise InFlightReviewConflict("conflicting in-flight input")
+
+    raw = _json("llm_review_request.sample.json")
+    raw.update({"stage": "PRE_MARKET", "plan_id": None, "plan_hash": None})
+    raw["context"]["candidate_trade_plan"] = None
+    raw["context"]["initial_risk_decision"] = None
+    monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
+    monkeypatch.setattr(main, "assert_review_store_available", lambda _engine: None)
+    monkeypatch.setattr(main, "get_llm_review_by_request_id", lambda *_args: None)
+    monkeypatch.setattr(main, "_llm_review_service", ConflictService)
+    monkeypatch.setattr(
+        main,
+        "persist_llm_review",
+        lambda *_args: pytest.fail("conflicting request must not be persisted"),
+    )
+    response = TestClient(main.app).post("/api/v1/llm/reviews", json=raw)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "llm_request_id_conflict"

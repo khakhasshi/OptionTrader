@@ -88,6 +88,7 @@ make up / make down  # docker compose 本地依赖（PostgreSQL 等）
 - 订单、成交、风控、审计写入与状态转换须同事务或用 transactional outbox。
 - 密钥不入 Git、日志、前端 bundle；用本地 secret store 或环境密钥管理。日志对账户号、token、订单原始凭证、PII 脱敏。
 - 不提交大量 tick 数据到 Git。fixture 必须脱敏且体积可控。
+- 生产文件若同时承载协议映射、状态机编排和外部适配器等多个职责，或接近 1000 行，必须按所有权边界拆分；入口模块只保留公共类型、组合与薄委托。例外需在 ADR 说明。
 - 每完成一个阶段更新 `TASKS.md`；重要架构决策写入本文件第 9 节并在 `docs/adr/` 建 ADR。
 - 遇错先定位根因，不通过绕过检查或隐藏错误强行继续。
 
@@ -100,6 +101,8 @@ make up / make down  # docker compose 本地依赖（PostgreSQL 等）
 - **D5**：Phase 2 真实源与事件上下文——`OPTIONTRADER_MARKET_SOURCE=theta-sdk` 只消费内部 `ThetaDataSdkService`；Python 官方 SDK 直连 ThetaData 并轮询当日 Nasdaq Basic 已完成 1m OHLC，凭证不跨入 Rust。每次连接首批必须从 09:30 连续回补，Python 过滤空占位/当前未完成分钟，Rust 再校验时间、OHLC、连续性及已发布前缀；任一失败保持闭锁。Python 从四类严格来源文件生成 EventContext，缺失、陈旧、未来接收时间或关键低置信度输入禁止新开仓；事件文本不进入指令通道。真实凭证小样本 smoke 已通过，完整 RTH soak 仍是现场 Gate，不以 mock 测试替代。
 - **D6**：Phase 3 半自动执行——CandidateTradePlan 1.3 使用确定性 Protobuf hash，计划级及每腿行情来源固定为 THETADATA，并携带 quote/size/Greeks/chain proof 与 OPEN/CLOSE 语义；Broker 只提供账户/持仓/订单/成交事实。Theta SDK bridge 生成 exact-contract 内容寻址批次，Stage 只复用仍新鲜的缓存、Confirm 强制重取并逐字段复核；Gamma 始终由同步 ThetaData Delta/IV/underlying/time 推导。确认令牌以 Fernet key ring 密文进入 PostgreSQL capability store，在确认意图事务内一次性 claim，启动原子轮换；所有状态转换同事务写入 deterministic outbox，支持租约、重试和 dead letter。ExecutionOrder 1.1 投影完整子单明细；Rust、Python、React 独立校验残余敞口，PostgreSQL 以单调 state_version、行锁和数量不回退规则禁止无证明清仓。重启由 PostgreSQL 原子重建 workflow；已提交/已 claim 的非终态先恢复为 ReconcilePending，不自动重发。IBKR 按 native id/orderRef/完整形状只读认领；Longbridge 官方 Rust SDK 按 native id、remark、完整形状只读认领单腿与拆腿；两者均通过 Begin/Persist/Commit 两阶段协议恢复权威状态。自适应 package 与每腿限价只由 Rust 基于 ThetaData proof 计算；市价只允许单腿、持仓可证明减少的保护性 CLOSE，多腿仍限价。REPLAY/SHADOW 不接 Broker；PAPER/MANUAL_CONFIRM 默认确定性 PaperBroker，外部 IBKR/Longbridge paper 路由必须同时满足 paper 环境、全局和 Broker 专属 opt-in、以及单一 Broker 对账匹配；unknown submit/cancel 先对账。CONTROLLED_AUTO/live 禁用。真实 paper 全天认证仍未完成，风险参数默认未确认。详见 `docs/adr/0002-phase3-semi-automated-execution.md` 与 `docs/BROKER_ADAPTERS.md`。
 - **D7**：Phase 4 LLM 辅助层——只接受白名单结构化上下文并删除原始引用，输出必须通过 LLMReview v1.0、阶段互斥约束和来源 ID 校验。OpenAI-compatible Provider 只启用 JSON mode，不提供工具；超时、限流、Schema/阶段错误、预算耗尽和配置缺失均返回惰性的 Review Only，确定性流程不受影响。PRE_EXECUTION 只接受 PostgreSQL 重读的 Candidate 与 APPROVED Initial Risk；即使输出 Proceed 也不连接 Stage/Confirm/Submit。研究假设固定 `activation_allowed=false`。Provider 密钥仅由服务端环境读取；浏览器设置页只生成本地草稿。详见 `docs/adr/0003-phase4-llm-advisory-boundary.md`。
+- **D8**：Rust `RiskExecutionService` 保持单一 gRPC 公共入口，但实现按 backend、candidate、confirmation、orders、reconciliation 和 mapping 分模块；入口只组合依赖并委托 RPC。拆分不得改变 protobuf、状态转换或 Broker fail-closed 语义。详见 `docs/adr/0004-risk-grpc-module-boundaries.md`。
+- **D9**：Phase 4 自动编排——盘后请求只能在 XNYS 收盘、确定性证据完整且同 session Broker 对账完成后进入 transactional outbox；盘中审阅只异步消费白名单状态事件并执行指纹去重、去抖、限频和合并，不能反压交易/风控线程。PostgreSQL `0007` 提供多 worker 原子每日配额、request-id single-flight、租约和结果；未知 Provider 状态的过期租约只恢复为惰性结果，禁止二次调用。自动编排默认关闭且 LLM 始终无交易授权。详见 `docs/adr/0005-phase4-automated-review-coordination.md`。
 - 后续决策追加于此并同步 ADR。
 
 ## 10. 暂不实现（第一阶段）

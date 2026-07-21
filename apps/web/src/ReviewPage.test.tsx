@@ -153,4 +153,36 @@ describe("review contract parser", () => {
       rule_hypotheses: [HYPOTHESES[0].payload],
     })).toBeNull();
   });
+
+  it("rejects implausible provider usage telemetry", () => {
+    expect(parseLLMReview({
+      ...REVIEW,
+      provider: { ...REVIEW.provider, input_tokens: 1_000_001 },
+    })).toBeNull();
+    expect(parseLLMReview({
+      ...REVIEW,
+      provider: { ...REVIEW.provider, output_tokens: 65_537 },
+    })).toBeNull();
+  });
+
+  it("accepts coordination failures only from the contract enum", () => {
+    expect(parseLLMReview({
+      ...REVIEW,
+      review_status: "UNAVAILABLE",
+      unavailable_reason_code: "COORDINATION_LEASE_EXPIRED",
+      recommended_action: "Review Only",
+      confidence: 0,
+      daily_review: null,
+      rule_hypotheses: [],
+    })).not.toBeNull();
+    expect(parseLLMReview({
+      ...REVIEW,
+      review_status: "UNAVAILABLE",
+      unavailable_reason_code: "SOMETHING_UNDOCUMENTED",
+      recommended_action: "Review Only",
+      confidence: 0,
+      daily_review: null,
+      rule_hypotheses: [],
+    })).toBeNull();
+  });
 });

@@ -19,6 +19,10 @@ from app.events.models import EventContext
 from app.trading.models import CandidateTradePlan, RiskDecision
 
 
+MAX_PROVIDER_INPUT_TOKENS = 1_000_000
+MAX_PROVIDER_OUTPUT_TOKENS = 65_536
+
+
 def _utc_z(value: str) -> str:
     if not value.endswith("Z"):
         raise ValueError("UTC timestamp must end in Z")
@@ -63,6 +67,8 @@ UnavailableReason = Literal[
     "INPUT_REJECTED",
     "INITIAL_RISK_REQUIRED",
     "BUDGET_EXCEEDED",
+    "COORDINATION_LEASE_EXPIRED",
+    "COORDINATION_RECOVERY",
 ]
 
 
@@ -239,8 +245,8 @@ class ProviderMetadata(StrictModel):
     latency_ms: int = Field(ge=0)
     attempts: int = Field(ge=0, le=4)
     cache_hit: bool
-    input_tokens: int = Field(ge=0)
-    output_tokens: int = Field(ge=0)
+    input_tokens: int = Field(ge=0, le=MAX_PROVIDER_INPUT_TOKENS)
+    output_tokens: int = Field(ge=0, le=MAX_PROVIDER_OUTPUT_TOKENS)
     estimated_cost_usd: NonnegativeDecimalString
 
 
@@ -372,6 +378,8 @@ __all__ = [
     "LLMReview",
     "LLMReviewContent",
     "LLMReviewRequest",
+    "MAX_PROVIDER_INPUT_TOKENS",
+    "MAX_PROVIDER_OUTPUT_TOKENS",
     "ProviderMetadata",
     "ReviewContext",
     "ReviewConstraintViolation",

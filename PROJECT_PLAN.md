@@ -116,4 +116,4 @@ gRPC（Python↔Rust）：已实现 StreamMarketSnapshots、GetDataHealth、Eval
 
 Phase 0、1 已完成，Phase 2 代码签收且完整 RTH 现场 soak 待执行。Phase 3 代码闭环已完成：Candidate 1.3 强制 ThetaData 行情证明并区分 OPEN/CLOSE；两阶段 Rust 风控、可信期权快照、Rust package/每腿定价、Longbridge BUY-first 受控拆腿、IBKR BAG、simulated/external paper 路由、PostgreSQL 事务审计/outbox、Fernet key ring 原子轮换、Broker 全账户事实账本、重启恢复、保护性减仓和 UI 人工确认均已接线并通过离线/集成门禁。Phase 3 的代码完成不等于 paper/live 放行：完整 RTH option soak、两家真实 paper 账户的提交/部分成交/撤单/断线/重启故障演练及 Q3 参数书面批准仍归现场 Gate，live 继续无可达路由。
 
-Phase 4 主体切片已完成：五阶段 LLMReview v1.0、严格输入/输出边界、DeepSeek OpenAI-compatible 适配、失败惰性降级、缓存/成本/并发控制、PostgreSQL 0006、审阅 API、中文 Daily Review 与研究队列、离线及真实模型对抗评测均已接通。LLM 端点与任何 Stage/Confirm/Submit/Cancel/Close 路由无调用关系，研究假设在模型、API 与数据库三层均禁止激活。自动盘后聚合/定时调度、盘中异步触发去抖和长期评测基线仍待下一切片。详见 `TASKS.md` 与 ADR 0003。
+Phase 4 代码切片已完成：五阶段 LLMReview v1.0、严格输入/输出边界、DeepSeek OpenAI-compatible 适配、失败惰性降级、中文 Daily Review 与研究队列、离线/真实模型评测、XNYS 盘后确定性聚合、盘中异步去抖合并、transactional outbox/DLQ，以及 PostgreSQL 多 worker 原子配额、request-id single-flight、租约和崩溃恢复均已接通。LLM 与任何 Stage/Confirm/Submit/Cancel/Close 路由无调用关系，自动编排默认关闭；长期评测基线仍持续扩充。详见 `TASKS.md`、ADR 0003 与 ADR 0005。

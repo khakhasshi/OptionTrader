@@ -1,5 +1,19 @@
 export type ReviewStatus = "COMPLETED" | "UNAVAILABLE" | "INVALID";
 export type SopAlignment = "Aligned" | "Conflict" | "Unknown";
+export type UnavailableReason =
+  | "CONFIG_MISSING"
+  | "TIMEOUT"
+  | "RATE_LIMIT"
+  | "PROVIDER_ERROR"
+  | "INVALID_RESPONSE"
+  | "INPUT_REJECTED"
+  | "INITIAL_RISK_REQUIRED"
+  | "BUDGET_EXCEEDED"
+  | "COORDINATION_LEASE_EXPIRED"
+  | "COORDINATION_RECOVERY";
+
+const MAX_PROVIDER_INPUT_TOKENS = 1_000_000;
+const MAX_PROVIDER_OUTPUT_TOKENS = 65_536;
 
 export interface LossAttribution {
   kind: "DIRECTION" | "IV" | "THETA" | "SLIPPAGE" | "EXECUTION_ERROR" | "OTHER";
@@ -52,7 +66,7 @@ export interface LLMReview {
   rule_references: string[];
   daily_review: DailyReviewDetail | null;
   rule_hypotheses: RuleHypothesis[];
-  unavailable_reason_code: string | null;
+  unavailable_reason_code: UnavailableReason | null;
   provider: ProviderMetadata;
 }
 
@@ -113,7 +127,21 @@ export function parseLLMReview(value: unknown): LLMReview | null {
     value.confidence < 0 ||
     value.confidence > 1 ||
     !isStringArray(value.rule_references) ||
-    !(value.unavailable_reason_code === null || isString(value.unavailable_reason_code))
+    !(
+      value.unavailable_reason_code === null ||
+      isOneOf(value.unavailable_reason_code, [
+        "CONFIG_MISSING",
+        "TIMEOUT",
+        "RATE_LIMIT",
+        "PROVIDER_ERROR",
+        "INVALID_RESPONSE",
+        "INPUT_REJECTED",
+        "INITIAL_RISK_REQUIRED",
+        "BUDGET_EXCEEDED",
+        "COORDINATION_LEASE_EXPIRED",
+        "COORDINATION_RECOVERY",
+      ])
+    )
   ) return null;
   const provider = parseProvider(value.provider);
   if (!provider) return null;
@@ -212,7 +240,9 @@ function parseProvider(value: unknown): ProviderMetadata | null {
     value.attempts > 4 ||
     typeof value.cache_hit !== "boolean" ||
     !isNonNegativeInteger(value.input_tokens) ||
+    value.input_tokens > MAX_PROVIDER_INPUT_TOKENS ||
     !isNonNegativeInteger(value.output_tokens) ||
+    value.output_tokens > MAX_PROVIDER_OUTPUT_TOKENS ||
     !isDecimal(value.estimated_cost_usd)
   ) return null;
   return value as unknown as ProviderMetadata;

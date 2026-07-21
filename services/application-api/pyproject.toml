@@ -16,6 +16,7 @@ dependencies = [
     "grpcio>=1.66",
     "protobuf>=5.27",
     "cryptography>=45.0",
+    "exchange-calendars>=4.13,<5",
     "thetadata>=1.0.9",
 ]
 

@@ -136,8 +136,21 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
    版本变化都必须重跑；失败时保持 LLM 功能降级，不得放宽 Schema 取得绿灯。
 6. Daily Review 与规则研究队列是只读页面。研究假设永远不能直接激活；进入 shadow 前仍需
    成本回测、walk-forward、样本外验证和人工 Gate Review。
-7. 当前 LLM cache、并发和每日预算按 API 进程计数。多 worker 会放大总配额，且相同请求在
-   并发窗口可能发生重复 Provider 调用；完成 PostgreSQL 共享配额/single-flight 前使用单 worker。
+7. `0007` 迁移后，每日请求/估算金额配额、request-id single-flight、租约和结果均由
+   PostgreSQL 协调；多 API worker 不会对同一 request id 重复调用 Provider。进程内 cache 与
+   并发信号量仍按 worker 隔离，因此不同 request id 即使内容相同也不承诺跨 worker 命中缓存。
+8. 自动编排默认关闭。完成 `make migrate` 后，只有显式设置
+   `OPTIONTRADER_LLM_AUTOMATION_ENABLED=true` 才启动。盘后任务使用 XNYS 交易日历；必须达到
+   交易所收盘与 grace、信号/EventContext 完整、每笔已提交订单终态、残余敞口清零，并取得
+   同 session、晚于收盘及订单更新时刻的 HEALTHY Broker 对账证明，才写入 review outbox。
+9. 盘中任务只异步读取确定性 transactional outbox 的白名单 topic，按状态指纹去重、去抖、
+   限频并批量合并。交易/风控写路径不写 LLM 队列，也不等待调度器；停止 API 时直接取消
+   supervisor，不为清空积压而延迟退出。
+10. 查看 `GET /api/v1/llm/automation/status` 和 `/api/v1/llm/automation/runs`。缺数据或未完成对账
+    会保留 `WAITING_INERT` 与原因码且不调用 Provider；消费失败按 outbox 租约重试，达到上限
+    进入 dead letter。若 Provider 调用期间 worker 消失，租约恢复生成
+    `COORDINATION_LEASE_EXPIRED` 惰性结果，禁止再次调用 Provider；这是有意的 at-most-once
+    取舍，不得人工删除租约后重放同一 request id。
 
 ## Broker SDK 认证前启动
 

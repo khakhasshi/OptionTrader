@@ -38,6 +38,13 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.llm.config import LLMSettings
+from app.llm.coordinator import PostgresReviewCoordinator
+from app.llm.automation import (
+    AutomationStatus,
+    LLMAutomationSettings,
+    LLMAutomationSupervisor,
+)
+from app.llm.automation_repository import AutomationRun, list_automation_runs
 from app.llm.models import (
     LLMReview,
     LLMReviewRequest,
@@ -46,7 +53,7 @@ from app.llm.models import (
     SourceReference,
 )
 from app.llm.security import review_input_hash
-from app.llm.service import LLMReviewService
+from app.llm.service import InFlightReviewConflict, LLMReviewService, same_review_request
 from app.persistence import (
     assert_review_store_available,
     claim_confirmation_intent,
@@ -110,7 +117,28 @@ def _llm_settings() -> LLMSettings:
 
 @lru_cache(maxsize=1)
 def _llm_review_service() -> LLMReviewService:
-    return LLMReviewService(_llm_settings())
+    settings = _llm_settings()
+    coordinator = PostgresReviewCoordinator(
+        _require_execution_engine(),
+        daily_max_requests=settings.daily_max_requests,
+        daily_max_estimated_usd=settings.daily_max_estimated_usd,
+    )
+    return LLMReviewService(settings, coordinator=coordinator)
+
+
+@lru_cache(maxsize=1)
+def _llm_automation_settings() -> LLMAutomationSettings:
+    return LLMAutomationSettings.from_env()
+
+
+@lru_cache(maxsize=1)
+def _llm_automation_supervisor() -> LLMAutomationSupervisor:
+    return LLMAutomationSupervisor(
+        _require_execution_engine(),
+        _llm_review_service(),
+        _llm_automation_settings(),
+        rule_version=_RULE_VERSION,
+    )
 
 
 @lru_cache(maxsize=2)
@@ -191,6 +219,7 @@ def _validate_execution_reconciliation_route(
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     reconciliation_task: asyncio.Task[None] | None = None
+    llm_automation_task: asyncio.Task[None] | None = None
     enabled = os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_ENABLED", "true")
     if enabled not in {"true", "false"}:
         raise ValueError("OPTIONTRADER_BROKER_RECONCILIATION_ENABLED must be exactly true or false")
@@ -215,9 +244,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             reconciliation_task = asyncio.create_task(
                 reconciliation_supervisor.serve(_require_execution_engine(), interval, brokers)
             )
+    automation_settings = _llm_automation_settings()
+    if automation_settings.enabled:
+        if not os.getenv("DATABASE_URL"):
+            raise ValueError("LLM automation requires DATABASE_URL")
+        llm_automation_task = asyncio.create_task(_llm_automation_supervisor().serve())
     try:
         yield
     finally:
+        if llm_automation_task is not None:
+            llm_automation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await llm_automation_task
         if reconciliation_task is not None:
             reconciliation_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -263,6 +301,34 @@ class LLMServiceStatus(BaseModel):
     configured: bool
     provider: str
     model: str
+    trading_authority: Literal["NONE"]
+
+
+class LLMAutomationStatusView(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: bool
+    running: bool
+    worker_id: str | None
+    last_cycle_at_utc: str | None
+    last_error_code: str | None
+    processed_requests: int
+    trading_authority: Literal["NONE"]
+
+
+class LLMAutomationRunView(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    run_id: str = Field(min_length=1)
+    kind: Literal["POST_MARKET", "INTRADAY"]
+    request_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    trading_date: date | None
+    state: Literal["WAITING_INERT", "ENQUEUED", "PROCESSING", "COMPLETED", "DEAD_LETTERED"]
+    inert_reason_code: str | None
+    trigger_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    outbox_event_id: str | None
+    source_event_ids: list[str]
     trading_authority: Literal["NONE"]
 
 
@@ -485,6 +551,49 @@ def llm_service_status() -> LLMServiceStatus:
     )
 
 
+@app.get("/api/v1/llm/automation/status", response_model=LLMAutomationStatusView)
+def llm_automation_status() -> LLMAutomationStatusView:
+    settings = _llm_automation_settings()
+    status = (
+        _llm_automation_supervisor().status()
+        if settings.enabled
+        else AutomationStatus(False, "", None, None, 0)
+    )
+    return LLMAutomationStatusView(
+        enabled=settings.enabled,
+        running=status.running,
+        worker_id=status.worker_id or None,
+        last_cycle_at_utc=status.last_cycle_at_utc,
+        last_error_code=status.last_error_code,
+        processed_requests=status.processed_requests,
+        trading_authority="NONE",
+    )
+
+
+@app.get("/api/v1/llm/automation/runs", response_model=list[LLMAutomationRunView])
+def read_llm_automation_runs(limit: int = 50) -> list[LLMAutomationRunView]:
+    try:
+        runs: list[AutomationRun] = list_automation_runs(_require_execution_engine(), limit=limit)
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="llm_automation_read_failed") from exc
+    return [
+        LLMAutomationRunView(
+            run_id=run.run_id,
+            kind=run.kind,
+            request_id=run.request_id,
+            session_id=run.session_id,
+            trading_date=run.trading_date,
+            state=run.state,
+            inert_reason_code=run.inert_reason_code,
+            trigger_hash=run.trigger_hash,
+            outbox_event_id=run.outbox_event_id,
+            source_event_ids=list(run.source_event_ids),
+            trading_authority="NONE",
+        )
+        for run in runs
+    ]
+
+
 @app.post("/api/v1/llm/reviews", response_model=LLMReview)
 async def create_llm_review(request: LLMReviewRequest) -> LLMReview:
     """Generate and atomically audit one advisory review.
@@ -557,7 +666,7 @@ async def create_llm_review(request: LLMReviewRequest) -> LLMReview:
             request.request_id,
         )
         if existing is not None:
-            if not _same_llm_review_request(existing, request, input_hash):
+            if not same_review_request(existing, request, input_hash):
                 raise HTTPException(status_code=409, detail="llm_request_id_conflict")
             return existing
         review = await _llm_review_service().review(
@@ -565,31 +674,12 @@ async def create_llm_review(request: LLMReviewRequest) -> LLMReview:
         )
         await asyncio.to_thread(persist_llm_review, engine, request, review)
         return review
+    except InFlightReviewConflict as exc:
+        raise HTTPException(status_code=409, detail="llm_request_id_conflict") from exc
     except HTTPException:
         raise
     except (SQLAlchemyError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="llm_review_audit_failed") from exc
-
-
-def _same_llm_review_request(
-    review: LLMReview,
-    request: LLMReviewRequest,
-    input_hash: str,
-) -> bool:
-    return (
-        review.request_id == request.request_id
-        and review.correlation_id == request.correlation_id
-        and review.causation_id == request.causation_id
-        and review.session_id == request.session_id
-        and review.occurred_at_utc == request.occurred_at_utc
-        and review.source_sequence == request.source_sequence
-        and review.rule_version == request.rule_version
-        and review.stage == request.stage
-        and review.trading_date == request.trading_date
-        and review.plan_id == request.plan_id
-        and review.plan_hash == request.plan_hash
-        and review.provider.input_hash == input_hash
-    )
 
 
 @app.get("/api/v1/llm/reviews", response_model=list[LLMReview])

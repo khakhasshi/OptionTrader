@@ -186,10 +186,34 @@ def test_non_completed_llm_review_is_forced_inert():
     assert len(list(validator.iter_errors(fixture))) >= 2
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ["COORDINATION_LEASE_EXPIRED", "COORDINATION_RECOVERY"],
+)
+def test_llm_review_accepts_documented_coordination_failure(reason):
+    reg, res = _registry()
+    fixture = json.load(open(os.path.join(FIXTURE_DIR, "llm_review.unavailable.json")))
+    fixture["unavailable_reason_code"] = reason
+    validator = Draft202012Validator(res["llm_review.json"].contents, registry=reg)
+    assert list(validator.iter_errors(fixture)) == []
+
+
 def test_llm_review_rejects_negative_estimated_cost():
     reg, res = _registry()
     fixture = json.load(open(os.path.join(FIXTURE_DIR, "llm_review.completed.json")))
     fixture["provider"]["estimated_cost_usd"] = "-0.01"
+    validator = Draft202012Validator(res["llm_review.json"].contents, registry=reg)
+    assert list(validator.iter_errors(fixture))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("input_tokens", 1_000_001), ("output_tokens", 65_537)],
+)
+def test_llm_review_rejects_implausible_provider_usage(field, value):
+    reg, res = _registry()
+    fixture = json.load(open(os.path.join(FIXTURE_DIR, "llm_review.completed.json")))
+    fixture["provider"][field] = value
     validator = Draft202012Validator(res["llm_review.json"].contents, registry=reg)
     assert list(validator.iter_errors(fixture))
 

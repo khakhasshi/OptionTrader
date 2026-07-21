@@ -13,7 +13,13 @@ import httpx
 from pydantic import ValidationError
 
 from app.llm.config import LLMSettings
-from app.llm.models import LLMReviewContent, ReviewConstraintViolation, UnavailableReason
+from app.llm.models import (
+    MAX_PROVIDER_INPUT_TOKENS,
+    MAX_PROVIDER_OUTPUT_TOKENS,
+    LLMReviewContent,
+    ReviewConstraintViolation,
+    UnavailableReason,
+)
 
 
 ContentValidator = Callable[[LLMReviewContent], LLMReviewContent]
@@ -47,6 +53,8 @@ class ProviderFailure(RuntimeError):
         latency_ms: int,
         *,
         validation_errors: tuple[str, ...] = (),
+        input_tokens: int = 0,
+        output_tokens: int = 0,
     ) -> None:
         super().__init__(reason_code)
         self.reason_code = reason_code
@@ -54,6 +62,8 @@ class ProviderFailure(RuntimeError):
         self.latency_ms = latency_ms
         # Schema paths and validator types only; provider values never cross this boundary.
         self.validation_errors = validation_errors
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 class OpenAICompatibleProvider:
@@ -118,12 +128,25 @@ class OpenAICompatibleProvider:
                 else:
                     if response.status_code == 429:
                         last_reason = "RATE_LIMIT"
+                        used_input, used_output = _safe_response_usage(response)
+                        consumed_input_tokens += used_input
+                        consumed_output_tokens += used_output
                         retry = True
                     elif response.status_code in {500, 502, 503, 504}:
                         last_reason = "PROVIDER_ERROR"
+                        used_input, used_output = _safe_response_usage(response)
+                        consumed_input_tokens += used_input
+                        consumed_output_tokens += used_output
                         retry = True
                     elif response.status_code >= 400:
-                        raise ProviderFailure("PROVIDER_ERROR", attempts, _elapsed_ms(started))
+                        used_input, used_output = _safe_response_usage(response)
+                        raise ProviderFailure(
+                            "PROVIDER_ERROR",
+                            attempts,
+                            _elapsed_ms(started),
+                            input_tokens=consumed_input_tokens + used_input,
+                            output_tokens=consumed_output_tokens + used_output,
+                        )
                     else:
                         try:
                             completion = _parse_completion(
@@ -174,6 +197,8 @@ class OpenAICompatibleProvider:
             attempts,
             _elapsed_ms(started),
             validation_errors=validation_errors,
+            input_tokens=consumed_input_tokens,
+            output_tokens=consumed_output_tokens,
         )
 
 
@@ -208,8 +233,12 @@ def _parse_completion(
     usage = raw.get("usage", {})
     if not isinstance(usage, dict):
         raise TypeError("provider usage is invalid")
-    input_tokens = _nonnegative_int(usage.get("prompt_tokens", 0))
-    output_tokens = _nonnegative_int(usage.get("completion_tokens", 0))
+    input_tokens = _bounded_nonnegative_int(
+        usage.get("prompt_tokens", 0), MAX_PROVIDER_INPUT_TOKENS
+    )
+    output_tokens = _bounded_nonnegative_int(
+        usage.get("completion_tokens", 0), MAX_PROVIDER_OUTPUT_TOKENS
+    )
     provider_request_id = raw.get("id")
     if provider_request_id is not None and not isinstance(provider_request_id, str):
         raise TypeError("provider request id is invalid")
@@ -223,8 +252,8 @@ def _parse_completion(
     )
 
 
-def _nonnegative_int(value: Any) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+def _bounded_nonnegative_int(value: Any, maximum: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > maximum:
         raise TypeError("provider token usage is invalid")
     return value
 
@@ -246,8 +275,8 @@ def _safe_response_usage(response: httpx.Response) -> tuple[int, int]:
             return 0, 0
         usage = raw["usage"]
         return (
-            _nonnegative_int(usage.get("prompt_tokens", 0)),
-            _nonnegative_int(usage.get("completion_tokens", 0)),
+            _bounded_nonnegative_int(usage.get("prompt_tokens", 0), MAX_PROVIDER_INPUT_TOKENS),
+            _bounded_nonnegative_int(usage.get("completion_tokens", 0), MAX_PROVIDER_OUTPUT_TOKENS),
         )
     except (TypeError, ValueError, json.JSONDecodeError):
         return 0, 0

@@ -33,6 +33,18 @@ metadata = MetaData()
 _JSON = JSONB().with_variant(JSON(), "sqlite")
 _BIGINT = BigInteger().with_variant(Integer(), "sqlite")
 
+trading_sessions = Table(
+    "trading_sessions",
+    metadata,
+    Column("session_id", Text, primary_key=True),
+    Column("trading_date", Date, nullable=False, unique=True),
+    Column("status", Text, nullable=False),
+    Column("opened_at_utc", DateTime(timezone=True)),
+    Column("closed_at_utc", DateTime(timezone=True)),
+    Column("created_at_utc", DateTime(timezone=True), nullable=False),
+    schema="trading",
+)
+
 # trading.signals — one row per engine tick: the selected strategy (or No Trade)
 # with the regime/vol context and the No-Trade reason for review.
 signals = Table(
@@ -309,6 +321,89 @@ rule_hypotheses = Table(
     schema="review",
 )
 
+llm_daily_budgets = Table(
+    "llm_daily_budgets",
+    metadata,
+    Column("budget_date", Date, primary_key=True),
+    Column("request_count", Integer, nullable=False),
+    Column("reserved_cost_usd", Numeric, nullable=False),
+    Column("actual_cost_usd", Numeric, nullable=False),
+    Column("updated_at_utc", DateTime(timezone=True), nullable=False),
+    schema="review",
+)
+
+llm_request_leases = Table(
+    "llm_request_leases",
+    metadata,
+    Column("request_id", Text, primary_key=True),
+    Column("identity_hash", Text, nullable=False),
+    Column("state", Text, nullable=False),
+    Column("owner_id", Text),
+    Column("lease_expires_at_utc", DateTime(timezone=True)),
+    Column("budget_date", Date, nullable=False),
+    Column("reserved_cost_usd", Numeric, nullable=False),
+    Column("actual_cost_usd", Numeric, nullable=False),
+    Column("result_payload", _JSON),
+    Column("failure_code", Text),
+    Column("created_at_utc", DateTime(timezone=True), nullable=False),
+    Column("updated_at_utc", DateTime(timezone=True), nullable=False),
+    Column("completed_at_utc", DateTime(timezone=True)),
+    schema="review",
+)
+
+llm_automation_runs = Table(
+    "llm_automation_runs",
+    metadata,
+    Column("run_id", Text, primary_key=True),
+    Column("kind", Text, nullable=False),
+    Column("request_id", Text, nullable=False, unique=True),
+    Column("session_id", Text, nullable=False),
+    Column("trading_date", Date),
+    Column("state", Text, nullable=False),
+    Column("inert_reason_code", Text),
+    Column("trigger_hash", Text, nullable=False),
+    Column("outbox_event_id", Text, unique=True),
+    Column("source_event_ids", _JSON, nullable=False),
+    Column("created_at_utc", DateTime(timezone=True), nullable=False),
+    Column("updated_at_utc", DateTime(timezone=True), nullable=False),
+    Column("completed_at_utc", DateTime(timezone=True)),
+    schema="review",
+)
+
+llm_trigger_events = Table(
+    "llm_trigger_events",
+    metadata,
+    Column("id", _BIGINT, primary_key=True, autoincrement=True),
+    Column("source_outbox_id", _BIGINT, nullable=False, unique=True),
+    Column("source_event_id", Text, nullable=False, unique=True),
+    Column("session_id", Text),
+    Column("topic", Text, nullable=False),
+    Column("aggregate_type", Text, nullable=False),
+    Column("aggregate_id", Text, nullable=False),
+    Column("occurred_at_utc", DateTime(timezone=True), nullable=False),
+    Column("event_fingerprint", Text, nullable=False),
+    Column("payload", _JSON, nullable=False),
+    Column("state", Text, nullable=False),
+    Column("available_at_utc", DateTime(timezone=True), nullable=False),
+    Column("merged_run_id", Text),
+    Column("created_at_utc", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "session_id",
+        "event_fingerprint",
+        name="uq_llm_trigger_session_fingerprint",
+    ),
+    schema="review",
+)
+
+llm_event_cursors = Table(
+    "llm_event_cursors",
+    metadata,
+    Column("cursor_name", Text, primary_key=True),
+    Column("last_outbox_id", _BIGINT, nullable=False),
+    Column("updated_at_utc", DateTime(timezone=True), nullable=False),
+    schema="review",
+)
+
 __all__ = [
     "audit_events",
     "broker_snapshots",
@@ -318,6 +413,11 @@ __all__ = [
     "fills",
     "daily_reviews",
     "llm_reviews",
+    "llm_automation_runs",
+    "llm_daily_budgets",
+    "llm_event_cursors",
+    "llm_request_leases",
+    "llm_trigger_events",
     "metadata",
     "order_events",
     "outbox_events",
@@ -326,4 +426,5 @@ __all__ = [
     "risk_decisions",
     "rule_hypotheses",
     "signals",
+    "trading_sessions",
 ]
