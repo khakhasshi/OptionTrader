@@ -160,13 +160,10 @@ class SessionHub:
 
     def _track_market_seq(self, frame: dict[str, Any]) -> None:
         """Remember the last accepted market sequence so a reconnect resumes
-        after it. Only LIVE frames carry a snapshot the projector accepted; a
-        STALE reconciling frame (gap) must NOT advance the resume point."""
-        snap = frame.get("snapshot")
-        if frame.get("connection") == "LIVE" and isinstance(snap, dict):
-            seq = snap.get("sequence_number")
-            if isinstance(seq, int) and seq > self._last_market_seq:
-                self._last_market_seq = seq
+        after it. BACKFILL frames are accepted into the projector's contiguous
+        history even though their CockpitState stays STALE/No Trade, so use the
+        projector's authoritative accepted cursor instead of display state."""
+        self._last_market_seq = self._projector.last_market_sequence
 
     def stop(self) -> None:
         """Stop the hub: end its upstream loop and release its subscribers."""

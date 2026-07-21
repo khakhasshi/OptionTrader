@@ -79,6 +79,8 @@ def _tick(minute_et: int, seq: int, health: str = "HEALTHY") -> dict[str, Any]:
             "volume": 1000 + seq,
             "vwap": f"{close:.2f}",
         },
+        "delivery_phase": "LIVE",
+        "high_watermark_sequence": seq,
     }
 
 

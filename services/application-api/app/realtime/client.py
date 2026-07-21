@@ -27,6 +27,11 @@ _HEALTH_NAME: dict[int, str] = {
     int(market_pb2.DATA_HEALTH_RECONCILING): "RECONCILING",
 }
 
+_DELIVERY_PHASE_NAME: dict[int, str] = {
+    int(market_pb2.DELIVERY_PHASE_BACKFILL): "BACKFILL",
+    int(market_pb2.DELIVERY_PHASE_LIVE): "LIVE",
+}
+
 
 def health_name(value: int) -> str:
     """Map a DataHealth enum int to its contract string, fail-closed default."""
@@ -86,6 +91,8 @@ def tick_to_dict(tick: market_pb2.MarketTick) -> dict[str, Any]:
     return {
         "snapshot": snapshot_to_dict(tick.snapshot) if tick.HasField("snapshot") else None,
         "bar": bar_to_dict(tick.bar) if tick.HasField("bar") else None,
+        "delivery_phase": _DELIVERY_PHASE_NAME.get(int(tick.delivery_phase), "UNSPECIFIED"),
+        "high_watermark_sequence": tick.high_watermark_sequence,
     }
 
 

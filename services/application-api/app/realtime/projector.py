@@ -52,6 +52,15 @@ class CockpitProjector:
     # reorder, or duplicate and forces RECONCILING (fail closed) until backfill
     # restores continuity.
     _last_market_seq: int = 0
+    # Highest sequence observed across a discontinuity. Even after the missing
+    # records begin arriving, frames stay fail-closed until this target is
+    # reached contiguously.
+    _reconcile_until_seq: int | None = None
+
+    @property
+    def last_market_sequence(self) -> int:
+        """Last market sequence accepted into the contiguous bar history."""
+        return self._last_market_seq
 
     def _connection(self, data_health: str) -> str:
         if data_health == "STALE":
@@ -102,6 +111,17 @@ class CockpitProjector:
 
         data_health = str(snapshot.get("data_health", "DISCONNECTED"))
         connection = self._connection(data_health)
+        delivery_phase = tick.get("delivery_phase", "UNSPECIFIED")
+        high_watermark = tick.get("high_watermark_sequence")
+
+        if delivery_phase not in {"BACKFILL", "LIVE"}:
+            frame = self._base_frame(server_time)
+            frame["connection"] = "DISCONNECTED"
+            frame["snapshot"] = snapshot
+            frame["risk_flags"] = [
+                f"invalid delivery phase: {delivery_phase}; new positions blocked"
+            ]
+            return frame
 
         # Sequence-continuity guard (fail closed on gap/reorder/dup). Even a
         # HEALTHY snapshot must NOT unlock trading if records were skipped — the
@@ -112,6 +132,8 @@ class CockpitProjector:
         market_seq = snapshot.get("sequence_number")
         expected = self._last_market_seq + 1
         if not isinstance(market_seq, int) or market_seq != expected:
+            if isinstance(market_seq, int) and market_seq > expected:
+                self._reconcile_until_seq = max(self._reconcile_until_seq or 0, market_seq)
             frame = self._base_frame(server_time)
             frame["connection"] = "STALE"  # data exists but is not trustworthy
             frame["snapshot"] = snapshot
@@ -151,8 +173,29 @@ class CockpitProjector:
         # Record accepted and contiguous: advance the consumed-sequence marker.
         self._last_market_seq = market_seq
 
-        allowed = data_health == "HEALTHY" and connection == "LIVE"
+        gap_reconciling = (
+            self._reconcile_until_seq is not None and market_seq < self._reconcile_until_seq
+        )
+        transport_reconciling = delivery_phase == "BACKFILL"
+        reconciling = gap_reconciling or transport_reconciling
+        if self._reconcile_until_seq is not None and market_seq >= self._reconcile_until_seq:
+            self._reconcile_until_seq = None
+
+        if reconciling:
+            connection = "STALE"
+
+        allowed = data_health == "HEALTHY" and connection == "LIVE" and not reconciling
         risk_flags = list(decision.risk_notes)
+        if transport_reconciling:
+            risk_flags.append(
+                f"backfill in progress: market_seq={market_seq}, "
+                f"high_watermark={high_watermark}; new positions blocked"
+            )
+        if gap_reconciling:
+            risk_flags.append(
+                f"sequence reconciliation in progress through {self._reconcile_until_seq}; "
+                "new positions blocked"
+            )
         if not allowed:
             risk_flags.append(f"new positions blocked: data_health={data_health}")
 

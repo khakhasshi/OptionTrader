@@ -132,10 +132,10 @@ def test_end_to_end_rust_grpc_hub_cockpit() -> None:
     try:
         _wait_port(grpc_port)
 
-        async def run() -> list[dict[str, Any]]:
+        async def collect(session_id: str) -> list[dict[str, Any]]:
             hub = SessionHub(
                 ProjectorConfig(
-                    session_id="itest", rule_version="itest-1", opening_range_minutes=3
+                    session_id=session_id, rule_version="itest-1", opening_range_minutes=3
                 ),
                 source=_grpc_source_for(f"127.0.0.1:{grpc_port}"),
             )
@@ -150,7 +150,15 @@ def test_end_to_end_rust_grpc_hub_cockpit() -> None:
                 hub.stop()
             return frames
 
-        frames = asyncio.run(run())
+        async def run() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            # First consumer starts at the live edge. A fresh Application Service
+            # created after the finite producer ends must receive the same records
+            # as BACKFILL and remain fail-closed throughout reconstruction.
+            initial = await collect("itest-live")
+            restarted = await collect("itest-restarted")
+            return initial, restarted
+
+        frames, restarted_frames = asyncio.run(run())
     finally:
         proc.terminate()
         try:
@@ -179,3 +187,16 @@ def test_end_to_end_rust_grpc_hub_cockpit() -> None:
     # Feed ends -> a fail-closed DISCONNECTED frame appears, not a stale LIVE.
     assert any(f["connection"] == "DISCONNECTED" for f in frames)
     assert all(f["new_position_allowed"] is False for f in frames if f["connection"] != "LIVE")
+
+    # Application restart after the producer has ended: all six historical
+    # snapshots are BACKFILL at the transport layer. They rebuild engine state
+    # but never reopen trading; the terminal frame remains DISCONNECTED.
+    restarted_live = [f for f in restarted_frames if f["connection"] == "LIVE"]
+    assert restarted_live == []
+    restarted_backfill = [f for f in restarted_frames if f.get("snapshot") is not None]
+    assert len(restarted_backfill) == 6
+    assert all(f["connection"] == "STALE" for f in restarted_backfill)
+    assert all(f["new_position_allowed"] is False for f in restarted_frames)
+    assert all(
+        any("backfill in progress" in flag for flag in f["risk_flags"]) for f in restarted_backfill
+    )

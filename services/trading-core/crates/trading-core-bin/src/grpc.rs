@@ -23,8 +23,8 @@ use market_core::{
 };
 use optiontrader_proto::market_v1::{
     market_service_server::MarketService, DataHealth as ProtoHealth,
-    DataHealthState as ProtoHealthState, GetDataHealthRequest, MarketBar as ProtoBar,
-    MarketSnapshot as ProtoSnapshot, MarketTick as ProtoTick, StreamRequest,
+    DataHealthState as ProtoHealthState, DeliveryPhase, GetDataHealthRequest,
+    MarketBar as ProtoBar, MarketSnapshot as ProtoSnapshot, MarketTick as ProtoTick, StreamRequest,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -230,22 +230,43 @@ impl MarketService for MarketServiceImpl {
         // silently skipped. Clamp to n so an over-large resume can't panic.
         let resume = request.into_inner().resume_after_sequence as usize;
         let mut sent = resume.min(n);
+        // Records needed to catch the producer head up are historical BACKFILL
+        // even when their snapshot DataHealth was HEALTHY. Once caught up, a
+        // single newly-produced record may be emitted as LIVE.
+        let mut reconciling = sent < *cursor_rx.borrow();
         self.ensure_producer();
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             loop {
                 let cursor = *cursor_rx.borrow();
+                // A subscriber that falls more than one record behind has left
+                // the live edge. Treat the entire current batch as BACKFILL;
+                // only a later record produced after catch-up may be LIVE.
+                if !reconciling && cursor.saturating_sub(sent) > 1 {
+                    reconciling = true;
+                }
                 while sent < cursor {
                     let (snap, bar) = &feed.ticks[sent];
                     let tick = ProtoTick {
                         snapshot: Some(snapshot_to_proto(snap)),
                         bar: Some(bar_to_proto(bar)),
+                        delivery_phase: if reconciling {
+                            DeliveryPhase::Backfill as i32
+                        } else {
+                            DeliveryPhase::Live as i32
+                        },
+                        high_watermark_sequence: cursor as u64,
                     };
                     if tx.send(Ok(tick)).await.is_err() {
                         return; // client dropped
                     }
                     sent += 1;
+                }
+                if reconciling && sent >= cursor {
+                    // The catch-up batch itself remains BACKFILL. Only a later
+                    // record produced after this point may be emitted as LIVE.
+                    reconciling = false;
                 }
                 if sent >= n {
                     return; // replay exhausted -> end this stream
@@ -331,25 +352,54 @@ mod tests {
         // A client that last saw seq=3 reconnects with resume_after_sequence=3
         // and must receive exactly 4,5,6 — the records it missed, in order.
         let svc = MarketServiceImpl::new(feed());
-        let seqs: Vec<u64> = drain_from(&svc, 3)
+        // Start the producer, then let it finish while no client is attached.
+        let first = svc
+            .stream_market_snapshots(Request::new(StreamRequest {
+                session_id: "starter".into(),
+                speedup: 0.0,
+                resume_after_sequence: 0,
+            }))
             .await
+            .unwrap();
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let ticks = drain_from(&svc, 3).await;
+        let seqs: Vec<u64> = ticks
             .iter()
             .map(|t| t.snapshot.as_ref().unwrap().sequence_number)
             .collect();
         assert_eq!(seqs, vec![4, 5, 6]);
+        assert!(ticks
+            .iter()
+            .all(|t| t.delivery_phase == DeliveryPhase::Backfill as i32));
     }
 
     #[tokio::test]
     async fn resume_zero_replays_from_session_open() {
-        // A fresh/restarted client (resume=0) backfills from the very first
-        // record, so history is never silently skipped.
+        // A fresh client at producer start receives the session from record 1.
         let svc = MarketServiceImpl::new(feed());
-        let seqs: Vec<u64> = drain_from(&svc, 0)
-            .await
+        let ticks = drain_from(&svc, 0).await;
+        let seqs: Vec<u64> = ticks
             .iter()
             .map(|t| t.snapshot.as_ref().unwrap().sequence_number)
             .collect();
         assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
+        assert!(ticks
+            .iter()
+            .all(|t| t.delivery_phase == DeliveryPhase::Live as i32));
+    }
+
+    #[tokio::test]
+    async fn restarted_client_replay_is_backfill_not_live() {
+        let svc = MarketServiceImpl::new(feed());
+        let _ = drain(&svc).await; // producer reaches the end
+
+        let replay = drain_from(&svc, 0).await;
+        assert_eq!(replay.len(), feed().ticks.len());
+        assert!(replay
+            .iter()
+            .all(|t| t.delivery_phase == DeliveryPhase::Backfill as i32));
     }
 
     #[tokio::test]
@@ -361,6 +411,9 @@ mod tests {
             .map(|t| t.snapshot.as_ref().unwrap().sequence_number)
             .collect();
         assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
+        assert!(ticks
+            .iter()
+            .all(|t| t.delivery_phase == DeliveryPhase::Live as i32));
         // snapshot and bar align on the same instant
         for t in &ticks {
             assert_eq!(

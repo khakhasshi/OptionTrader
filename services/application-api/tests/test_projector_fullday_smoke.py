@@ -98,7 +98,12 @@ def _tick(i: int, close: float, health: str, minute_offset: int = 0) -> dict[str
         "volume": 1000 + i,
         "vwap": f"{close:.2f}",
     }
-    return {"snapshot": snap, "bar": bar}
+    return {
+        "snapshot": snap,
+        "bar": bar,
+        "delivery_phase": "LIVE",
+        "high_watermark_sequence": i + 1,
+    }
 
 
 def test_fullday_replay_is_schema_valid_and_fail_closed() -> None:

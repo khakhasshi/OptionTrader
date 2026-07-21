@@ -78,11 +78,24 @@ message MarketBar {
   string vwap = 9;              // "" when absent
 }
 
+// Delivery phase is transport state, separate from the historical snapshot's
+// DataHealth. A HEALTHY historical snapshot can still be BACKFILL and must not
+// permit a new position until the subscriber has caught up to the live stream.
+enum DeliveryPhase {
+  DELIVERY_PHASE_UNSPECIFIED = 0;
+  DELIVERY_PHASE_BACKFILL = 1;
+  DELIVERY_PHASE_LIVE = 2;
+}
+
 // One tick of the stream: the Rust-authoritative aggregate snapshot (for
 // display + data_health) paired with the raw per-minute bar (for the engines).
 message MarketTick {
   MarketSnapshot snapshot = 1;
   MarketBar bar = 2;
+  DeliveryPhase delivery_phase = 3;
+  // Producer cursor observed while this record was emitted. During BACKFILL,
+  // the subscriber must remain fail-closed through this high-watermark.
+  uint64 high_watermark_sequence = 4;
 }
 
 // StreamMarketSnapshots parameters. session_id ties the stream to one trading

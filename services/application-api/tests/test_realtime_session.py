@@ -64,8 +64,19 @@ def _bar(minute_et: int, seq: int) -> dict[str, Any]:
     }
 
 
-def _tick(minute_et: int, seq: int, health: str = "HEALTHY") -> dict[str, Any]:
-    return {"snapshot": _snapshot(minute_et, seq, health), "bar": _bar(minute_et, seq)}
+def _tick(
+    minute_et: int,
+    seq: int,
+    health: str = "HEALTHY",
+    delivery_phase: str = "LIVE",
+    high_watermark: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "snapshot": _snapshot(minute_et, seq, health),
+        "bar": _bar(minute_et, seq),
+        "delivery_phase": delivery_phase,
+        "high_watermark_sequence": high_watermark if high_watermark is not None else seq,
+    }
 
 
 class _Controllable:

@@ -67,10 +67,19 @@ def _snapshot(minute_et: int, close: float, seq: int, health: str = "HEALTHY") -
     }
 
 
-def _tick(minute_et: int, close: float, seq: int, health: str = "HEALTHY") -> dict[str, Any]:
+def _tick(
+    minute_et: int,
+    close: float,
+    seq: int,
+    health: str = "HEALTHY",
+    delivery_phase: str = "LIVE",
+    high_watermark: int | None = None,
+) -> dict[str, Any]:
     return {
         "snapshot": _snapshot(minute_et, close, seq, health),
         "bar": _bar(minute_et, close, 1000 + seq),
+        "delivery_phase": delivery_phase,
+        "high_watermark_sequence": high_watermark if high_watermark is not None else seq,
     }
 
 
@@ -167,16 +176,20 @@ def test_sequence_gap_blocks_until_backfilled() -> None:
     assert any("sequence discontinuity" in flag for flag in f4["risk_flags"])
     assert list(validator.iter_errors(f4)) == []
 
-    # Backfill 2 and 3 (contiguous): still blocked at 2, blocked at 3...
-    f2 = proj.apply(_tick(571, 500.1, 2))
-    assert f2["new_position_allowed"] is True and f2["connection"] == "LIVE"
-    f3 = proj.apply(_tick(572, 500.2, 3))
-    assert f3["new_position_allowed"] is True
+    # Backfill 2, 3 and the catch-up target 4. Every historical frame remains
+    # blocked even though its historical snapshot health was HEALTHY.
+    f2 = proj.apply(_tick(571, 500.1, 2, delivery_phase="BACKFILL", high_watermark=4))
+    assert f2["new_position_allowed"] is False and f2["connection"] == "STALE"
+    f3 = proj.apply(_tick(572, 500.2, 3, delivery_phase="BACKFILL", high_watermark=4))
+    assert f3["new_position_allowed"] is False
+    f4b = proj.apply(_tick(573, 500.3, 4, delivery_phase="BACKFILL", high_watermark=4))
+    assert f4b["connection"] == "STALE"
+    assert f4b["new_position_allowed"] is False
 
-    # ...now the previously-skipped 4 arrives again in order -> tradable.
-    f4b = proj.apply(_tick(573, 500.3, 4))
-    assert f4b["connection"] == "LIVE"
-    assert f4b["new_position_allowed"] is True
+    # Only a record produced after catch-up may restore LIVE permission.
+    f5 = proj.apply(_tick(574, 500.4, 5, delivery_phase="LIVE", high_watermark=5))
+    assert f5["connection"] == "LIVE"
+    assert f5["new_position_allowed"] is True
 
 
 def test_first_record_after_restart_midsession_blocks() -> None:
@@ -187,3 +200,26 @@ def test_first_record_after_restart_midsession_blocks() -> None:
     assert frame["new_position_allowed"] is False
     assert frame["connection"] == "STALE"
     assert any("expected 1" in flag for flag in frame["risk_flags"])
+
+
+def test_application_restart_backfill_from_open_stays_blocked_until_live_edge() -> None:
+    """A restarted app receives contiguous history from seq 1, so continuity
+    alone is insufficient: delivery_phase keeps the entire replay fail-closed."""
+    proj = CockpitProjector(config=_config())
+    for seq in range(1, 5):
+        frame = proj.apply(
+            _tick(
+                569 + seq,
+                500.0 + seq * 0.1,
+                seq,
+                delivery_phase="BACKFILL",
+                high_watermark=4,
+            )
+        )
+        assert frame["connection"] == "STALE"
+        assert frame["new_position_allowed"] is False
+        assert any("backfill in progress" in flag for flag in frame["risk_flags"])
+
+    live = proj.apply(_tick(574, 500.5, 5, delivery_phase="LIVE", high_watermark=5))
+    assert live["connection"] == "LIVE"
+    assert live["new_position_allowed"] is True

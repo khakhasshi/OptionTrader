@@ -21,10 +21,13 @@ DataHealth 权威唯一在 Rust Market Core。
    `StreamMarketSnapshots` server streaming + `GetDataHealth`。Python 只消费，
    产出 RegimeState/VolState/Signal，不重算底层特征。
 
-2. **流里同时带原始每分钟 bar**：`StreamMarketSnapshots` 返回
-   `stream MarketTick{snapshot, bar}`。聚合快照（session 高低/VWAP/opening
+2. **流里同时带原始每分钟 bar 与传输阶段**：`StreamMarketSnapshots` 返回
+   `stream MarketTick{snapshot, bar, delivery_phase, high_watermark_sequence}`。
+   聚合快照（session 高低/VWAP/opening
    range）无法还原逐分钟 OHLC，若在 Python 侧近似重建会污染 Regime/Vol 信号，
    违反「先避免错误交易」。带上原始 bar 使实时引擎输出与离线回放逐位一致。
+   `delivery_phase` 区分 `BACKFILL` 与 `LIVE`：历史 snapshot 即使当时 HEALTHY，
+   在追平 producer high-watermark 前也只能重建状态，禁止新开仓。
 
 3. **DataHealth 状态机在 Rust**（`market-core/health.rs`）：依据记录到达节奏
    （间隔/乱序/断流/重连）驱动 HEALTHY→DEGRADED→STALE→DISCONNECTED→
@@ -50,11 +53,18 @@ DataHealth 权威唯一在 Rust Market Core。
    + new_position_allowed + snapshot HEALTHY）AND broker 维（/core/health 的
    canOpenNewPosition）。断流时清空 frame，重连窗口内不放行陈旧 LIVE 帧。
 
+9. **断线回补与应用重启恢复**：`StreamRequest.resume_after_sequence` 请求 Rust
+   session buffer 回放缺失记录。Rust 对落后订阅者标记 `BACKFILL`；Python 仍按序
+   追加 bar 并重建引擎，但强制 CockpitState 为 STALE/No Trade。只有追平后新产生
+   的 `LIVE` 记录，且 DataHealth=HEALTHY，才可恢复新开仓许可。Projector 另以
+   MarketSnapshot.sequence_number 连续性守卫防御 gap/reorder/duplicate。
+
 ## 影响
 
 - 新增依赖栈：Rust tonic/prost/tokio-stream；Python grpcio/grpcio-tools/
   protobuf。
-- proto 契约新增 MarketTick/MarketBar 消息；proto 与 jsonschema 各守其边界。
+- proto 契约包含 MarketTick/MarketBar、DeliveryPhase、resume cursor 与
+  high-watermark；proto 与 jsonschema 各守其边界。
 - 事件上下文导入、真实 ThetaData 实时接入是骨架之后的独立批次。
 
 ## 备选与否决
