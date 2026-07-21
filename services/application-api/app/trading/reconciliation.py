@@ -53,27 +53,35 @@ class ReconciliationStatus:
 class BrokerReconciliationSupervisor:
     def __init__(self) -> None:
         self._lock = Lock()
-        self._status = ReconciliationStatus()
+        self._statuses = {
+            broker_id: ReconciliationStatus(broker_id=broker_id)
+            for broker_id in ("ibkr", "longbridge")
+        }
 
-    def status(self) -> dict[str, Any]:
+    def status(self, broker_id: str = "ibkr") -> dict[str, Any]:
         with self._lock:
-            return asdict(self._status)
+            return asdict(self._statuses[broker_id])
 
-    def note_startup(self, unresolved: int) -> None:
+    def note_startup(self, unresolved_by_broker: dict[str, int]) -> None:
         with self._lock:
-            self._status.unresolved_order_ids = ["UNRESOLVED_AT_STARTUP"] * unresolved
+            for broker_id, unresolved in unresolved_by_broker.items():
+                self._statuses[broker_id].unresolved_order_ids = [
+                    "UNRESOLVED_AT_STARTUP"
+                ] * unresolved
 
     def run_once(self, engine: Engine, broker_id: str = "ibkr") -> dict[str, Any]:
         with self._lock:
-            self._status.running = True
-            self._status.last_attempt_at_utc = _utc_now()
-            self._status.failure_code = None
-            self._status.broker_id = broker_id
+            status = self._statuses[broker_id]
+            status.running = True
+            status.last_attempt_at_utc = _utc_now()
+            status.failure_code = None
 
         unresolved: list[str] = []
         batch: Any | None = None
         try:
             for order_id, order_broker in pending_reconciliation_orders(engine):
+                if order_broker != broker_id:
+                    continue
                 try:
                     order = reconcile_execution_order(order_id)
                     still_pending = order.state == "RECONCILE_PENDING"
@@ -103,16 +111,17 @@ class BrokerReconciliationSupervisor:
             )
             final_codes = sorted(set(mismatches + reasons))
             with self._lock:
-                self._status.running = False
-                self._status.broker_reconciled = reconciled and not unresolved
-                self._status.snapshot_sequence = int(batch.snapshot_sequence)
-                self._status.snapshot_hash = str(batch.snapshot_hash)
-                self._status.unresolved_order_ids = unresolved
-                self._status.mismatch_codes = final_codes
-                self._status.failure_code = None
-                if self._status.broker_reconciled:
-                    self._status.last_success_at_utc = _utc_now()
-                return asdict(self._status)
+                status = self._statuses[broker_id]
+                status.running = False
+                status.broker_reconciled = reconciled and not unresolved
+                status.snapshot_sequence = int(batch.snapshot_sequence)
+                status.snapshot_hash = str(batch.snapshot_hash)
+                status.unresolved_order_ids = unresolved
+                status.mismatch_codes = final_codes
+                status.failure_code = None
+                if status.broker_reconciled:
+                    status.last_success_at_utc = _utc_now()
+                return asdict(status)
         except grpc.RpcError as exc:
             reason = _grpc_reason(exc)
         except (ValueError, TypeError, ArithmeticError, AttributeError):
@@ -138,15 +147,19 @@ class BrokerReconciliationSupervisor:
         except Exception:  # noqa: BLE001 - status must still expose the failed cycle
             pass
         with self._lock:
-            self._status.running = False
-            self._status.broker_reconciled = False
-            self._status.unresolved_order_ids = unresolved
-            self._status.failure_code = reason
-            return asdict(self._status)
+            status = self._statuses[broker_id]
+            status.running = False
+            status.broker_reconciled = False
+            status.unresolved_order_ids = unresolved
+            status.failure_code = reason
+            return asdict(status)
 
-    async def serve(self, engine: Engine, interval_seconds: int) -> None:
+    async def serve(
+        self, engine: Engine, interval_seconds: int, broker_ids: tuple[str, ...]
+    ) -> None:
         while True:
-            await asyncio.to_thread(self.run_once, engine)
+            for broker_id in broker_ids:
+                await asyncio.to_thread(self.run_once, engine, broker_id)
             await asyncio.sleep(interval_seconds)
 
 

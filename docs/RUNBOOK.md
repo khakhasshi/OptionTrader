@@ -84,8 +84,10 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
    `RestoreWorkflow`：未 claim 且未过期的确认能力原样恢复；终态保持终态；已提交、已 claim、
    过期但结果不明的订单统一进入 `RECONCILE_PENDING`，版本号加一且残余敞口置 true。返回的
    `reconciliation_order_ids` 会逐个调用 Rust 对账。IBKR 恢复只读匹配 native id/orderRef/完整
-   订单形状，再要求新鲜、HEALTHY、已对账账户快照；成功结果回写 PostgreSQL。失败或 Longbridge
-   未认证路径保持 unresolved/RECONCILING；不得删除数据库行或重建计划绕过。
+   订单形状；Longbridge 由 Rust 官方 SDK 按 native id、OptionTrader remark、symbol、side、quantity、
+   原生订单类型和提交价格全字段匹配，拆腿还要求每个 leg remark 唯一。两条路径都要求新鲜、
+   HEALTHY、已对账账户快照；成功结果回写 PostgreSQL。失败保持 unresolved/RECONCILING；不得删除
+   数据库行或重建计划绕过，恢复 RPC 不得提交、改单或撤单。
 7. 订单进入 `RECONCILE_PENDING`、BrokerHealth 非 HEALTHY、账本不一致或 kill switch
    激活时，禁止新开仓；撤单/减仓恢复路径不得依赖 LLM。
 8. capability claim 使用 PostgreSQL 行锁，可跨 API worker 仲裁；CLI worker 参数不再是
@@ -96,14 +98,19 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
    `OPTIONTRADER_BROKER_RECONCILIATION_INTERVAL_SECONDS=30`（仅允许 5–300 秒）。每轮先由
    Rust `BeginBrokerReconciliation` 关闭 Broker 闸门并签发 15 秒快照，再由 Application API
    原子写入 PostgreSQL，最后以同 sequence/hash 回执。查看
-   `GET /api/v1/trading/reconciliation`；任何 failure/mismatch/unresolved 都必须保持 false。
+   通过 `OPTIONTRADER_BROKER_RECONCILIATION_BROKERS=ibkr` 选择本进程唯一 Broker；共享
+   BrokerAuthority 尚未按账户分片，因此禁止同时配置两家。Longbridge 认证时改为 `longbridge`，
+   缺凭证会保持闭锁。查看
+   `GET /api/v1/trading/reconciliation?broker_id=longbridge`；每个 Broker 独立展示状态，任何
+   failure/mismatch/unresolved 或残余敞口都必须保持 false。
    `OPTIONTRADER_BROKER_RECONCILIATION_ENABLED=false` 仅供本地非交易开发，不能作为 paper 配置。
 
 ## Broker SDK 认证前启动
 
 Longbridge 原生 adapter 从 `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、
 `LONGBRIDGE_ACCESS_TOKEN` 读取凭证。不要把值写入 compose、日志或提交。当前 workflow 不会
-实例化真实 adapter；仅在独立 paper 认证进程中显式启用提交。
+启用真实提交；持续对账可实例化 `submission_enabled=false` 的只读 adapter，且只允许读取事实和
+重建内存身份账本。仅在独立 paper 认证进程中显式启用提交。
 
 Longbridge 多腿认证还需设置并记录以下参数；非法值会阻止 adapter 启动：
 

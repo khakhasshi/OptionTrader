@@ -290,7 +290,10 @@ def test_startup_restore_persists_successful_broker_auto_reconciliation(
         "persist_order_projection",
         persist,
     )
-    assert main.restore_durable_execution_workflow() == (1, 0)
+    assert main.restore_durable_execution_workflow() == (
+        1,
+        {"ibkr": 0, "longbridge": 0},
+    )
     assert actions == ["PROCESS_RESTART_RECONCILIATION", "BROKER_AUTO_RECONCILED"]
 
 
@@ -326,7 +329,10 @@ def test_startup_restore_keeps_unavailable_broker_order_unresolved(
         "persist_broker_reconciliation_failure",
         lambda _engine, broker, reason, **_kwargs: failures.append((broker, reason)),
     )
-    assert main.restore_durable_execution_workflow() == (1, 1)
+    assert main.restore_durable_execution_workflow() == (
+        1,
+        {"ibkr": 1, "longbridge": 0},
+    )
     assert failures == [("ibkr", "BROKER_RPC_FAILURE")]
 
 
@@ -336,7 +342,7 @@ def test_reconciliation_status_endpoint_exposes_unresolved_state(
     monkeypatch.setattr(
         reconciliation.supervisor,
         "status",
-        lambda: {
+        lambda _broker_id="ibkr": {
             "broker_id": "ibkr",
             "running": False,
             "last_attempt_at_utc": "2026-07-21T14:30:00Z",
@@ -353,6 +359,14 @@ def test_reconciliation_status_endpoint_exposes_unresolved_state(
     assert response.status_code == 200
     assert response.json()["broker_reconciled"] is False
     assert response.json()["unresolved_order_ids"] == ["order_demo_001"]
+
+
+def test_reconciliation_selects_one_broker_per_shared_authority() -> None:
+    assert main._reconciliation_brokers("longbridge") == ("longbridge",)
+    with pytest.raises(ValueError):
+        main._reconciliation_brokers("ibkr,longbridge")
+    with pytest.raises(ValueError):
+        main._reconciliation_brokers("")
 
 
 def test_startup_restore_counts_broker_pending_response_as_unresolved(
@@ -379,5 +393,8 @@ def test_startup_restore_counts_broker_pending_response_as_unresolved(
         return True
 
     monkeypatch.setattr(main, "persist_order_projection", persist)
-    assert main.restore_durable_execution_workflow() == (1, 1)
+    assert main.restore_durable_execution_workflow() == (
+        1,
+        {"ibkr": 1, "longbridge": 0},
+    )
     assert actions[-1] == "BROKER_RECONCILIATION_PENDING"

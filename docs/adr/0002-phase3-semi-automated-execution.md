@@ -60,16 +60,19 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
     RECONCILING，再返回经过结构/时效验证的 BrokerSnapshot protobuf 字节、sequence、SHA-256 与
     15 秒 TTL；Python 原子持久化并核对本地订单后 Commit。哈希/序号漂移、过期、数据库失败、
     任一 mismatch 或未解决 workflow 均不得恢复 HEALTHY。该路径只读，不具有提交能力。
+18. Longbridge 恢复 authority 直接使用官方 Rust SDK，固定 `submission_enabled=false`。它仅在
+    native id、OptionTrader remark、symbol、side、quantity、原生订单类型和提交价格完全一致时
+    认领持久化订单；拆腿逐 leg 唯一匹配。随后把 SDK 账户、持仓、订单和当日成交投影到统一
+    BrokerSnapshot，复用第 17 条的 hash 两阶段持久化协议。
 
 ## 当前限制
 
-- PostgreSQL workflow 已自动重建；可能已提交的订单先恢复为 `RECONCILE_PENDING`。IBKR 路径
-  已通过只读 `RecoverBrokerOrder` 自动复核 native id/orderRef/完整订单形状和新鲜账户快照，
-  不以 Submit 代替恢复。Longbridge 自动恢复尚未接入。
+- PostgreSQL workflow 已自动重建；可能已提交的订单先恢复为 `RECONCILE_PENDING`。IBKR 与
+  Longbridge 均已自动复核 native identity/完整订单形状和新鲜账户快照，不以 Submit 代替恢复。
 - capability 密文只有持有同一 Fernet 密钥的 API 实例可解密；缺失、错误或轮换不当均
   fail closed。密钥轮换与多密钥解密尚未实现。
-- IBKR 自动恢复和持续全账户事实账本已更新动态 buying power/health/reconciled，并持久化净值、
-  持仓与成交；这些字段尚未全部进入仓位风险计算，Longbridge 全量 snapshot authority 仍未接入。
+- 两家 Broker 的自动恢复和持续全账户事实账本已更新动态 buying power/health/reconciled，并
+  持久化净值、持仓与成交；这些字段尚未全部进入仓位风险计算。
 - ThetaData Standard 的二阶/all-Greeks entitlement 不可用。derived Gamma 已有确定性实现和
   时间同步闸门，但完整 RTH option soak 仍是 paper Gate。
 - IBKR sidecar gRPC 与四类快照代码已完成，Longbridge 当日成交与未知活动订单闭锁已完成；

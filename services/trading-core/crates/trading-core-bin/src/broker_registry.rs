@@ -1,18 +1,22 @@
 //! Direct, read-only broker recovery authority used after process restart.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use broker::{
-    BrokerChildOrder, BrokerOrder, BrokerOrderLeg, BrokerOrderRequest, BrokerOrderStatus,
-    BrokerOrderType, OrderSide,
+    longbridge::LongbridgeBroker, AccountSnapshot as DomainAccount, BrokerAdapter,
+    BrokerChildOrder, BrokerError, BrokerHealth as DomainHealth, BrokerOrder, BrokerOrderLeg,
+    BrokerOrderRequest, BrokerOrderStatus, BrokerOrderType, Fill as DomainFill, OrderSide,
+    PositionSnapshot as DomainPosition,
 };
 use chrono::{DateTime, Utc};
 use optiontrader_proto::broker_v1::{
-    broker_adapter_service_client::BrokerAdapterServiceClient, AdaptivePriority, BrokerHealth,
-    BrokerId, BrokerOrderSnapshot, BrokerOrderStatus as ProtoStatus,
-    BrokerOrderType as ProtoOrderType, BrokerSnapshot, GetBrokerSnapshotRequest,
-    OrderSide as ProtoSide, RecoverBrokerOrderRequest, SubmitBrokerOrderRequest,
+    broker_adapter_service_client::BrokerAdapterServiceClient, AccountSnapshot, AdaptivePriority,
+    BrokerChildOrderSnapshot, BrokerHealth, BrokerId, BrokerOrderSnapshot,
+    BrokerOrderStatus as ProtoStatus, BrokerOrderType as ProtoOrderType, BrokerSnapshot,
+    FillSnapshot, GetBrokerSnapshotRequest, OrderSide as ProtoSide, PositionSnapshot,
+    RecoverBrokerOrderRequest, SubmitBrokerOrderRequest,
 };
 use prost::Message;
 use rust_decimal::Decimal;
@@ -44,6 +48,7 @@ pub struct ValidatedBrokerSnapshot {
 pub enum BrokerSnapshotAuthority {
     Remote {
         ibkr_endpoint: String,
+        longbridge: Arc<Mutex<LongbridgeSnapshotState>>,
     },
     #[cfg(test)]
     Fixed(Result<RecoveredBrokerOrder, BrokerRecoveryError>),
@@ -51,11 +56,20 @@ pub enum BrokerSnapshotAuthority {
     FullFixed(Result<ValidatedBrokerSnapshot, BrokerRecoveryError>),
 }
 
+pub(crate) struct LongbridgeSnapshotState {
+    adapter: Option<LongbridgeBroker>,
+    sequence: u64,
+}
+
 impl BrokerSnapshotAuthority {
     pub fn from_env() -> Self {
         Self::Remote {
             ibkr_endpoint: std::env::var("OPTIONTRADER_IBKR_SIDECAR_GRPC")
                 .unwrap_or_else(|_| "http://127.0.0.1:50053".into()),
+            longbridge: Arc::new(Mutex::new(LongbridgeSnapshotState {
+                adapter: None,
+                sequence: 0,
+            })),
         }
     }
 
@@ -65,18 +79,60 @@ impl BrokerSnapshotAuthority {
         expected_broker_order_id: String,
         now: DateTime<Utc>,
     ) -> Result<RecoveredBrokerOrder, BrokerRecoveryError> {
-        let ibkr_endpoint = match self {
-            Self::Remote { ibkr_endpoint } => ibkr_endpoint,
+        let (ibkr_endpoint, longbridge) = match self {
+            Self::Remote {
+                ibkr_endpoint,
+                longbridge,
+            } => (ibkr_endpoint, longbridge),
             #[cfg(test)]
             Self::Fixed(result) => return result.clone(),
             #[cfg(test)]
             Self::FullFixed(_) => return Err(BrokerRecoveryError::Unavailable),
         };
-        if BrokerId::try_from(expected_order.broker_id).ok() != Some(BrokerId::Ibkr) {
-            return Err(BrokerRecoveryError::UnsupportedBroker);
-        }
         if expected_broker_order_id.is_empty() {
             return Err(BrokerRecoveryError::OrderConflict);
+        }
+        if BrokerId::try_from(expected_order.broker_id).ok() == Some(BrokerId::Longbridge) {
+            let state = Arc::clone(longbridge);
+            return tokio::task::spawn_blocking(move || {
+                let mut state = state.lock().map_err(|_| BrokerRecoveryError::Unavailable)?;
+                if state.adapter.is_none() {
+                    state.adapter = Some(
+                        LongbridgeBroker::from_env(false).map_err(map_longbridge_recovery_error)?,
+                    );
+                }
+                let request = domain_request(&expected_order)?;
+                let next_sequence = state.sequence.saturating_add(1).max(1);
+                let adapter = state
+                    .adapter
+                    .as_mut()
+                    .ok_or(BrokerRecoveryError::Unavailable)?;
+                adapter
+                    .restore_expected_order(request, &expected_broker_order_id)
+                    .map_err(map_longbridge_recovery_error)?;
+                adapter.reconcile().map_err(map_longbridge_recovery_error)?;
+                let recovered = adapter
+                    .orders()
+                    .into_iter()
+                    .find(|order| order.broker_order_id == expected_broker_order_id)
+                    .ok_or(BrokerRecoveryError::OrderConflict)?;
+                let snapshot = longbridge_snapshot(adapter, next_sequence, now);
+                let recovered_proto = proto_order(recovered);
+                let result = validate_snapshot(
+                    snapshot,
+                    recovered_proto,
+                    &expected_order,
+                    &expected_broker_order_id,
+                    now,
+                );
+                state.sequence = next_sequence;
+                result
+            })
+            .await
+            .map_err(|_| BrokerRecoveryError::Unavailable)?;
+        }
+        if BrokerId::try_from(expected_order.broker_id).ok() != Some(BrokerId::Ibkr) {
+            return Err(BrokerRecoveryError::UnsupportedBroker);
         }
         let mut client = tokio::time::timeout(
             Duration::from_secs(2),
@@ -120,13 +176,39 @@ impl BrokerSnapshotAuthority {
         broker_id: i32,
         now: DateTime<Utc>,
     ) -> Result<ValidatedBrokerSnapshot, BrokerRecoveryError> {
-        let ibkr_endpoint = match self {
-            Self::Remote { ibkr_endpoint } => ibkr_endpoint,
+        let (ibkr_endpoint, longbridge) = match self {
+            Self::Remote {
+                ibkr_endpoint,
+                longbridge,
+            } => (ibkr_endpoint, longbridge),
             #[cfg(test)]
             Self::Fixed(_) => return Err(BrokerRecoveryError::Unavailable),
             #[cfg(test)]
             Self::FullFixed(result) => return result.clone(),
         };
+        if BrokerId::try_from(broker_id).ok() == Some(BrokerId::Longbridge) {
+            let state = Arc::clone(longbridge);
+            return tokio::task::spawn_blocking(move || {
+                let mut state = state.lock().map_err(|_| BrokerRecoveryError::Unavailable)?;
+                if state.adapter.is_none() {
+                    state.adapter = Some(
+                        LongbridgeBroker::from_env(false).map_err(map_longbridge_recovery_error)?,
+                    );
+                }
+                let next_sequence = state.sequence.saturating_add(1).max(1);
+                let adapter = state
+                    .adapter
+                    .as_mut()
+                    .ok_or(BrokerRecoveryError::Unavailable)?;
+                adapter.reconcile().map_err(map_longbridge_recovery_error)?;
+                let snapshot = longbridge_snapshot(adapter, next_sequence, now);
+                let result = validate_full_snapshot(snapshot, broker_id, now);
+                state.sequence = next_sequence;
+                result
+            })
+            .await
+            .map_err(|_| BrokerRecoveryError::Unavailable)?;
+        }
         if BrokerId::try_from(broker_id).ok() != Some(BrokerId::Ibkr) {
             return Err(BrokerRecoveryError::UnsupportedBroker);
         }
@@ -146,6 +228,211 @@ impl BrokerSnapshotAuthority {
         .map_err(|_| BrokerRecoveryError::Unavailable)?
         .into_inner();
         validate_full_snapshot(snapshot, broker_id, now)
+    }
+}
+
+fn map_longbridge_recovery_error(error: BrokerError) -> BrokerRecoveryError {
+    match error {
+        BrokerError::Disconnected | BrokerError::InvalidConfiguration => {
+            BrokerRecoveryError::Unavailable
+        }
+        BrokerError::OrderNotFound
+        | BrokerError::DuplicateConflict
+        | BrokerError::InvalidOrderType
+        | BrokerError::InvalidPrice
+        | BrokerError::InvalidQuantity
+        | BrokerError::UnsupportedOrderShape => BrokerRecoveryError::OrderConflict,
+        BrokerError::NotReconciled
+        | BrokerError::QuoteUnavailable
+        | BrokerError::QuoteStale
+        | BrokerError::QuoteCrossed
+        | BrokerError::SpreadTooWide
+        | BrokerError::TerminalOrder
+        | BrokerError::LiveSubmissionDisabled => BrokerRecoveryError::NotReconciled,
+    }
+}
+
+fn domain_request(
+    raw: &SubmitBrokerOrderRequest,
+) -> Result<BrokerOrderRequest, BrokerRecoveryError> {
+    if BrokerId::try_from(raw.broker_id).ok() != Some(BrokerId::Longbridge)
+        || raw.idempotency_key.is_empty()
+        || raw.plan_hash.len() != 64
+        || raw.total_quantity == 0
+    {
+        return Err(BrokerRecoveryError::OrderConflict);
+    }
+    let domain_type = order_type(raw.order_type)?;
+    if (domain_type == BrokerOrderType::AdaptiveLimit
+        && AdaptivePriority::try_from(raw.adaptive_priority).ok() != Some(AdaptivePriority::Normal))
+        || (domain_type != BrokerOrderType::AdaptiveLimit
+            && AdaptivePriority::try_from(raw.adaptive_priority).ok()
+                != Some(AdaptivePriority::Unspecified))
+    {
+        return Err(BrokerRecoveryError::OrderConflict);
+    }
+    let submitted_price = optional_price(&raw.submitted_price, domain_type)?;
+    let legs = raw
+        .legs
+        .iter()
+        .map(|leg| {
+            Ok(BrokerOrderLeg {
+                contract_id: required(leg.contract_id.clone())?,
+                side: side(leg.side)?,
+                quantity: positive(leg.quantity)?,
+                broker_contract_id: nonempty(leg.broker_contract_id.clone()),
+                symbol: nonempty(leg.symbol.clone()),
+                exchange: nonempty(leg.exchange.clone()),
+                submitted_price: optional_price(&leg.submitted_price, domain_type)?,
+            })
+        })
+        .collect::<Result<Vec<_>, BrokerRecoveryError>>()?;
+    Ok(BrokerOrderRequest {
+        idempotency_key: raw.idempotency_key.clone(),
+        plan_hash: raw.plan_hash.clone(),
+        side: side(raw.side)?,
+        order_type: domain_type,
+        total_quantity: raw.total_quantity,
+        submitted_price,
+        legs,
+    })
+}
+
+fn longbridge_snapshot(
+    adapter: &LongbridgeBroker,
+    sequence: u64,
+    now: DateTime<Utc>,
+) -> BrokerSnapshot {
+    BrokerSnapshot {
+        schema_version: "1.0".into(),
+        snapshot_sequence: sequence,
+        account: Some(proto_account(adapter.account(), now)),
+        positions: adapter
+            .positions()
+            .into_iter()
+            .map(proto_position)
+            .collect(),
+        orders: adapter.orders().into_iter().map(proto_order).collect(),
+        fills: adapter.fills().into_iter().map(proto_fill).collect(),
+    }
+}
+
+fn proto_account(account: DomainAccount, now: DateTime<Utc>) -> AccountSnapshot {
+    AccountSnapshot {
+        broker_id: BrokerId::Longbridge as i32,
+        occurred_at_utc: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        health: match account.health {
+            DomainHealth::Healthy => BrokerHealth::Healthy,
+            DomainHealth::Degraded => BrokerHealth::Degraded,
+            DomainHealth::Disconnected => BrokerHealth::Disconnected,
+            DomainHealth::Reconciling => BrokerHealth::Reconciling,
+        } as i32,
+        reconciled: account.reconciled,
+        buying_power: account.buying_power.to_string(),
+        net_liquidation: account.net_liquidation.to_string(),
+        currency: account.currency,
+    }
+}
+
+fn proto_position(position: DomainPosition) -> PositionSnapshot {
+    PositionSnapshot {
+        contract_id: position.contract_id,
+        quantity: position.quantity,
+        average_price: position.average_price.to_string(),
+    }
+}
+
+fn proto_fill(fill: DomainFill) -> FillSnapshot {
+    FillSnapshot {
+        fill_id: fill.fill_id,
+        broker_order_id: fill.broker_order_id,
+        contract_id: fill.contract_id,
+        side: proto_side(fill.side) as i32,
+        quantity: fill.quantity,
+        price: fill.price.to_string(),
+        occurred_at_utc: fill
+            .occurred_at_utc
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    }
+}
+
+fn proto_order(order: BrokerOrder) -> BrokerOrderSnapshot {
+    let order_type = proto_order_type(order.order_type);
+    BrokerOrderSnapshot {
+        broker_order_id: order.broker_order_id,
+        idempotency_key: order.idempotency_key,
+        plan_hash: order.plan_hash,
+        status: proto_status(order.status) as i32,
+        total_quantity: order.total_quantity,
+        filled_quantity: order.filled_quantity,
+        submitted_price: order
+            .submitted_price
+            .map_or_else(String::new, |v| v.to_string()),
+        legs: order
+            .legs
+            .into_iter()
+            .map(|leg| optiontrader_proto::broker_v1::BrokerOrderLeg {
+                contract_id: leg.contract_id,
+                side: proto_side(leg.side) as i32,
+                quantity: leg.quantity,
+                broker_contract_id: leg.broker_contract_id.unwrap_or_default(),
+                symbol: leg.symbol.unwrap_or_default(),
+                exchange: leg.exchange.unwrap_or_default(),
+                submitted_price: leg
+                    .submitted_price
+                    .map_or_else(String::new, |v| v.to_string()),
+            })
+            .collect(),
+        side: proto_side(order.side) as i32,
+        order_type: order_type as i32,
+        adaptive_priority: if order_type == ProtoOrderType::AdaptiveLimit {
+            AdaptivePriority::Normal as i32
+        } else {
+            AdaptivePriority::Unspecified as i32
+        },
+        child_orders: order
+            .child_orders
+            .into_iter()
+            .map(|child| BrokerChildOrderSnapshot {
+                broker_order_id: child.broker_order_id,
+                leg_index: u32::try_from(child.leg_index).unwrap_or(u32::MAX),
+                contract_id: child.contract_id,
+                side: proto_side(child.side) as i32,
+                quantity: child.quantity,
+                filled_quantity: child.filled_quantity,
+                status: proto_status(child.status) as i32,
+                submitted_price: child
+                    .submitted_price
+                    .map_or_else(String::new, |v| v.to_string()),
+            })
+            .collect(),
+        residual_exposure: order.residual_exposure,
+    }
+}
+
+fn proto_side(side: OrderSide) -> ProtoSide {
+    match side {
+        OrderSide::Buy => ProtoSide::Buy,
+        OrderSide::Sell => ProtoSide::Sell,
+    }
+}
+
+fn proto_order_type(order_type: BrokerOrderType) -> ProtoOrderType {
+    match order_type {
+        BrokerOrderType::Market => ProtoOrderType::Market,
+        BrokerOrderType::Limit => ProtoOrderType::Limit,
+        BrokerOrderType::AdaptiveLimit => ProtoOrderType::AdaptiveLimit,
+    }
+}
+
+fn proto_status(status: BrokerOrderStatus) -> ProtoStatus {
+    match status {
+        BrokerOrderStatus::Working => ProtoStatus::Working,
+        BrokerOrderStatus::PartialFill => ProtoStatus::PartialFill,
+        BrokerOrderStatus::Filled => ProtoStatus::Filled,
+        BrokerOrderStatus::Cancelled => ProtoStatus::Cancelled,
+        BrokerOrderStatus::Rejected => ProtoStatus::Rejected,
+        BrokerOrderStatus::ReconcilePending => ProtoStatus::ReconcilePending,
     }
 }
 
@@ -594,6 +881,43 @@ mod tests {
         drifted.plan_hash = "b".repeat(64);
         assert_eq!(
             validate_snapshot(snapshot(drifted), recovered, &expected, "900", now()),
+            Err(BrokerRecoveryError::OrderConflict)
+        );
+    }
+
+    #[test]
+    fn longbridge_request_and_snapshot_projection_preserve_order_identity() {
+        let mut raw = expected();
+        raw.broker_id = BrokerId::Longbridge as i32;
+        raw.legs[0].broker_contract_id = "QQQ260721C00500000.US".into();
+        let request = domain_request(&raw).unwrap();
+        assert_eq!(request.order_type, BrokerOrderType::Limit);
+        assert_eq!(
+            request.legs[0].broker_contract_id.as_deref(),
+            Some("QQQ260721C00500000.US")
+        );
+
+        let domain = BrokerOrder {
+            broker_order_id: "lb-900".into(),
+            idempotency_key: request.idempotency_key.clone(),
+            plan_hash: request.plan_hash.clone(),
+            status: BrokerOrderStatus::Working,
+            side: request.side,
+            order_type: request.order_type,
+            total_quantity: request.total_quantity,
+            filled_quantity: 0,
+            submitted_price: request.submitted_price,
+            legs: request.legs,
+            child_orders: Vec::new(),
+            residual_exposure: false,
+        };
+        let projected = proto_order(domain.clone());
+        assert_eq!(domain_order(projected).unwrap(), domain);
+
+        raw.order_type = ProtoOrderType::AdaptiveLimit as i32;
+        raw.adaptive_priority = AdaptivePriority::Unspecified as i32;
+        assert_eq!(
+            domain_request(&raw),
             Err(BrokerRecoveryError::OrderConflict)
         );
     }

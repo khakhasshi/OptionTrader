@@ -99,7 +99,7 @@ def _require_confirmation_cipher() -> ConfirmationCipher:
         raise HTTPException(status_code=503, detail="confirmation_store_unavailable") from exc
 
 
-def restore_durable_execution_workflow() -> tuple[int, int]:
+def restore_durable_execution_workflow() -> tuple[int, dict[str, int]]:
     """Rebuild Rust's volatile workflow before serving execution requests."""
     engine = _require_execution_engine()
     cipher = _require_confirmation_cipher()
@@ -117,37 +117,45 @@ def restore_durable_execution_workflow() -> tuple[int, int]:
             ),
             actor="rust-execution-gateway",
         )
-    unresolved = 0
+    unresolved_by_broker = {"ibkr": 0, "longbridge": 0}
     for order_id in reconciliation_ids:
+        order_broker = broker_by_order_id[order_id]
         try:
             reconciled = grpc_reconcile_execution_order(order_id)
         except grpc.RpcError:
-            unresolved += 1
+            unresolved_by_broker[order_broker] += 1
             persist_broker_reconciliation_failure(
                 engine,
-                broker_by_order_id[order_id],
+                order_broker,
                 "BROKER_RPC_FAILURE",
                 order_id=order_id,
             )
             continue
         still_pending = reconciled.state == "RECONCILE_PENDING"
         if still_pending:
-            unresolved += 1
+            unresolved_by_broker[order_broker] += 1
         persist_order_projection(
             engine,
             reconciled,
             action=("BROKER_RECONCILIATION_PENDING" if still_pending else "BROKER_AUTO_RECONCILED"),
             actor="rust-execution-gateway",
         )
-    return len(restored), unresolved
+    return len(restored), unresolved_by_broker
+
+
+def _reconciliation_brokers(raw: str) -> tuple[str, ...]:
+    brokers = tuple(value.strip() for value in raw.split(","))
+    if len(brokers) != 1 or brokers[0] not in {"ibkr", "longbridge"}:
+        raise ValueError("broker reconciliation brokers must select exactly one of ibkr,longbridge")
+    return brokers
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     reconciliation_task: asyncio.Task[None] | None = None
     if os.getenv("DATABASE_URL") and os.getenv("OPTIONTRADER_CONFIRMATION_FERNET_KEY"):
-        _, unresolved = restore_durable_execution_workflow()
-        reconciliation_supervisor.note_startup(unresolved)
+        _, unresolved_by_broker = restore_durable_execution_workflow()
+        reconciliation_supervisor.note_startup(unresolved_by_broker)
         enabled = os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_ENABLED", "true")
         if enabled not in {"true", "false"}:
             raise ValueError(
@@ -157,8 +165,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             interval = int(os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_INTERVAL_SECONDS", "30"))
             if not 5 <= interval <= 300:
                 raise ValueError("broker reconciliation interval must be between 5 and 300 seconds")
+            raw_brokers = os.getenv("OPTIONTRADER_BROKER_RECONCILIATION_BROKERS", "ibkr")
+            brokers = _reconciliation_brokers(raw_brokers)
             reconciliation_task = asyncio.create_task(
-                reconciliation_supervisor.serve(_require_execution_engine(), interval)
+                reconciliation_supervisor.serve(_require_execution_engine(), interval, brokers)
             )
     try:
         yield
@@ -559,8 +569,10 @@ def latest_trading_order(session_id: str | None = None) -> ExecutionTicket:
     "/api/v1/trading/reconciliation",
     response_model=BrokerReconciliationView,
 )
-def broker_reconciliation_status() -> BrokerReconciliationView:
-    return BrokerReconciliationView.model_validate(reconciliation_supervisor.status())
+def broker_reconciliation_status(
+    broker_id: Literal["ibkr", "longbridge"] = "ibkr",
+) -> BrokerReconciliationView:
+    return BrokerReconciliationView.model_validate(reconciliation_supervisor.status(broker_id))
 
 
 @app.websocket("/api/v1/stream/cockpit")

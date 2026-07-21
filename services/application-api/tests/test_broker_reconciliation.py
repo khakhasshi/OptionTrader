@@ -85,3 +85,39 @@ def test_supervisor_persistence_failure_sends_negative_receipt_and_stays_closed(
     assert audits == ["BROKER_SNAPSHOT_INVALID"]
     assert status["broker_reconciled"] is False
     assert status["failure_code"] == "BROKER_SNAPSHOT_INVALID"
+
+
+def test_supervisor_filters_orders_and_keeps_status_per_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reconciled_orders: list[str] = []
+    monkeypatch.setattr(
+        reconciliation,
+        "pending_reconciliation_orders",
+        lambda _engine: [("ib-order", "ibkr"), ("lb-order", "longbridge")],
+    )
+
+    def reconcile_order(order_id: str) -> SimpleNamespace:
+        reconciled_orders.append(order_id)
+        return SimpleNamespace(state="WORKING")
+
+    monkeypatch.setattr(reconciliation, "reconcile_execution_order", reconcile_order)
+    monkeypatch.setattr(reconciliation, "persist_order_projection", lambda *_args, **_kw: None)
+    monkeypatch.setattr(reconciliation, "begin_broker_reconciliation", lambda _broker: _batch())
+    monkeypatch.setattr(reconciliation, "persist_broker_reconciliation", lambda *_args: [])
+    monkeypatch.setattr(
+        reconciliation,
+        "commit_broker_reconciliation",
+        lambda *_args, **_kwargs: (True, []),
+    )
+
+    supervisor = reconciliation.BrokerReconciliationSupervisor()
+    longbridge = supervisor.run_once(object(), "longbridge")  # type: ignore[arg-type]
+    assert reconciled_orders == ["lb-order"]
+    assert longbridge["broker_id"] == "longbridge"
+    assert longbridge["broker_reconciled"] is True
+    assert supervisor.status("ibkr")["last_attempt_at_utc"] is None
+
+    supervisor.note_startup({"ibkr": 2, "longbridge": 0})
+    assert len(supervisor.status("ibkr")["unresolved_order_ids"]) == 2
+    assert supervisor.status("longbridge")["unresolved_order_ids"] == []

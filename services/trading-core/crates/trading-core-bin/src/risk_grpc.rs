@@ -1534,10 +1534,9 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
                 .apply_broker_order(&recovered.order, now)
                 .map_err(|_| Status::failed_precondition("broker order conflicts with workflow"))?;
             let response = order_proto(staged, now);
-            let remains = workflow
-                .orders
-                .values()
-                .any(|entry| entry.record.state == OrderState::ReconcilePending);
+            let remains = workflow.orders.values().any(|entry| {
+                entry.record.state == OrderState::ReconcilePending || entry.record.residual_exposure
+            });
             (response, remains)
         };
         let account_reconciliation_pending = self
@@ -1683,7 +1682,9 @@ impl RiskExecutionService for RiskExecutionServiceImpl {
             .map_err(|()| Status::internal("execution workflow lock poisoned"))?
             .orders
             .values()
-            .any(|entry| entry.record.state == OrderState::ReconcilePending);
+            .any(|entry| {
+                entry.record.state == OrderState::ReconcilePending || entry.record.residual_exposure
+            });
         if workflow_pending {
             return Ok(Response::new(CommitBrokerReconciliationResponse {
                 accepted: true,
@@ -2472,6 +2473,63 @@ mod tests {
             .await
             .values()
             .any(|entry| !entry.committed));
+    }
+
+    #[tokio::test]
+    async fn residual_leg_exposure_keeps_account_authority_closed() {
+        let service = service();
+        let staged = stage(&service, ProtoMode::Paper).await;
+        let awaiting = staged.order.unwrap();
+        let working = service
+            .confirm_candidate(Request::new(ConfirmCandidateRequest {
+                order_id: awaiting.order_id,
+                confirmed_plan_hash: awaiting.plan_hash,
+                confirmation_token: staged.confirmation_token,
+                event_context: Some(context()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        workflow_lock(&service)
+            .unwrap()
+            .orders
+            .get_mut(&working.order_id)
+            .unwrap()
+            .record
+            .residual_exposure = true;
+        service.broker_reconciliations.lock().await.insert(
+            ProtoBrokerId::Ibkr as i32,
+            PendingBrokerReconciliation {
+                snapshot_sequence: 92,
+                snapshot_hash: "d".repeat(64),
+                expires_at: now() + chrono::Duration::seconds(15),
+                buying_power: Decimal::new(80_000, 0),
+                committed: false,
+            },
+        );
+        {
+            let mut broker = service.broker.write().unwrap();
+            broker.health = BrokerHealth::Reconciling;
+            broker.reconciled = false;
+        }
+
+        let receipt = service
+            .commit_broker_reconciliation(Request::new(CommitBrokerReconciliationRequest {
+                broker_id: ProtoBrokerId::Ibkr as i32,
+                snapshot_sequence: 92,
+                snapshot_hash: "d".repeat(64),
+                persistence_succeeded: true,
+                mismatch_codes: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!receipt.broker_reconciled);
+        assert_eq!(
+            receipt.reason_codes,
+            vec!["WORKFLOW_RECONCILIATION_PENDING"]
+        );
+        assert!(!service.broker.read().unwrap().reconciled);
     }
 
     #[tokio::test]

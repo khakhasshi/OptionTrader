@@ -63,6 +63,8 @@ struct RecoveryOrderSnapshot {
     quantity: u32,
     filled_quantity: u32,
     status: BrokerOrderStatus,
+    native_order_type: LbOrderType,
+    submitted_price: Option<Decimal>,
 }
 
 trait LongbridgeOrderIo {
@@ -173,6 +175,53 @@ impl LongbridgeBroker {
         self.account.reconciled = false;
     }
 
+    /// Attach durable OptionTrader identity to broker-visible orders without
+    /// submitting, replacing or cancelling anything.
+    pub fn restore_expected_order(
+        &mut self,
+        request: BrokerOrderRequest,
+        expected_broker_order_id: &str,
+    ) -> Result<BrokerOrder, BrokerError> {
+        validate_request(&request)?;
+        if let Some(existing_id) = self.order_by_key.get(&request.idempotency_key) {
+            let existing = self
+                .orders
+                .get(existing_id)
+                .ok_or(BrokerError::NotReconciled)?;
+            if existing_id != expected_broker_order_id || !same_request(existing, &request) {
+                return Err(BrokerError::DuplicateConflict);
+            }
+            return Ok(existing.clone());
+        }
+        let remote_orders = self
+            .context
+            .today_orders(GetTodayOrdersOptions::new())
+            .map_err(|_| BrokerError::Disconnected)?
+            .iter()
+            .map(recovery_snapshot)
+            .collect::<Result<Vec<_>, _>>()?;
+        let restored =
+            restore_expected_order_from(&request, expected_broker_order_id, &remote_orders)?;
+        self.order_by_key
+            .insert(request.idempotency_key, restored.broker_order_id.clone());
+        self.orders
+            .insert(restored.broker_order_id.clone(), restored.clone());
+        Ok(restored)
+    }
+
+    /// Drop only OptionTrader's in-memory recovery projection before rebuilding
+    /// it from durable identities and the broker's read-only facts.
+    pub fn reset_recovery_ledger(&mut self) -> Result<(), BrokerError> {
+        if self.submission_enabled {
+            return Err(BrokerError::LiveSubmissionDisabled);
+        }
+        self.orders.clear();
+        self.order_by_key.clear();
+        self.fills.clear();
+        self.mark_reconciliation_required();
+        Ok(())
+    }
+
     fn remote_order(&self, order_id: &str) -> Result<LbOrder, BrokerError> {
         self.context
             .today_orders(GetTodayOrdersOptions::new().order_id(order_id.to_owned()))
@@ -190,6 +239,13 @@ impl LongbridgeBroker {
             .ok_or(BrokerError::OrderNotFound)?;
         if current.legs.len() == 1 {
             let remote = self.remote_order(order_id)?;
+            let remote_identity = recovery_snapshot(&remote)?;
+            let expected_remark = format!("optiontrader:{}", &current.plan_hash[..16]);
+            if remote_identity.remark != expected_remark
+                || !remote_matches_leg(&remote_identity, &current.legs[0], current.order_type)
+            {
+                return Err(BrokerError::NotReconciled);
+            }
             let known = self
                 .orders
                 .get_mut(order_id)
@@ -572,6 +628,17 @@ impl BrokerAdapter for LongbridgeBroker {
             self.mark_reconciliation_required();
             return Err(BrokerError::NotReconciled);
         }
+        let order_ids: Vec<String> = self.orders.keys().cloned().collect();
+        for order_id in order_ids {
+            if let Err(error) = self.update_known_order(&order_id) {
+                if error == BrokerError::Disconnected {
+                    self.mark_disconnected();
+                    return Err(error);
+                }
+                self.mark_reconciliation_required();
+                return Err(BrokerError::NotReconciled);
+            }
+        }
         self.fills = self
             .context
             .today_executions(GetTodayExecutionsOptions::new())
@@ -618,10 +685,6 @@ impl BrokerAdapter for LongbridgeBroker {
                 })
             })
             .collect::<Result<Vec<_>, BrokerError>>()?;
-        let order_ids: Vec<String> = self.orders.keys().cloned().collect();
-        for order_id in order_ids {
-            self.update_known_order(&order_id)?;
-        }
         self.account.health = BrokerHealth::Healthy;
         self.account.reconciled = true;
         Ok(())
@@ -814,7 +877,76 @@ fn recovery_snapshot(order: &LbOrder) -> Result<RecoveryOrderSnapshot, BrokerErr
         quantity: decimal_quantity(order.quantity)?,
         filled_quantity: decimal_quantity(order.executed_quantity)?,
         status: map_status(order.status)?,
+        native_order_type: order.order_type,
+        submitted_price: order.price,
     })
+}
+
+fn restore_expected_order_from(
+    request: &BrokerOrderRequest,
+    expected_broker_order_id: &str,
+    remote_orders: &[RecoveryOrderSnapshot],
+) -> Result<BrokerOrder, BrokerError> {
+    let mut restored = BrokerOrder {
+        broker_order_id: expected_broker_order_id.to_owned(),
+        idempotency_key: request.idempotency_key.clone(),
+        plan_hash: request.plan_hash.clone(),
+        status: BrokerOrderStatus::ReconcilePending,
+        side: request.side,
+        order_type: request.order_type,
+        total_quantity: request.total_quantity,
+        filled_quantity: 0,
+        submitted_price: request.submitted_price,
+        legs: request.legs.clone(),
+        child_orders: Vec::new(),
+        residual_exposure: true,
+    };
+    if request.legs.len() == 1 {
+        let leg = &request.legs[0];
+        let expected_remark = format!("optiontrader:{}", &request.plan_hash[..16]);
+        let matches = remote_orders
+            .iter()
+            .filter(|order| {
+                order.order_id == expected_broker_order_id
+                    && order.remark == expected_remark
+                    && remote_matches_leg(order, leg, request.order_type)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(if matches.is_empty() {
+                BrokerError::OrderNotFound
+            } else {
+                BrokerError::DuplicateConflict
+            });
+        }
+        let remote = matches[0];
+        restored.status = remote.status;
+        restored.filled_quantity = remote.filled_quantity;
+        restored.residual_exposure = matches!(
+            remote.status,
+            BrokerOrderStatus::PartialFill | BrokerOrderStatus::ReconcilePending
+        );
+        return Ok(restored);
+    }
+    let expected_parent = format!("lb-split:{}", request.idempotency_key);
+    if expected_broker_order_id != expected_parent {
+        return Err(BrokerError::DuplicateConflict);
+    }
+    restored.child_orders = recover_split_children_from(&restored, remote_orders)?;
+    refresh_parent_status(&mut restored);
+    Ok(restored)
+}
+
+fn remote_matches_leg(
+    remote: &RecoveryOrderSnapshot,
+    leg: &BrokerOrderLeg,
+    order_type: BrokerOrderType,
+) -> bool {
+    remote.symbol == leg.broker_contract_id.as_deref().unwrap_or_default()
+        && remote.side == leg.side
+        && remote.quantity == leg.quantity
+        && remote.native_order_type == map_order_type(order_type)
+        && remote.submitted_price == leg.submitted_price
 }
 
 fn recover_split_children_from(
@@ -828,10 +960,7 @@ fn recover_split_children_from(
         let matches: Vec<&RecoveryOrderSnapshot> = remote_orders
             .iter()
             .filter(|order| {
-                order.remark == remark
-                    && order.symbol == leg.broker_contract_id.as_deref().unwrap_or_default()
-                    && order.side == leg.side
-                    && order.quantity == leg.quantity
+                order.remark == remark && remote_matches_leg(order, leg, parent.order_type)
             })
             .collect();
         if matches.len() > 1 {
@@ -1129,6 +1258,8 @@ mod tests {
             quantity: 1,
             filled_quantity: 1,
             status: BrokerOrderStatus::Filled,
+            native_order_type: LbOrderType::LO,
+            submitted_price: Some(Decimal::new(75, 2)),
         };
         let recovered = recover_split_children_from(&parent, std::slice::from_ref(&buy)).unwrap();
         assert_eq!(recovered.len(), 1);
@@ -1136,6 +1267,38 @@ mod tests {
         assert_eq!(
             recover_split_children_from(&parent, &[buy.clone(), buy]),
             Err(BrokerError::DuplicateConflict)
+        );
+    }
+
+    #[test]
+    fn read_only_restore_requires_native_id_remark_and_full_order_shape() {
+        let request = request(
+            vec![(OrderSide::Buy, Decimal::new(125, 2))],
+            BrokerOrderType::AdaptiveLimit,
+        );
+        let remote = RecoveryOrderSnapshot {
+            order_id: "lb-native-1".into(),
+            remark: format!("optiontrader:{}", &request.plan_hash[..16]),
+            symbol: request.legs[0].broker_contract_id.clone().unwrap(),
+            side: OrderSide::Buy,
+            quantity: 1,
+            filled_quantity: 0,
+            status: BrokerOrderStatus::Working,
+            native_order_type: LbOrderType::LO,
+            submitted_price: Some(Decimal::new(125, 2)),
+        };
+        let restored =
+            restore_expected_order_from(&request, "lb-native-1", std::slice::from_ref(&remote))
+                .unwrap();
+        assert_eq!(restored.broker_order_id, "lb-native-1");
+        assert_eq!(restored.status, BrokerOrderStatus::Working);
+        assert!(!restored.residual_exposure);
+
+        let mut wrong_price = remote;
+        wrong_price.submitted_price = Some(Decimal::new(130, 2));
+        assert_eq!(
+            restore_expected_order_from(&request, "lb-native-1", &[wrong_price]),
+            Err(BrokerError::OrderNotFound)
         );
     }
 }
