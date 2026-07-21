@@ -39,8 +39,19 @@ _REPO = os.path.dirname(
 _BINARY = os.path.join(_REPO, "services", "trading-core", "target", "debug", "trading-core")
 _SCHEMA_DIR = os.path.join(_REPO, "packages", "contracts", "jsonschema")
 
+# In the dedicated CI integration job we set OPTIONTRADER_REQUIRE_INTEGRATION=1,
+# which turns a missing binary into a hard FAIL instead of a skip — the smoke
+# must actually execute there, not silently pass by skipping.
+_REQUIRE = os.getenv("OPTIONTRADER_REQUIRE_INTEGRATION") == "1"
+
+if not os.path.exists(_BINARY) and _REQUIRE:
+    raise RuntimeError(
+        "OPTIONTRADER_REQUIRE_INTEGRATION=1 but trading-core binary is missing; "
+        "the integration job must build it (cargo build --bin trading-core)."
+    )
+
 pytestmark = pytest.mark.skipif(
-    not os.path.exists(_BINARY),
+    not os.path.exists(_BINARY) and not _REQUIRE,
     reason="trading-core binary not built; run cargo build --bin trading-core",
 )
 
@@ -80,13 +91,17 @@ def _grpc_source_for(
 ) -> Any:
     """A hub tick source that consumes the real gRPC stream at `target`."""
 
-    async def src(session_id: str) -> AsyncIterator[tuple[str, Any]]:
+    async def src(
+        session_id: str, resume_after_sequence: int = 0
+    ) -> AsyncIterator[tuple[str, Any]]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
         def pump() -> None:
             try:
-                for tick in stream_ticks(session_id, target=target):
+                for tick in stream_ticks(
+                    session_id, target=target, resume_after_sequence=resume_after_sequence
+                ):
                     loop.call_soon_threadsafe(queue.put_nowait, ("tick", tick))
                 loop.call_soon_threadsafe(queue.put_nowait, ("end", "stream ended"))
             except grpc.RpcError as exc:

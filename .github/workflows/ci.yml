@@ -73,3 +73,19 @@ jobs:
           components: rustfmt, clippy
       - run: make lint-core
       - run: make test-core
+
+  # Cross-language end-to-end: build the Rust core, then run the Python
+  # integration smoke against the real binary. OPTIONTRADER_REQUIRE_INTEGRATION=1
+  # forbids the skip path, so a missing binary fails the job instead of passing.
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      OPTIONTRADER_REQUIRE_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make setup-api
+      - run: cargo build --bin trading-core
+        working-directory: services/trading-core
+      - run: cd services/application-api && uv run pytest tests/test_integration_smoke.py -q

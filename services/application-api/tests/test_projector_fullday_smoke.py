@@ -27,6 +27,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+from datetime import datetime
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -110,8 +111,8 @@ def test_fullday_replay_is_schema_valid_and_fail_closed() -> None:
     stale_frames_tradable = 0
     gap_frames_tradable = 0
     healthy_tradable = 0
-    seen_gap_minute_jump = False
-    prev_minute = None
+    gap_minute_delta: float | None = None
+    prev_dt: datetime | None = None
 
     for i in range(_SESSION_MINUTES):
         close += 0.1 if i % 3 else -0.15
@@ -124,10 +125,13 @@ def test_fullday_replay_is_schema_valid_and_fail_closed() -> None:
         health = "STALE" if (in_stale or in_gap) else "HEALTHY"
         frame = proj.apply(_tick(i, close, health, minute_offset=offset))
 
-        minute = frame["snapshot"]["timestamp_et"] if frame["snapshot"] else None
-        if prev_minute is not None and minute is not None and i == _GAP_AT:
-            seen_gap_minute_jump = True  # the jump lands exactly at the gap index
-        prev_minute = minute
+        ts = frame["snapshot"]["occurred_at_utc"] if frame["snapshot"] else None
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+        if dt is not None and prev_dt is not None and i == _GAP_AT:
+            # Measure the ACTUAL minute jump at the gap boundary; a broken gap
+            # injection would show 1 min here and fail the assertion below.
+            gap_minute_delta = (dt - prev_dt).total_seconds() / 60.0
+        prev_dt = dt
 
         if list(validator.iter_errors(frame)):
             invalid += 1
@@ -141,7 +145,13 @@ def test_fullday_replay_is_schema_valid_and_fail_closed() -> None:
     assert invalid == 0, f"{invalid} frames failed cockpit_state.json validation"
     assert stale_frames_tradable == 0, "new positions must be blocked throughout STALE"
     assert gap_frames_tradable == 0, "new positions must be blocked throughout the gap"
-    assert seen_gap_minute_jump, "the injected gap must produce a real minute jump"
+    # The gap must be a REAL time jump: normal step is 1 min, so the boundary
+    # delta is (1 + _GAP_MINUTES). Asserting the exact value means a future
+    # broken gap injection (contiguous minutes) fails this test instead of
+    # passing silently.
+    assert gap_minute_delta == float(1 + _GAP_MINUTES), (
+        f"expected a {1 + _GAP_MINUTES}-minute jump at the gap, got {gap_minute_delta}"
+    )
     assert healthy_tradable > 0
 
 
