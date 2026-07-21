@@ -93,7 +93,7 @@ def _config(sid: str = "s1") -> ProjectorConfig:
     return ProjectorConfig(session_id=sid, rule_version="t", opening_range_minutes=3)
 
 
-def test_single_subscriber_gets_frames_then_terminal_disconnect() -> None:
+def test_single_subscriber_gets_live_then_disconnected_on_upstream_end() -> None:
     async def run() -> list[dict[str, Any]]:
         src = _Controllable()
         hub = get_hub(_config(), source=src)
@@ -102,20 +102,23 @@ def test_single_subscriber_gets_frames_then_terminal_disconnect() -> None:
         async def consume() -> None:
             async for f in hub.subscribe():
                 frames.append(f)
+                # Stop once we've seen the terminal DISCONNECTED after 4 LIVE.
+                if f["connection"] == "DISCONNECTED" and len(frames) >= 5:
+                    hub.stop()
 
         task = asyncio.create_task(consume())
         await asyncio.sleep(0)
         for i in range(4):
             src.push(_tick(570 + i, i + 1))
         await asyncio.sleep(0.05)
-        src.end()
+        src.end()  # upstream drops -> hub publishes DISCONNECTED, then reconnects
         await asyncio.wait_for(task, timeout=2)
         return frames
 
     frames = asyncio.run(run())
     assert [f["connection"] for f in frames[:4]] == ["LIVE"] * 4
-    assert frames[-1]["connection"] == "DISCONNECTED"
-    # seq is monotonic
+    assert frames[4]["connection"] == "DISCONNECTED"
+    # seq is monotonic across the whole run
     seqs = [f["seq"] for f in frames]
     assert seqs == sorted(seqs)
 
@@ -178,8 +181,8 @@ def test_multiple_clients_share_one_projector_no_engine_rerun() -> None:
         await asyncio.sleep(0)
         for i in range(3):
             src.push(_tick(570 + i, i + 1))
-        await asyncio.sleep(0.05)
-        src.end()
+        await asyncio.sleep(0.1)
+        hub.stop()  # end both subscribers deterministically
         await asyncio.wait_for(asyncio.gather(ta, tb), timeout=2)
         return a, b
 
@@ -215,8 +218,52 @@ def test_upstream_error_publishes_disconnected_frame() -> None:
         frames: list[dict[str, Any]] = []
         async for f in hub.subscribe():
             frames.append(f)
+            hub.stop()  # one DISCONNECTED is enough; end the (retrying) hub
         return frames
 
     frames = asyncio.run(run())
     assert frames[-1]["connection"] == "DISCONNECTED"
     assert frames[-1]["new_position_allowed"] is False
+
+
+def test_hub_reconnects_after_upstream_end_with_higher_seq() -> None:
+    """Review P1: the same SessionHub must reconnect after upstream end/error,
+    keep its projector, and resume LIVE at a strictly higher seq."""
+
+    class _FlakySource:
+        """First upstream attempt ends immediately; second yields live ticks."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(self, _sid: str) -> AsyncIterator[tuple[str, Any]]:
+            self.calls += 1
+            if self.calls == 1:
+                yield ("end", "first attempt failed")
+                return
+            for i in range(3):
+                yield ("tick", _tick(573 + i, 10 + i))
+            # keep the stream open so the hub doesn't loop again mid-assert
+            await asyncio.sleep(1.0)
+
+    async def run() -> tuple[int, int]:
+        src = _FlakySource()
+        hub = get_hub(_config("flaky"), source=src)
+        gen = hub.subscribe()
+        first_disc_seq = None
+        first_live_after = None
+        for _ in range(20):
+            f = await asyncio.wait_for(gen.__anext__(), timeout=3)
+            if f["connection"] == "DISCONNECTED" and first_disc_seq is None:
+                first_disc_seq = f["seq"]
+            elif f["connection"] == "LIVE" and first_disc_seq is not None:
+                first_live_after = f["seq"]
+                break
+        await gen.aclose()
+        hub.stop()
+        assert first_disc_seq is not None and first_live_after is not None
+        assert src.calls >= 2, "hub must re-open upstream after the first end"
+        return first_disc_seq, first_live_after
+
+    disc_seq, live_after = asyncio.run(run())
+    assert live_after > disc_seq

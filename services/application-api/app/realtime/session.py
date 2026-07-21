@@ -98,28 +98,58 @@ class SessionHub:
         self._projector = CockpitProjector(config=config)
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._latest: dict[str, Any] | None = None
-        self._ended = False
+        self._stopped = False
         self._task: asyncio.Task[None] | None = None
+        # Upstream reconnect backoff (seconds). Bounded so a permanently-dead
+        # upstream doesn't hot-loop; short base keeps recovery snappy.
+        self._backoff_base = 0.05
+        self._backoff_max = 5.0
 
     def _start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._run())
 
     async def _run(self) -> None:
-        """Consume upstream once; project each event; fan out to subscribers."""
-        try:
-            async for kind, payload in self._source(self._config.session_id):
-                if kind == "tick":
-                    frame = self._projector.apply(payload)
-                else:
-                    frame = self._projector.disconnected_frame(_now_iso(), str(payload))
-                self._publish(frame)
-                if kind == "end":
-                    break
-        except Exception as exc:  # noqa: BLE001 — fail closed on any hub fault
-            self._publish(self._projector.disconnected_frame(_now_iso(), f"hub fault: {exc}"))
-        finally:
-            self._ended = True
+        """Consume upstream, reconnecting with backoff across end/error, using
+        ONE persistent projector so seq stays monotonic through every reconnect.
+
+        On each upstream drop we publish a fail-closed DISCONNECTED frame; on the
+        next successful attempt we resume projecting LIVE frames at a higher seq.
+        The loop runs until the hub is explicitly stopped (a WS client staying
+        connected therefore rides through upstream blips instead of being cut)."""
+        backoff = self._backoff_base
+        while not self._stopped:
+            ended_reason = "stream ended"
+            try:
+                async for kind, payload in self._source(self._config.session_id):
+                    if self._stopped:
+                        return
+                    if kind == "tick":
+                        self._publish(self._projector.apply(payload))
+                        backoff = self._backoff_base  # healthy data resets backoff
+                    else:
+                        ended_reason = str(payload)
+                        break
+            except Exception as exc:  # noqa: BLE001 — fail closed on any hub fault
+                ended_reason = f"upstream fault: {exc}"
+
+            if self._stopped:
+                return
+            # Upstream dropped: fail closed, then wait and reconnect.
+            self._publish(
+                self._projector.disconnected_frame(_now_iso(), f"{ended_reason}; reconnecting")
+            )
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                return
+            backoff = min(backoff * 2, self._backoff_max)
+
+    def stop(self) -> None:
+        """Stop the hub: end its upstream loop and release its subscribers."""
+        self._stopped = True
+        if self._task is not None:
+            self._task.cancel()
 
     def _publish(self, frame: dict[str, Any]) -> None:
         self._latest = frame
@@ -130,22 +160,18 @@ class SessionHub:
     async def subscribe(self) -> AsyncGenerator[dict[str, Any], None]:
         """Attach a WS client. Replays the latest frame immediately (so a
         reconnecting client sees current state), then streams live frames with
-        monotonic seq. Ends when upstream has ended and nothing more will come.
-        """
+        monotonic seq across upstream reconnects. Ends when the hub is stopped or
+        the client cancels the generator."""
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._subscribers.add(queue)
         self._start()
         try:
             if self._latest is not None:
                 yield self._latest
-            while True:
-                if self._ended and queue.empty():
-                    return
+            while not self._stopped:
                 try:
                     frame = await asyncio.wait_for(queue.get(), timeout=0.25)
                 except TimeoutError:
-                    if self._ended and queue.empty():
-                        return
                     continue
                 yield frame
         finally:
@@ -153,16 +179,19 @@ class SessionHub:
 
 
 def get_hub(config: ProjectorConfig, source: AsyncTickSource | None = None) -> SessionHub:
-    """Return the session's hub, creating it once. A reconnecting client reuses
-    the same hub, so its projector's seq stays monotonic across reconnects."""
+    """Return the session's hub. A reconnecting client reuses the same live hub,
+    so its projector's seq stays monotonic across reconnects. A hub that was
+    explicitly stopped is replaced with a fresh one."""
     hub = _HUBS.get(config.session_id)
-    if hub is None:
+    if hub is None or hub._stopped:  # noqa: SLF001 — internal lifecycle check
         hub = SessionHub(config, source=source)
         _HUBS[config.session_id] = hub
     return hub
 
 
 def reset_hubs() -> None:
-    """Test helper: drop all hubs and cached frames for a clean slate."""
+    """Test helper: stop and drop all hubs and cached frames for a clean slate."""
+    for hub in _HUBS.values():
+        hub.stop()
     _HUBS.clear()
     _LATEST.clear()
