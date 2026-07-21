@@ -8,7 +8,12 @@ from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from hashlib import sha256
 
 from app.grpc_gen import execution_pb2
-from app.trading.models import CandidateLeg, CandidateTradePlan
+from app.trading.models import (
+    AdaptiveLimitPolicy,
+    CandidateLeg,
+    CandidateTradePlan,
+    OptionQuoteProof,
+)
 
 _MULTIPLIER = Decimal("100")
 
@@ -37,6 +42,17 @@ class QuotedLeg:
     strike: str
     bid: str
     ask: str
+    bid_size: int
+    ask_size: int
+    quote_at_utc: datetime
+    delta: str
+    gamma: str
+    theta: str
+    vega: str
+    chain_snapshot_id: str
+    broker_contract_id: str | None = None
+    symbol: str = "QQQ"
+    exchange: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +70,11 @@ class CandidateInputs:
     ttl_seconds: int
     rule_version: str
     data_snapshot_ids: tuple[str, ...]
+    order_type: str = "LIMIT"
+    adaptive_initial_aggressiveness_bps: int = 3_000
+    adaptive_max_attempts: int = 3
+    adaptive_max_quote_age_ms: int = 500
+    adaptive_max_spread_bps: int = 2_000
 
 
 def _unit_economics(inputs: CandidateInputs) -> tuple[Decimal, Decimal]:
@@ -132,6 +153,19 @@ def _to_proto(
         "MANUAL_CONFIRM": execution_pb2.EXECUTION_MODE_MANUAL_CONFIRM,
         "CONTROLLED_AUTO": execution_pb2.EXECUTION_MODE_CONTROLLED_AUTO,
     }[plan.execution_mode]
+    order_type = {
+        "MARKET": execution_pb2.BROKER_ORDER_TYPE_MARKET,
+        "LIMIT": execution_pb2.BROKER_ORDER_TYPE_LIMIT,
+        "ADAPTIVE_LIMIT": execution_pb2.BROKER_ORDER_TYPE_ADAPTIVE_LIMIT,
+    }[plan.order_type]
+    adaptive = None
+    if plan.adaptive_limit is not None:
+        adaptive = execution_pb2.AdaptiveLimitPolicy(
+            initial_aggressiveness_bps=plan.adaptive_limit.initial_aggressiveness_bps,
+            max_attempts=plan.adaptive_limit.max_attempts,
+            max_quote_age_ms=plan.adaptive_limit.max_quote_age_ms,
+            max_spread_bps=plan.adaptive_limit.max_spread_bps,
+        )
     return execution_pb2.CandidateTradePlan(
         schema_version=plan.schema_version,
         plan_id="" if clear_identity else plan.plan_id,
@@ -159,6 +193,21 @@ def _to_proto(
                 expiry=leg.expiry,
                 strike=leg.strike,
                 quantity=leg.quantity,
+                quote=execution_pb2.OptionQuoteProof(
+                    bid=leg.quote.bid,
+                    ask=leg.quote.ask,
+                    bid_size=leg.quote.bid_size,
+                    ask_size=leg.quote.ask_size,
+                    occurred_at_utc=leg.quote.occurred_at_utc,
+                    delta=leg.quote.delta,
+                    gamma=leg.quote.gamma,
+                    theta=leg.quote.theta,
+                    vega=leg.quote.vega,
+                    chain_snapshot_id=leg.quote.chain_snapshot_id,
+                ),
+                broker_contract_id=leg.broker_contract_id or "",
+                symbol=leg.symbol,
+                exchange=leg.exchange or "",
             )
             for leg in plan.legs
         ],
@@ -173,6 +222,13 @@ def _to_proto(
         rule_version=plan.rule_version,
         data_snapshot_ids=plan.data_snapshot_ids,
         manual_confirmation_required=plan.manual_confirmation_required,
+        order_side=(
+            execution_pb2.ORDER_SIDE_BUY
+            if plan.order_side == "BUY"
+            else execution_pb2.ORDER_SIDE_SELL
+        ),
+        order_type=order_type,
+        **({"adaptive_limit": adaptive} if adaptive is not None else {}),
     )
 
 
@@ -201,6 +257,23 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
         raise ValueError("controlled-auto/live candidate generation is disabled")
     if not 1 <= inputs.ttl_seconds <= 120:
         raise ValueError("candidate TTL must be between 1 and 120 seconds")
+    if inputs.order_type not in {"MARKET", "LIMIT", "ADAPTIVE_LIMIT"}:
+        raise ValueError("candidate order type is unmapped")
+    for leg in inputs.quoted_legs:
+        if leg.quote_at_utc.tzinfo is None:
+            raise ValueError("option quote time must be timezone-aware")
+        if leg.quote_at_utc.astimezone(UTC) > occurred:
+            raise ValueError("option quote cannot be from the future")
+        if leg.bid_size < 1 or leg.ask_size < 1:
+            raise ValueError("option quote sizes must be positive")
+        if leg.chain_snapshot_id not in inputs.data_snapshot_ids:
+            raise ValueError("option chain snapshot must be part of plan proof")
+        if not leg.broker_contract_id:
+            raise ValueError("broker-native contract id is required")
+        if inputs.broker_id == "ibkr" and not leg.broker_contract_id.isdigit():
+            raise ValueError("IBKR contract id must be a numeric conId")
+    if inputs.broker_id == "longbridge" and len(inputs.quoted_legs) != 1:
+        raise ValueError("Longbridge does not support multi-leg option orders")
 
     limit_price, unit_max_loss = _unit_economics(inputs)
     risk_budget = _decimal(inputs.risk_budget, "risk budget")
@@ -221,7 +294,7 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
     )
     placeholder_hash = "0" * 64
     plan = CandidateTradePlan(
-        schema_version="1.0",
+        schema_version="1.1",
         plan_id="pending",
         plan_hash=placeholder_hash,
         idempotency_key="pending",
@@ -239,6 +312,23 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
                 expiry=leg.expiry,
                 strike=leg.strike,
                 quantity=quantity,
+                quote=OptionQuoteProof(
+                    bid=leg.bid,
+                    ask=leg.ask,
+                    bid_size=leg.bid_size,
+                    ask_size=leg.ask_size,
+                    occurred_at_utc=leg.quote_at_utc.astimezone(UTC)
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                    delta=leg.delta,
+                    gamma=leg.gamma,
+                    theta=leg.theta,
+                    vega=leg.vega,
+                    chain_snapshot_id=leg.chain_snapshot_id,
+                ),
+                broker_contract_id=leg.broker_contract_id or "",
+                symbol=leg.symbol,
+                exchange=leg.exchange,
             )
             for leg in inputs.quoted_legs
         ],
@@ -253,6 +343,18 @@ def build_candidate_plan(inputs: CandidateInputs) -> CandidateTradePlan:
         rule_version=inputs.rule_version,
         data_snapshot_ids=list(inputs.data_snapshot_ids),
         manual_confirmation_required=True,
+        order_side="BUY" if inputs.strategy == "LongGamma" else "SELL",
+        order_type=inputs.order_type,  # type: ignore[arg-type]
+        adaptive_limit=(
+            AdaptiveLimitPolicy(
+                initial_aggressiveness_bps=inputs.adaptive_initial_aggressiveness_bps,
+                max_attempts=inputs.adaptive_max_attempts,
+                max_quote_age_ms=inputs.adaptive_max_quote_age_ms,
+                max_spread_bps=inputs.adaptive_max_spread_bps,
+            )
+            if inputs.order_type == "ADAPTIVE_LIMIT"
+            else None
+        ),
     )
     digest = canonical_plan_hash(plan)
     return plan.model_copy(

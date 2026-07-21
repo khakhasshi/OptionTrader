@@ -46,6 +46,12 @@ module = "app.grpc_gen.*"
 ignore_errors = true
 follow_imports = "skip"
 
+[[tool.mypy.overrides]]
+# The official IBKR package is installed from the TWS API distribution only on
+# the local sidecar host and is deliberately imported dynamically.
+module = "app.ibkr_sidecar.native"
+ignore_errors = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

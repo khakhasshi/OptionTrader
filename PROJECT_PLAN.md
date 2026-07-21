@@ -20,7 +20,7 @@ Longbridge内容    (Regime/Vol/Strategy/Event/         │
                    (执行事实源 = 当前 broker_id)
 ```
 
-数据流：Rust Market Core 从 ThetaData 建立不可变快照（含递增 sequence_number）与 DataHealth，聚合快照入 PostgreSQL、原始高频行情入 Parquet。Python 消费快照生成 Regime/Vol/Signal/CandidateTradePlan，经 Rust 两阶段风控，人工确认后向唯一 Broker 提交限价单，全过程状态转换写入 PostgreSQL。
+数据流：Rust Market Core 从 ThetaData 建立不可变快照（含递增 sequence_number）与 DataHealth，聚合快照入 PostgreSQL、原始高频行情入 Parquet。Python 消费快照生成 Regime/Vol/Signal/CandidateTradePlan，经 Rust 两阶段风控，人工确认后向唯一 Broker 提交市价、限价或受保护的自适应限价单；市价新开仓默认闭锁，全过程状态转换写入 PostgreSQL。
 
 ## 2. 目录结构
 
@@ -114,4 +114,4 @@ gRPC（Python↔Rust）：已实现 StreamMarketSnapshots、GetDataHealth、Eval
 
 ## 11. 当前进度
 
-Phase 0、1 已完成，Phase 2 代码签收且完整 RTH 现场 soak 待执行。Phase 3 已进入开发：候选计划、两阶段 Rust 风控、paper/shadow 状态机、PostgreSQL 审计与 UI 人工确认首个闭环已完成；真实 Broker adapter、动态账户快照、重启对账恢复及真实期权报价证明仍在进行。详见 `TASKS.md`。
+Phase 0、1 已完成，Phase 2 代码签收且完整 RTH 现场 soak 待执行。Phase 3 已进入开发：Candidate 1.1、两阶段 Rust 风控、期权报价/Greeks/chain proof、paper/shadow 状态机、PostgreSQL 审计、UI 人工确认和 Broker SDK 适配首批已完成；真实期权报价权威源、Broker 订单/成交流、动态账户快照、自动重启对账恢复及 paper 现场认证仍在进行。详见 `TASKS.md`。

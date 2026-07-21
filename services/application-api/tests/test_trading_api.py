@@ -219,3 +219,40 @@ def test_existing_durable_order_with_lost_gateway_state_requires_reconciliation(
     )
     assert response.status_code == 409
     assert response.json()["detail"] == "execution_reconciliation_required"
+
+
+def test_latest_order_never_serves_durable_projection_after_gateway_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _result()
+    assert result.order is not None
+
+    class MissingOrder(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.NOT_FOUND
+
+    monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
+    monkeypatch.setattr(
+        main, "latest_execution_ticket", lambda *_args, **_kwargs: (_plan(), result.order)
+    )
+    monkeypatch.setattr(
+        main, "grpc_get_order", lambda *_args: (_ for _ in ()).throw(MissingOrder())
+    )
+    response = TestClient(main.app).get("/api/v1/trading/orders")
+    assert response.status_code == 409
+    assert response.json()["detail"] == "execution_reconciliation_required"
+
+
+def test_latest_order_rejects_gateway_version_rollback(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _result()
+    assert result.order is not None
+    durable = result.order.model_copy(update={"state_version": 3})
+    stale = result.order.model_copy(update={"state_version": 2})
+    monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
+    monkeypatch.setattr(
+        main, "latest_execution_ticket", lambda *_args, **_kwargs: (_plan(), durable)
+    )
+    monkeypatch.setattr(main, "grpc_get_order", lambda *_args: stale)
+    response = TestClient(main.app).get("/api/v1/trading/orders")
+    assert response.status_code == 409
+    assert response.json()["detail"] == "execution_reconciliation_required"

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use broker::{
     BrokerAdapter, BrokerError, BrokerOrder, BrokerOrderLeg, BrokerOrderRequest, BrokerOrderStatus,
+    BrokerOrderType, OrderSide,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -302,7 +303,9 @@ impl IdempotencyRegistry {
 pub fn submit_to_broker<A: BrokerAdapter>(
     record: &mut OrderRecord,
     adapter: &mut A,
-    limit_price: Decimal,
+    side: OrderSide,
+    order_type: BrokerOrderType,
+    submitted_price: Option<Decimal>,
     legs: Vec<BrokerOrderLeg>,
     at: DateTime<Utc>,
 ) -> Result<(), ExecutionError> {
@@ -310,8 +313,10 @@ pub fn submit_to_broker<A: BrokerAdapter>(
         .submit(BrokerOrderRequest {
             idempotency_key: record.idempotency_key.clone(),
             plan_hash: record.plan_hash.clone(),
+            side,
+            order_type,
             total_quantity: record.total_quantity,
-            limit_price,
+            submitted_price,
             legs,
         })
         .map_err(ExecutionError::Broker)?;
@@ -345,6 +350,9 @@ mod tests {
             contract_id: "QQQ-20260721-C-500".into(),
             side: OrderSide::Buy,
             quantity: 2,
+            broker_contract_id: None,
+            symbol: Some("QQQ".into()),
+            exchange: None,
         }]
     }
 
@@ -360,7 +368,9 @@ mod tests {
         submit_to_broker(
             &mut record,
             &mut broker,
-            Decimal::new(250, 2),
+            OrderSide::Buy,
+            BrokerOrderType::Limit,
+            Some(Decimal::new(250, 2)),
             legs(),
             now(),
         )
@@ -371,7 +381,9 @@ mod tests {
         submit_to_broker(
             &mut record,
             &mut broker,
-            Decimal::new(250, 2),
+            OrderSide::Buy,
+            BrokerOrderType::Limit,
+            Some(Decimal::new(250, 2)),
             legs(),
             now(),
         )
@@ -409,7 +421,16 @@ mod tests {
             .unwrap();
         record.begin_submit(now()).unwrap();
         let mut broker = PaperBroker::new(BrokerId::Longbridge);
-        submit_to_broker(&mut record, &mut broker, Decimal::ONE, legs(), now()).unwrap();
+        submit_to_broker(
+            &mut record,
+            &mut broker,
+            OrderSide::Buy,
+            BrokerOrderType::Limit,
+            Some(Decimal::ONE),
+            legs(),
+            now(),
+        )
+        .unwrap();
         let broker_id = record.broker_order_id.clone().unwrap();
         let partial = broker.apply_fill(&broker_id, 1, Decimal::ONE).unwrap();
         record.apply_broker_order(&partial, now()).unwrap();
@@ -451,13 +472,18 @@ mod tests {
             idempotency_key: "key-progress".into(),
             plan_hash: "a".repeat(64),
             status: BrokerOrderStatus::PartialFill,
+            side: OrderSide::Buy,
+            order_type: BrokerOrderType::Limit,
             total_quantity: 3,
             filled_quantity: 1,
-            limit_price: Decimal::ONE,
+            submitted_price: Some(Decimal::ONE),
             legs: vec![BrokerOrderLeg {
                 contract_id: "QQQ-20260721-C-500".into(),
                 side: OrderSide::Buy,
                 quantity: 3,
+                broker_contract_id: None,
+                symbol: Some("QQQ".into()),
+                exchange: None,
             }],
         };
         record.apply_broker_order(&partial, now()).unwrap();

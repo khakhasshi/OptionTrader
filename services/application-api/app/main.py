@@ -434,8 +434,31 @@ def latest_trading_order(session_id: str | None = None) -> ExecutionTicket:
         raise HTTPException(status_code=503, detail="execution_audit_read_failed") from exc
     if ticket is None:
         raise HTTPException(status_code=404, detail="order_not_found")
-    plan, order = ticket
-    return ExecutionTicket(plan=plan, order=order)
+    plan, durable_order = ticket
+    try:
+        gateway_order = grpc_get_order(durable_order.order_id)
+    except grpc.RpcError as exc:
+        if exc.code() == grpc.StatusCode.NOT_FOUND:
+            raise HTTPException(
+                status_code=409, detail="execution_reconciliation_required"
+            ) from exc
+        raise _grpc_http_error(exc) from exc
+    if (
+        gateway_order.plan_hash != durable_order.plan_hash
+        or gateway_order.idempotency_key != durable_order.idempotency_key
+        or gateway_order.state_version < durable_order.state_version
+    ):
+        raise HTTPException(status_code=409, detail="execution_reconciliation_required")
+    try:
+        persist_order_projection(
+            engine,
+            gateway_order,
+            action="ORDER_READ_RECONCILED",
+            actor="rust-execution-gateway",
+        )
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="execution_audit_write_failed") from exc
+    return ExecutionTicket(plan=plan, order=gateway_order)
 
 
 @app.websocket("/api/v1/stream/cockpit")

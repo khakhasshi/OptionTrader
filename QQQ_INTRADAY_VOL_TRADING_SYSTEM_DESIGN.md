@@ -783,7 +783,7 @@ flowchart TD
     P -->|确认| Q
     Q --> R{最终风控通过？}
     R -->|否| H
-    R -->|是| S["向唯一指定 Broker 提交限价单"]
+    R -->|是| S["向唯一指定 Broker 提交已批准订单（限价/自适应限价；市价新开仓闭锁）"]
     S --> T["订单状态机与成交/持仓对账"]
 
     T --> U["Rust Risk & Execution Gateway / Position Engine<br/>先判断止损/止盈/时间/风控退出"]

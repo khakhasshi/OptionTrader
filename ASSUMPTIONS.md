@@ -27,7 +27,7 @@
 | ID | 问题 | 为何关键 | 暂行默认 |
 |---|---|---|---|
 | Q1 | ThetaData 实时流的 Rust 接入形态及并发/速率限额仍待实测；历史接口已确认使用本地官方 Python/gRPC SDK | 决定 Rust Market Core 实时连接层、限流、缓存与回补设计 | Phase 1 历史下载由 Python Research Job 执行；生产标准化、DataHealth 和底层特征仍由 Rust 权威处理；实时接入在 Phase 2 前完成实测 |
-| Q2 | IBKR 最终采用 TWS/Gateway Python sidecar 还是其他官方接入形态，以及 Longbridge/IBKR paper 账户的现场认证步骤 | adapter 领域契约已固定，但决定进程部署、会话恢复和错误映射 | Longbridge 原生 Rust adapter；IBKR 本机 sidecar；两者统一 `broker.proto`。当前仅契约与 PaperBroker，真实连接仍待 Phase 3 后续切片 |
+| Q2 | IBKR 最终采用 TWS/Gateway Python sidecar 还是其他官方接入形态，以及 Longbridge/IBKR paper 账户的现场认证步骤 | adapter 领域契约已固定，但决定进程部署、会话恢复和错误映射 | Longbridge 原生 Rust SDK adapter；IBKR 本机 TWS/Gateway sidecar；两者统一 `broker.proto`。SDK/订单映射已开始，订单/成交流、自动重启对账与 paper 现场认证仍待 Phase 3 后续切片 |
 | Q3 | 账户货币、初始净值、最大张数、单笔最大损失等硬风控具体数值由谁批准？ | 架构与闸门已落地，但 paper/live Gate 前必须由人确认并版本化 | 默认 `RISK_LIMITS_CONFIRMED=false`、规则 `UNCONFIRMED`、buying power=0；占位数值不能作为批准值 |
 | Q4 | LLM 供应商与模型（Anthropic/OpenAI/本地）、是否有可用密钥、成本预算？ | 决定 llm 模块的 client、Schema 校验、超时/重试/缓存策略 | Phase 4 才接入；先定义 Pydantic Schema 与 provider 无关接口 |
 | Q5 | 是否需要用户认证/多用户？权限分 Viewer/Trader/Risk Admin 如何落地（本地单人还是团队）？ | 决定 API 鉴权与前端权限模型 | 假定单用户本地部署，权限角色先建枚举，认证 Phase 3 细化 |

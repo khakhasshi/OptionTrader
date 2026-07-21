@@ -20,10 +20,34 @@ export interface CandidateLeg {
   expiry: string;
   strike: string;
   quantity: number;
+  quote: OptionQuoteProof;
+  broker_contract_id: string;
+  symbol: string;
+  exchange?: string;
+}
+
+export interface OptionQuoteProof {
+  bid: string;
+  ask: string;
+  bid_size: number;
+  ask_size: number;
+  occurred_at_utc: string;
+  delta: string;
+  gamma: string;
+  theta: string;
+  vega: string;
+  chain_snapshot_id: string;
+}
+
+export interface AdaptiveLimitPolicy {
+  initial_aggressiveness_bps: number;
+  max_attempts: number;
+  max_quote_age_ms: number;
+  max_spread_bps: number;
 }
 
 export interface CandidateTradePlan {
-  schema_version: "1.0";
+  schema_version: "1.1";
   plan_id: string;
   plan_hash: string;
   idempotency_key: string;
@@ -40,6 +64,9 @@ export interface CandidateTradePlan {
   rule_version: string;
   data_snapshot_ids: string[];
   manual_confirmation_required: true;
+  order_side: "BUY" | "SELL";
+  order_type: "MARKET" | "LIMIT" | "ADAPTIVE_LIMIT";
+  adaptive_limit?: AdaptiveLimitPolicy;
 }
 
 export interface ExecutionOrder {
@@ -105,16 +132,61 @@ function hash(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
+function parseQuote(value: unknown): OptionQuoteProof | null {
+  if (!record(value)) return null;
+  if (
+    !decimal(value.bid) ||
+    !decimal(value.ask) ||
+    !Number.isInteger(value.bid_size) ||
+    Number(value.bid_size) < 1 ||
+    !Number.isInteger(value.ask_size) ||
+    Number(value.ask_size) < 1 ||
+    !utc(value.occurred_at_utc) ||
+    !decimal(value.delta) ||
+    !decimal(value.gamma) ||
+    !decimal(value.theta) ||
+    !decimal(value.vega) ||
+    typeof value.chain_snapshot_id !== "string" ||
+    value.chain_snapshot_id.length === 0
+  ) return null;
+  return value as unknown as OptionQuoteProof;
+}
+
+function parseAdaptiveLimit(value: unknown): AdaptiveLimitPolicy | null {
+  if (!record(value)) return null;
+  const fields = [
+    value.initial_aggressiveness_bps,
+    value.max_attempts,
+    value.max_quote_age_ms,
+    value.max_spread_bps,
+  ];
+  if (!fields.every(Number.isInteger)) return null;
+  const policy = value as unknown as AdaptiveLimitPolicy;
+  if (
+    policy.initial_aggressiveness_bps < 0 || policy.initial_aggressiveness_bps > 10_000 ||
+    policy.max_attempts < 1 || policy.max_attempts > 10 ||
+    policy.max_quote_age_ms < 1 || policy.max_quote_age_ms > 5_000 ||
+    policy.max_spread_bps < 1 || policy.max_spread_bps > 10_000
+  ) return null;
+  return policy;
+}
+
 function parseLeg(value: unknown): CandidateLeg | null {
   if (!record(value)) return null;
   if (value.side !== "BUY" && value.side !== "SELL") return null;
   if (value.type !== "CALL" && value.type !== "PUT") return null;
+  const quote = parseQuote(value.quote);
   if (
     typeof value.contract_id !== "string" ||
     typeof value.expiry !== "string" ||
     !decimal(value.strike) ||
     !Number.isInteger(value.quantity) ||
-    Number(value.quantity) < 1
+    Number(value.quantity) < 1 ||
+    !quote ||
+    typeof value.symbol !== "string" ||
+    value.symbol.length === 0 ||
+    typeof value.broker_contract_id !== "string" || value.broker_contract_id.length === 0 ||
+    (value.exchange !== undefined && typeof value.exchange !== "string")
   )
     return null;
   return {
@@ -124,12 +196,17 @@ function parseLeg(value: unknown): CandidateLeg | null {
     expiry: value.expiry,
     strike: value.strike,
     quantity: Number(value.quantity),
+    quote,
+    broker_contract_id: value.broker_contract_id,
+    symbol: value.symbol,
+    ...(typeof value.exchange === "string" ? { exchange: value.exchange } : {}),
   };
 }
 
 function parsePlan(value: unknown): CandidateTradePlan | null {
-  if (!record(value) || value.schema_version !== "1.0") return null;
+  if (!record(value) || value.schema_version !== "1.1") return null;
   const legs = Array.isArray(value.legs) ? value.legs.map(parseLeg) : [];
+  const adaptive = value.adaptive_limit === undefined ? null : parseAdaptiveLimit(value.adaptive_limit);
   if (
     typeof value.plan_id !== "string" ||
     !hash(value.plan_hash) ||
@@ -149,11 +226,15 @@ function parsePlan(value: unknown): CandidateTradePlan | null {
     typeof value.rule_version !== "string" ||
     !Array.isArray(value.data_snapshot_ids) ||
     !value.data_snapshot_ids.every((item) => typeof item === "string") ||
-    value.manual_confirmation_required !== true
+    value.manual_confirmation_required !== true ||
+    (value.order_side !== "BUY" && value.order_side !== "SELL") ||
+    !["MARKET", "LIMIT", "ADAPTIVE_LIMIT"].includes(String(value.order_type)) ||
+    (value.order_type === "ADAPTIVE_LIMIT" && !adaptive) ||
+    (value.order_type !== "ADAPTIVE_LIMIT" && value.adaptive_limit !== undefined)
   )
     return null;
   return {
-    schema_version: "1.0",
+    schema_version: "1.1",
     plan_id: value.plan_id,
     plan_hash: value.plan_hash,
     idempotency_key: value.idempotency_key,
@@ -170,6 +251,11 @@ function parsePlan(value: unknown): CandidateTradePlan | null {
     rule_version: value.rule_version,
     data_snapshot_ids: value.data_snapshot_ids as string[],
     manual_confirmation_required: true,
+    order_side: value.order_side as CandidateTradePlan["order_side"],
+    order_type: value.order_type as CandidateTradePlan["order_type"],
+    ...(adaptive
+      ? { adaptive_limit: adaptive }
+      : {}),
   };
 }
 

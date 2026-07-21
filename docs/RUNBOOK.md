@@ -84,3 +84,23 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
    确认安全边界。实时 SessionHub 仍是每进程实例，完整横向扩展尚未认证，paper soak 前
    仍建议单 worker。若 Confirm 的 gRPC 已成功但投影写入失败，claim 不得自动释放；先调用
    GetOrder 对账并回填投影，确认 Rust 已停留在非 `AWAITING_CONFIRMATION` 状态。
+
+## Broker SDK 认证前启动
+
+Longbridge 原生 adapter 从 `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、
+`LONGBRIDGE_ACCESS_TOKEN` 读取凭证。不要把值写入 compose、日志或提交。当前 workflow 不会
+实例化真实 adapter；仅在独立 paper 认证进程中显式启用提交。
+
+IBKR sidecar 必须先在 TWS 或 Gateway 中启用 socket client、关闭 Read-Only API，并核对
+paper/live 端口。配置至少包含：
+
+```text
+OPTIONTRADER_IBKR_MODE=TWS|GATEWAY
+OPTIONTRADER_IBKR_PAPER=true
+OPTIONTRADER_IBKR_ACCOUNT=DU...
+OPTIONTRADER_IBKR_CLIENT_ID=37
+OPTIONTRADER_IBKR_SUBMISSION_ENABLED=false
+```
+
+必须观察到 `nextValidId` 与 managed account 匹配后才能进行只读对账。只有 paper Gate
+逐项签收时，才可在该认证进程把 submission 开关改为 true；主系统继续保持 false。

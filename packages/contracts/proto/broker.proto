@@ -16,6 +16,20 @@ enum OrderSide {
   ORDER_SIDE_SELL = 2;
 }
 
+enum BrokerOrderType {
+  BROKER_ORDER_TYPE_UNSPECIFIED = 0;
+  BROKER_ORDER_TYPE_MARKET = 1;
+  BROKER_ORDER_TYPE_LIMIT = 2;
+  BROKER_ORDER_TYPE_ADAPTIVE_LIMIT = 3;
+}
+
+enum AdaptivePriority {
+  ADAPTIVE_PRIORITY_UNSPECIFIED = 0;
+  ADAPTIVE_PRIORITY_PASSIVE = 1;
+  ADAPTIVE_PRIORITY_NORMAL = 2;
+  ADAPTIVE_PRIORITY_URGENT = 3;
+}
+
 enum BrokerHealth {
   BROKER_HEALTH_UNSPECIFIED = 0;
   BROKER_HEALTH_HEALTHY = 1;
@@ -53,6 +67,11 @@ message BrokerOrderLeg {
   string contract_id = 1;
   OrderSide side = 2;
   uint32 quantity = 3;
+  // Broker-native stable identifier: numeric conId for IBKR, SDK option symbol
+  // for Longbridge. contract_id remains the provider-neutral audit identity.
+  string broker_contract_id = 4;
+  string symbol = 5;
+  string exchange = 6;
 }
 
 message BrokerOrderSnapshot {
@@ -63,8 +82,12 @@ message BrokerOrderSnapshot {
   // Number of combo units; each leg quantity must equal this value.
   uint32 total_quantity = 5;
   uint32 filled_quantity = 6;
-  string limit_price = 7;
+  // Empty only for MARKET. ADAPTIVE_LIMIT carries the Rust-authority price.
+  string submitted_price = 7;
   repeated BrokerOrderLeg legs = 8;
+  OrderSide side = 9;
+  BrokerOrderType order_type = 10;
+  AdaptivePriority adaptive_priority = 11;
 }
 
 message FillSnapshot {
@@ -96,8 +119,12 @@ message SubmitBrokerOrderRequest {
   string plan_hash = 3;
   // Number of combo units; each leg quantity must equal this value.
   uint32 total_quantity = 4;
-  string limit_price = 5;
+  // Empty only for MARKET. Sidecars must not calculate or relax this price.
+  string submitted_price = 5;
   repeated BrokerOrderLeg legs = 6;
+  OrderSide side = 7;
+  BrokerOrderType order_type = 8;
+  AdaptivePriority adaptive_priority = 9;
 }
 
 message CancelBrokerOrderRequest {

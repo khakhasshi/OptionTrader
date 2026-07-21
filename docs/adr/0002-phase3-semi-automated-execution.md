@@ -25,7 +25,8 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
 5. `REPLAY/SHADOW` 永不调用 Broker；`PAPER/MANUAL_CONFIRM` 当前只调用确定性内存
    PaperBroker；`CONTROLLED_AUTO` 和真实提交保持禁用。
 6. Broker adapter 请求必须携带一至四条完整期权腿。每腿合约唯一、方向明确、数量与
-   组合单位一致；重复 idempotency key 只有在 hash、限价和全部腿完全一致时才返回原单。
+   组合单位一致；重复 idempotency key 只有在 hash、订单方向/类型、提交价和全部腿完全
+   一致时才返回原单。
 7. Longbridge 原生 Rust adapter 与 IBKR 本机 sidecar 服从同一领域语义。跨进程 sidecar
    契约定义在 `broker.proto`，覆盖账户、持仓、订单、成交、提交、撤单和对账；当前仅
    契约落地，不代表真实账户已连接或通过 paper 认证。
@@ -36,6 +37,11 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
    React 跨不可用窗口保留 last-known 锚点并拒绝旧版本、成交量回退或同版本冲突。
 10. Rust workflow 原地推进订单，不在可失败步骤前从账本 remove。内部不一致会保留订单
     并进入 `RECONCILE_PENDING`，以便后续人工或 Broker 对账恢复。
+11. CandidateTradePlan 1.1 为每条腿携带报价时间、bid/ask size、Greeks 和 chain snapshot
+    proof。Rust 在 Stage/Confirm 检查报价时效、点差、Greeks、策略白名单和美东开仓窗口；
+    市价新开仓固定拒绝。
+12. 自适应限价由 Rust 计算并受原计划保护价约束。adapter 只做确定性映射，不得用坏报价
+    退化到 touch/market。Longbridge 多腿 fail closed；IBKR 多腿使用 BAG。
 
 ## 当前限制
 
@@ -44,9 +50,10 @@ shadow 或 paper 执行。系统的第一目标仍是阻止错误交易，因此
 - capability 密文只有持有同一 Fernet 密钥的 API 实例可解密；缺失、错误或轮换不当均
   fail closed。密钥轮换与多密钥解密尚未实现。
 - Broker snapshot 尚未成为账户风险字段的动态来源；首个切片仍由启动配置注入。
-- 当前市场快照不能独立证明每条期权腿的 quote age、spread、Greeks 与 chain 完整性；
-  在这些证明进入 Rust 前，不得把本切片视为 live Gate。
-- 真实 Longbridge/IBKR adapter、订单事件流、持仓管理和保护性退出仍待后续切片。
+- Candidate 已携带并由 Rust 校验期权证明，但证明仍来自候选输入；Rust 直连的实时期权报价
+  权威源尚未落地，因此不能把该校验视为 live Gate。
+- Longbridge/IBKR SDK 映射已开始，订单/成交全量流、sidecar gRPC、自动重启对账、持仓管理
+  和保护性退出仍待后续切片。
 
 ## 后果
 

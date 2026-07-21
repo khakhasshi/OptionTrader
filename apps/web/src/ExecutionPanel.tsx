@@ -152,7 +152,7 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
             <div><span>State</span><strong className={`state state-${ticket.order.state.toLowerCase()}`}>{ticket.order.state}</strong></div>
             <div><span>Strategy</span><strong>{ticket.plan.strategy}</strong></div>
             <div><span>Broker / mode</span><strong>{ticket.plan.broker_id.toUpperCase()} · {ticket.plan.execution_mode}</strong></div>
-            <div><span>Limit / max loss</span><strong>{ticket.plan.limit_price} / {ticket.plan.max_loss}</strong></div>
+            <div><span>Order / protection</span><strong>{ticket.plan.order_type} · {ticket.plan.limit_price}</strong></div>
             <div><span>Filled</span><strong>{ticket.order.filled_quantity} / {ticket.order.total_quantity}</strong></div>
             <div><span>TTL</span><strong className={remaining === 0 ? "danger-text" : ""}><Clock3 size={14} aria-hidden="true" /> {remaining}s</strong></div>
           </div>
@@ -195,7 +195,8 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
             <h3 id="confirm-title">Confirm exact plan</h3>
             <dl>
               <div><dt>Strategy</dt><dd>{ticket.plan.strategy}</dd></div>
-              <div><dt>Limit</dt><dd>{ticket.plan.limit_price}</dd></div>
+              <div><dt>Order</dt><dd>{ticket.plan.order_side} {ticket.plan.order_type}</dd></div>
+              <div><dt>Protection</dt><dd>{ticket.plan.limit_price}</dd></div>
               <div><dt>Max loss</dt><dd>{ticket.plan.max_loss}</dd></div>
               <div><dt>Mode</dt><dd>{ticket.plan.execution_mode}</dd></div>
             </dl>

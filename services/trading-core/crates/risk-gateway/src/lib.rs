@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, Utc};
+use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +33,7 @@ pub enum BrokerId {
     Ibkr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StrategyKind {
     LongGamma,
     ShortPremium,
@@ -55,6 +56,27 @@ pub enum OrderSide {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerOrderType {
+    Market,
+    Limit,
+    AdaptiveLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionQuoteProof {
+    pub bid: Decimal,
+    pub ask: Decimal,
+    pub bid_size: u32,
+    pub ask_size: u32,
+    pub occurred_at: DateTime<Utc>,
+    pub delta: Decimal,
+    pub gamma: Decimal,
+    pub theta: Decimal,
+    pub vega: Decimal,
+    pub chain_snapshot_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionRight {
     Call,
     Put,
@@ -68,6 +90,10 @@ pub struct CandidateLeg {
     pub expiry: String,
     pub strike: Decimal,
     pub quantity: u32,
+    pub quote: OptionQuoteProof,
+    pub broker_contract_id: Option<String>,
+    pub symbol: String,
+    pub exchange: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +115,9 @@ pub struct CandidatePlan {
     pub data_snapshot_ids: Vec<String>,
     pub manual_confirmation_required: bool,
     pub hash_verified: bool,
+    pub order_side: OrderSide,
+    pub order_type: BrokerOrderType,
+    pub adaptive_policy_valid: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +168,7 @@ pub struct AuthorityState {
     pub cooldown_until: Option<DateTime<Utc>>,
     pub buying_power: Decimal,
     pub active_rule_version: String,
+    pub allowed_strategies: BTreeSet<StrategyKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +178,10 @@ pub struct RiskLimits {
     pub max_open_risk: Decimal,
     pub max_daily_trades: u32,
     pub max_contracts: u32,
+    pub max_quote_age_ms: u64,
+    pub max_option_spread_bps: u32,
+    pub entry_start_minute_et: u16,
+    pub entry_cutoff_minute_et: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +218,14 @@ pub enum RiskReasonCode {
     BuyingPowerInsufficient,
     MaxContractsExceeded,
     RuleVersionMismatch,
+    QuoteProofInvalid,
+    QuoteStale,
+    QuoteSpreadTooWide,
+    GreeksInvalid,
+    ChainSnapshotMismatch,
+    StrategyNotAllowed,
+    EntryWindowClosed,
+    MarketOrderBlocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +286,7 @@ fn candidate_shape_valid(plan: &CandidatePlan) -> bool {
         || plan.max_loss <= Decimal::ZERO
         || plan.expires_at <= plan.created_at
         || !plan.manual_confirmation_required
+        || !plan.adaptive_policy_valid
     {
         return false;
     }
@@ -260,7 +303,64 @@ fn candidate_shape_valid(plan: &CandidatePlan) -> bool {
                 && !leg.expiry.is_empty()
                 && leg.strike > Decimal::ZERO
                 && leg.quantity > 0
+                && !leg.symbol.is_empty()
+                && leg
+                    .broker_contract_id
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
         })
+}
+
+fn quote_reasons(input: &FinalRiskInput, reasons: &mut BTreeSet<RiskReasonCode>) {
+    for leg in &input.plan.legs {
+        let quote = &leg.quote;
+        if quote.bid <= Decimal::ZERO
+            || quote.ask <= Decimal::ZERO
+            || quote.bid > quote.ask
+            || quote.bid_size == 0
+            || quote.ask_size == 0
+            || quote.occurred_at > input.evaluated_at
+        {
+            reasons.insert(RiskReasonCode::QuoteProofInvalid);
+            continue;
+        }
+        let age = input.evaluated_at - quote.occurred_at;
+        if age.num_milliseconds() < 0
+            || age.num_milliseconds() as u64 > input.limits.max_quote_age_ms
+        {
+            reasons.insert(RiskReasonCode::QuoteStale);
+        }
+        let mid = (quote.bid + quote.ask) / Decimal::TWO;
+        if (quote.ask - quote.bid) * Decimal::from(10_000u32)
+            > mid * Decimal::from(input.limits.max_option_spread_bps)
+        {
+            reasons.insert(RiskReasonCode::QuoteSpreadTooWide);
+        }
+        if quote.delta.abs() > Decimal::ONE
+            || quote.gamma < Decimal::ZERO
+            || quote.gamma > Decimal::from(10u32)
+            || quote.vega < Decimal::ZERO
+            || quote.vega > Decimal::from(100u32)
+            || quote.theta.abs() > Decimal::from(100u32)
+        {
+            reasons.insert(RiskReasonCode::GreeksInvalid);
+        }
+        if quote.chain_snapshot_id.is_empty()
+            || !input
+                .plan
+                .data_snapshot_ids
+                .contains(&quote.chain_snapshot_id)
+        {
+            reasons.insert(RiskReasonCode::ChainSnapshotMismatch);
+        }
+    }
+}
+
+fn entry_window_open(input: &FinalRiskInput) -> bool {
+    let local = input.authority.market_time.with_timezone(&New_York);
+    let minute =
+        chrono::Timelike::hour(&local) as u16 * 60 + chrono::Timelike::minute(&local) as u16;
+    minute >= input.limits.entry_start_minute_et && minute < input.limits.entry_cutoff_minute_et
 }
 
 fn sell_is_hedged(plan: &CandidatePlan, sold: &CandidateLeg) -> bool {
@@ -274,6 +374,34 @@ fn sell_is_hedged(plan: &CandidatePlan, sold: &CandidateLeg) -> bool {
                 OptionRight::Put => hedge.strike < sold.strike,
             }
     })
+}
+
+fn strategy_and_broker_shape_valid(plan: &CandidatePlan) -> bool {
+    let strategy_valid = match plan.strategy {
+        StrategyKind::LongGamma => {
+            plan.order_side == OrderSide::Buy
+                && plan.legs.iter().all(|leg| leg.side == OrderSide::Buy)
+        }
+        StrategyKind::ShortPremium | StrategyKind::EventVolCrush => {
+            plan.order_side == OrderSide::Sell
+                && matches!(plan.legs.len(), 2 | 4)
+                && plan
+                    .legs
+                    .iter()
+                    .filter(|leg| leg.side == OrderSide::Sell)
+                    .all(|sold| sell_is_hedged(plan, sold))
+                && plan.legs.iter().any(|leg| leg.side == OrderSide::Sell)
+        }
+    };
+    let broker_valid = match plan.broker_id {
+        BrokerId::Longbridge => plan.legs.len() == 1,
+        BrokerId::Ibkr => plan.legs.iter().all(|leg| {
+            leg.broker_contract_id
+                .as_deref()
+                .is_some_and(|value| value.parse::<u64>().is_ok_and(|id| id > 0))
+        }),
+    };
+    strategy_valid && broker_valid
 }
 
 fn event_policy_allows(plan: &CandidatePlan, event: &EventRiskContext) -> bool {
@@ -352,6 +480,20 @@ pub fn final_risk_check(input: &FinalRiskInput) -> FinalRiskDecision {
     if input.authority.active_rule_version != input.plan.rule_version {
         reasons.insert(RiskReasonCode::RuleVersionMismatch);
     }
+    if !input
+        .authority
+        .allowed_strategies
+        .contains(&input.plan.strategy)
+    {
+        reasons.insert(RiskReasonCode::StrategyNotAllowed);
+    }
+    if !entry_window_open(input) {
+        reasons.insert(RiskReasonCode::EntryWindowClosed);
+    }
+    if input.plan.order_type == BrokerOrderType::Market {
+        reasons.insert(RiskReasonCode::MarketOrderBlocked);
+    }
+    quote_reasons(input, &mut reasons);
     if !input.event_context.available {
         reasons.insert(RiskReasonCode::EventContextUnavailable);
     }
@@ -364,7 +506,7 @@ pub fn final_risk_check(input: &FinalRiskInput) -> FinalRiskDecision {
     if input.evaluated_at >= input.plan.expires_at {
         reasons.insert(RiskReasonCode::PlanExpired);
     }
-    if !candidate_shape_valid(&input.plan) {
+    if !candidate_shape_valid(&input.plan) || !strategy_and_broker_shape_valid(&input.plan) {
         reasons.insert(RiskReasonCode::PlanInvalid);
     }
     if !input.plan.hash_verified || input.plan.plan_hash.len() != 64 {
@@ -429,6 +571,21 @@ mod tests {
                     expiry: "2026-07-20".into(),
                     strike: Decimal::from_str("500").unwrap(),
                     quantity: 1,
+                    quote: OptionQuoteProof {
+                        bid: Decimal::from_str("2.40").unwrap(),
+                        ask: Decimal::from_str("2.50").unwrap(),
+                        bid_size: 20,
+                        ask_size: 25,
+                        occurred_at: now() - Duration::milliseconds(200),
+                        delta: Decimal::from_str("0.52").unwrap(),
+                        gamma: Decimal::from_str("0.08").unwrap(),
+                        theta: Decimal::from_str("-0.12").unwrap(),
+                        vega: Decimal::from_str("0.05").unwrap(),
+                        chain_snapshot_id: "opt-1".into(),
+                    },
+                    broker_contract_id: Some("123456".into()),
+                    symbol: "QQQ".into(),
+                    exchange: Some("SMART".into()),
                 }],
                 limit_price: Decimal::from_str("2.50").unwrap(),
                 max_loss: Decimal::from_str("250").unwrap(),
@@ -436,6 +593,9 @@ mod tests {
                 data_snapshot_ids: vec!["mkt-1".into(), "opt-1".into()],
                 manual_confirmation_required: true,
                 hash_verified: true,
+                order_side: OrderSide::Buy,
+                order_type: BrokerOrderType::Limit,
+                adaptive_policy_valid: true,
             },
             event_context: EventRiskContext {
                 event_context_id: "event-1".into(),
@@ -469,6 +629,11 @@ mod tests {
                 cooldown_until: None,
                 buying_power: Decimal::from_str("100000").unwrap(),
                 active_rule_version: "rules-p3".into(),
+                allowed_strategies: BTreeSet::from([
+                    StrategyKind::LongGamma,
+                    StrategyKind::ShortPremium,
+                    StrategyKind::EventVolCrush,
+                ]),
             },
             evaluated_at: now() + Duration::seconds(1),
             limits: RiskLimits {
@@ -477,6 +642,10 @@ mod tests {
                 max_open_risk: Decimal::from_str("1000").unwrap(),
                 max_daily_trades: 3,
                 max_contracts: 2,
+                max_quote_age_ms: 120_000,
+                max_option_spread_bps: 3_000,
+                entry_start_minute_et: 9 * 60 + 35,
+                entry_cutoff_minute_et: 15 * 60 + 30,
             },
         }
     }
@@ -596,6 +765,31 @@ mod tests {
             RiskReasonCode::BuyingPowerInsufficient,
             RiskReasonCode::MaxContractsExceeded,
             RiskReasonCode::RuleVersionMismatch,
+        ] {
+            assert!(reasons.contains(&expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn option_proof_whitelist_window_and_market_order_fail_closed_independently() {
+        let mut value = input();
+        value.plan.legs[0].quote.occurred_at = now() - Duration::minutes(3);
+        value.plan.legs[0].quote.ask = Decimal::from_str("5.00").unwrap();
+        value.plan.legs[0].quote.delta = Decimal::from_str("1.2").unwrap();
+        value.plan.legs[0].quote.chain_snapshot_id = "unknown".into();
+        value.authority.allowed_strategies.clear();
+        value.authority.market_time = "2026-07-20T19:31:00Z".parse().unwrap();
+        value.evaluated_at = value.authority.market_time;
+        value.plan.order_type = BrokerOrderType::Market;
+        let reasons = final_risk_check(&value).reasons;
+        for expected in [
+            RiskReasonCode::QuoteStale,
+            RiskReasonCode::QuoteSpreadTooWide,
+            RiskReasonCode::GreeksInvalid,
+            RiskReasonCode::ChainSnapshotMismatch,
+            RiskReasonCode::StrategyNotAllowed,
+            RiskReasonCode::EntryWindowClosed,
+            RiskReasonCode::MarketOrderBlocked,
         ] {
             assert!(reasons.contains(&expected), "missing {expected:?}");
         }

@@ -7,8 +7,15 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+
+mod pricing;
+pub use pricing::{price_adaptive_limit, AdaptivePriceError};
+
+#[cfg(feature = "longbridge-sdk")]
+pub mod longbridge;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -63,19 +70,50 @@ pub enum OrderSide {
     Sell,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BrokerOrderType {
+    Market,
+    Limit,
+    AdaptiveLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteProof {
+    pub bid: Decimal,
+    pub ask: Decimal,
+    pub tick_size: Decimal,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdaptiveLimitPolicy {
+    /// Initial distance from mid toward the opposite touch, in basis points.
+    pub initial_aggressiveness_bps: u32,
+    pub max_attempts: u32,
+    pub max_quote_age_ms: u64,
+    pub max_spread_bps: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerOrderLeg {
     pub contract_id: String,
     pub side: OrderSide,
     pub quantity: u32,
+    pub broker_contract_id: Option<String>,
+    pub symbol: Option<String>,
+    pub exchange: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerOrderRequest {
     pub idempotency_key: String,
     pub plan_hash: String,
+    pub side: OrderSide,
+    pub order_type: BrokerOrderType,
     pub total_quantity: u32,
-    pub limit_price: Decimal,
+    /// Final price computed by the Rust authority. None is valid only for MKT.
+    pub submitted_price: Option<Decimal>,
     pub legs: Vec<BrokerOrderLeg>,
 }
 
@@ -85,9 +123,11 @@ pub struct BrokerOrder {
     pub idempotency_key: String,
     pub plan_hash: String,
     pub status: BrokerOrderStatus,
+    pub side: OrderSide,
+    pub order_type: BrokerOrderType,
     pub total_quantity: u32,
     pub filled_quantity: u32,
-    pub limit_price: Decimal,
+    pub submitted_price: Option<Decimal>,
     pub legs: Vec<BrokerOrderLeg>,
 }
 
@@ -97,6 +137,13 @@ pub enum BrokerError {
     NotReconciled,
     DuplicateConflict,
     InvalidQuantity,
+    InvalidOrderType,
+    InvalidPrice,
+    QuoteUnavailable,
+    QuoteStale,
+    QuoteCrossed,
+    SpreadTooWide,
+    UnsupportedOrderShape,
     OrderNotFound,
     TerminalOrder,
     LiveSubmissionDisabled,
@@ -233,7 +280,6 @@ impl BrokerAdapter for PaperBroker {
             .map(|leg| leg.contract_id.as_str())
             .collect();
         if request.total_quantity == 0
-            || request.limit_price <= Decimal::ZERO
             || request.legs.is_empty()
             || request.legs.len() > 4
             || contracts.len() != request.legs.len()
@@ -245,14 +291,22 @@ impl BrokerAdapter for PaperBroker {
         {
             return Err(BrokerError::InvalidQuantity);
         }
+        match (request.order_type, request.submitted_price) {
+            (BrokerOrderType::Market, None) => {}
+            (BrokerOrderType::Limit | BrokerOrderType::AdaptiveLimit, Some(price))
+                if price > Decimal::ZERO => {}
+            _ => return Err(BrokerError::InvalidPrice),
+        }
         if let Some(order_id) = self.order_by_key.get(&request.idempotency_key) {
             let existing = self
                 .orders
                 .get(order_id)
                 .expect("idempotency index references an order");
             if existing.plan_hash != request.plan_hash
+                || existing.side != request.side
+                || existing.order_type != request.order_type
                 || existing.total_quantity != request.total_quantity
-                || existing.limit_price != request.limit_price
+                || existing.submitted_price != request.submitted_price
                 || existing.legs != request.legs
             {
                 return Err(BrokerError::DuplicateConflict);
@@ -266,9 +320,11 @@ impl BrokerAdapter for PaperBroker {
             idempotency_key: request.idempotency_key.clone(),
             plan_hash: request.plan_hash,
             status: BrokerOrderStatus::Working,
+            side: request.side,
+            order_type: request.order_type,
             total_quantity: request.total_quantity,
             filled_quantity: 0,
-            limit_price: request.limit_price,
+            submitted_price: request.submitted_price,
             legs: request.legs,
         };
         self.order_by_key
@@ -373,18 +429,26 @@ mod tests {
         BrokerOrderRequest {
             idempotency_key: key.into(),
             plan_hash: hash.into(),
+            side: OrderSide::Sell,
+            order_type: BrokerOrderType::Limit,
             total_quantity: 2,
-            limit_price: Decimal::new(125, 2),
+            submitted_price: Some(Decimal::new(125, 2)),
             legs: vec![
                 BrokerOrderLeg {
                     contract_id: "QQQ-20260721-C-500".into(),
                     side: OrderSide::Sell,
                     quantity: 2,
+                    broker_contract_id: None,
+                    symbol: Some("QQQ".into()),
+                    exchange: None,
                 },
                 BrokerOrderLeg {
                     contract_id: "QQQ-20260721-C-501".into(),
                     side: OrderSide::Buy,
                     quantity: 2,
+                    broker_contract_id: None,
+                    symbol: Some("QQQ".into()),
+                    exchange: None,
                 },
             ],
         }
@@ -449,7 +513,7 @@ mod tests {
 
         let first = broker.submit(request("semantic-key", "same-hash")).unwrap();
         let mut changed = request("semantic-key", "same-hash");
-        changed.limit_price = Decimal::new(126, 2);
+        changed.submitted_price = Some(Decimal::new(126, 2));
         assert_eq!(broker.submit(changed), Err(BrokerError::DuplicateConflict));
         assert_eq!(
             broker.orders().first().unwrap().broker_order_id,

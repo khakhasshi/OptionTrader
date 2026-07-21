@@ -38,10 +38,34 @@ class CandidateLeg(StrictModel):
     expiry: str
     strike: DecimalString
     quantity: int = Field(ge=1)
+    quote: OptionQuoteProof
+    broker_contract_id: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    exchange: str | None = Field(default=None, min_length=1)
+
+
+class OptionQuoteProof(StrictModel):
+    bid: DecimalString
+    ask: DecimalString
+    bid_size: int = Field(ge=1)
+    ask_size: int = Field(ge=1)
+    occurred_at_utc: UtcTimestamp
+    delta: DecimalString
+    gamma: DecimalString
+    theta: DecimalString
+    vega: DecimalString
+    chain_snapshot_id: str = Field(min_length=1)
+
+
+class AdaptiveLimitPolicy(StrictModel):
+    initial_aggressiveness_bps: int = Field(ge=0, le=10_000)
+    max_attempts: int = Field(ge=1, le=10)
+    max_quote_age_ms: int = Field(ge=1, le=5_000)
+    max_spread_bps: int = Field(ge=1, le=10_000)
 
 
 class CandidateTradePlan(StrictModel):
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.1"]
     plan_id: str = Field(min_length=1)
     plan_hash: Hash
     idempotency_key: str = Field(min_length=1)
@@ -63,6 +87,9 @@ class CandidateTradePlan(StrictModel):
     rule_version: str = Field(min_length=1)
     data_snapshot_ids: list[str] = Field(min_length=1)
     manual_confirmation_required: Literal[True]
+    order_side: Literal["BUY", "SELL"]
+    order_type: Literal["MARKET", "LIMIT", "ADAPTIVE_LIMIT"]
+    adaptive_limit: AdaptiveLimitPolicy | None = None
 
     @model_validator(mode="after")
     def identifiers_and_times_are_consistent(self) -> CandidateTradePlan:
@@ -76,6 +103,12 @@ class CandidateTradePlan(StrictModel):
             raise ValueError("candidate contract ids must be unique")
         if len({leg.quantity for leg in self.legs}) != 1:
             raise ValueError("all candidate legs must use the same combo-unit quantity")
+        if self.order_type == "ADAPTIVE_LIMIT" and self.adaptive_limit is None:
+            raise ValueError("adaptive-limit candidate requires pricing policy")
+        if self.order_type != "ADAPTIVE_LIMIT" and self.adaptive_limit is not None:
+            raise ValueError("adaptive pricing policy is only valid for adaptive limit")
+        if any(leg.quote.chain_snapshot_id not in self.data_snapshot_ids for leg in self.legs):
+            raise ValueError("every option chain snapshot must be part of plan proof")
         return self
 
 
@@ -102,6 +135,14 @@ RiskReason = Literal[
     "BUYING_POWER_INSUFFICIENT",
     "MAX_CONTRACTS_EXCEEDED",
     "RULE_VERSION_MISMATCH",
+    "QUOTE_PROOF_INVALID",
+    "QUOTE_STALE",
+    "QUOTE_SPREAD_TOO_WIDE",
+    "GREEKS_INVALID",
+    "CHAIN_SNAPSHOT_MISMATCH",
+    "STRATEGY_NOT_ALLOWED",
+    "ENTRY_WINDOW_CLOSED",
+    "MARKET_ORDER_BLOCKED",
 ]
 
 OrderState = Literal[

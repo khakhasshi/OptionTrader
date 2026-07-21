@@ -13,14 +13,46 @@
         "contract_id": { "type": "string", "minLength": 1 },
         "expiry": { "type": "string", "format": "date" },
         "strike": { "$ref": "common.json#/$defs/decimal" },
-        "quantity": { "type": "integer", "minimum": 1 }
+        "quantity": { "type": "integer", "minimum": 1 },
+        "quote": { "$ref": "#/$defs/quoteProof" },
+        "broker_contract_id": { "type": "string", "minLength": 1 },
+        "symbol": { "type": "string", "minLength": 1 },
+        "exchange": { "type": "string", "minLength": 1 }
       },
-      "required": ["side", "type", "contract_id", "expiry", "strike", "quantity"],
+      "required": ["side", "type", "contract_id", "expiry", "strike", "quantity", "quote", "broker_contract_id", "symbol"],
+      "additionalProperties": false
+    },
+    "quoteProof": {
+      "type": "object",
+      "properties": {
+        "bid": { "$ref": "common.json#/$defs/decimal" },
+        "ask": { "$ref": "common.json#/$defs/decimal" },
+        "bid_size": { "type": "integer", "minimum": 1 },
+        "ask_size": { "type": "integer", "minimum": 1 },
+        "occurred_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "delta": { "$ref": "common.json#/$defs/decimal" },
+        "gamma": { "$ref": "common.json#/$defs/decimal" },
+        "theta": { "$ref": "common.json#/$defs/decimal" },
+        "vega": { "$ref": "common.json#/$defs/decimal" },
+        "chain_snapshot_id": { "type": "string", "minLength": 1 }
+      },
+      "required": ["bid", "ask", "bid_size", "ask_size", "occurred_at_utc", "delta", "gamma", "theta", "vega", "chain_snapshot_id"],
+      "additionalProperties": false
+    },
+    "adaptiveLimit": {
+      "type": "object",
+      "properties": {
+        "initial_aggressiveness_bps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "max_quote_age_ms": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "max_spread_bps": { "type": "integer", "minimum": 1, "maximum": 10000 }
+      },
+      "required": ["initial_aggressiveness_bps", "max_attempts", "max_quote_age_ms", "max_spread_bps"],
       "additionalProperties": false
     }
   },
   "properties": {
-    "schema_version": { "type": "string", "const": "1.0" },
+    "schema_version": { "type": "string", "const": "1.1" },
     "plan_id": { "type": "string" },
     "plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "idempotency_key": { "type": "string" },
@@ -42,12 +74,22 @@
     "rule_version": { "type": "string" },
     "data_snapshot_ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
     "manual_confirmation_required": { "type": "boolean", "const": true }
+    ,"order_side": { "$ref": "common.json#/$defs/orderSide" }
+    ,"order_type": { "type": "string", "enum": ["MARKET", "LIMIT", "ADAPTIVE_LIMIT"] }
+    ,"adaptive_limit": { "$ref": "#/$defs/adaptiveLimit" }
   },
   "required": [
     "schema_version", "plan_id", "plan_hash", "idempotency_key", "session_id",
     "signal_id", "broker_id", "strategy", "execution_mode", "created_at_utc", "legs",
     "limit_price", "max_loss", "expires_at_utc", "rule_version", "data_snapshot_ids",
-    "manual_confirmation_required"
+    "manual_confirmation_required", "order_side", "order_type"
+  ],
+  "allOf": [
+    {
+      "if": { "properties": { "order_type": { "const": "ADAPTIVE_LIMIT" } }, "required": ["order_type"] },
+      "then": { "required": ["adaptive_limit"] },
+      "else": { "not": { "required": ["adaptive_limit"] } }
+    }
   ],
   "additionalProperties": false
 }

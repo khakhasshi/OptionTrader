@@ -3,6 +3,12 @@ name = "broker"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["longbridge-sdk"]
+longbridge-sdk = ["dep:longbridge"]
+
 [dependencies]
+chrono.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
+longbridge = { version = "4.3.3", features = ["blocking"], optional = true }

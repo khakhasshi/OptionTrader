@@ -41,6 +41,25 @@ describe("parseExecutionTicket", () => {
     ).toBeNull();
   });
 
+  it("rejects legacy or incomplete quote and adaptive contracts", () => {
+    expect(
+      parseExecutionTicket({ ...TICKET, plan: { ...TICKET.plan, schema_version: "1.0" } }),
+    ).toBeNull();
+    const { quote: _quote, ...legWithoutQuote } = TICKET.plan.legs[0];
+    expect(
+      parseExecutionTicket({
+        ...TICKET,
+        plan: { ...TICKET.plan, legs: [legWithoutQuote] },
+      }),
+    ).toBeNull();
+    expect(
+      parseExecutionTicket({
+        ...TICKET,
+        plan: { ...TICKET.plan, order_type: "ADAPTIVE_LIMIT" },
+      }),
+    ).toBeNull();
+  });
+
   it("rejects stale or conflicting order projections", () => {
     const current = { ...TICKET.order, state: "WORKING" as const, state_version: 4, filled_quantity: 1 };
     expect(isNewerExecutionOrder(current, { ...TICKET.order, state_version: 1 })).toBe(false);

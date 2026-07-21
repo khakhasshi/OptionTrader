@@ -16,6 +16,11 @@ def test_duplicated_boundary_enums_remain_wire_compatible() -> None:
     assert int(broker_pb2.BROKER_ID_IBKR) == int(execution_pb2.BROKER_ID_IBKR)
     assert int(broker_pb2.ORDER_SIDE_BUY) == int(execution_pb2.ORDER_SIDE_BUY)
     assert int(broker_pb2.ORDER_SIDE_SELL) == int(execution_pb2.ORDER_SIDE_SELL)
+    assert int(broker_pb2.BROKER_ORDER_TYPE_MARKET) == int(execution_pb2.BROKER_ORDER_TYPE_MARKET)
+    assert int(broker_pb2.BROKER_ORDER_TYPE_LIMIT) == int(execution_pb2.BROKER_ORDER_TYPE_LIMIT)
+    assert int(broker_pb2.BROKER_ORDER_TYPE_ADAPTIVE_LIMIT) == int(
+        execution_pb2.BROKER_ORDER_TYPE_ADAPTIVE_LIMIT
+    )
 
 
 def test_broker_order_round_trip_preserves_all_combo_legs() -> None:
@@ -24,17 +29,26 @@ def test_broker_order_round_trip_preserves_all_combo_legs() -> None:
         idempotency_key="submit_abc",
         plan_hash="a" * 64,
         total_quantity=2,
-        limit_price="1.25",
+        submitted_price="1.25",
+        side=broker_pb2.ORDER_SIDE_SELL,
+        order_type=broker_pb2.BROKER_ORDER_TYPE_ADAPTIVE_LIMIT,
+        adaptive_priority=broker_pb2.ADAPTIVE_PRIORITY_NORMAL,
         legs=[
             broker_pb2.BrokerOrderLeg(
                 contract_id="QQQ-20260721-C-500",
                 side=broker_pb2.ORDER_SIDE_SELL,
                 quantity=2,
+                broker_contract_id="101",
+                symbol="QQQ",
+                exchange="SMART",
             ),
             broker_pb2.BrokerOrderLeg(
                 contract_id="QQQ-20260721-C-501",
                 side=broker_pb2.ORDER_SIDE_BUY,
                 quantity=2,
+                broker_contract_id="102",
+                symbol="QQQ",
+                exchange="SMART",
             ),
         ],
     )
