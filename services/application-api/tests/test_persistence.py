@@ -9,7 +9,7 @@ without a live Postgres.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 import json
 import os
@@ -33,10 +33,16 @@ from app.persistence import (
     claim_outbox_batch,
     claim_confirmation_intent,
     confirmation_capabilities,
+    daily_reviews,
     build_signal_contract,
     build_signal_rows,
     event_contexts,
     fills,
+    get_llm_review,
+    get_llm_review_by_request_id,
+    latest_daily_review,
+    llm_reviews,
+    list_rule_hypotheses,
     metadata,
     mark_outbox_published,
     order_events,
@@ -47,12 +53,23 @@ from app.persistence import (
     persist_order_projection,
     persist_signal,
     persist_event_context,
+    persist_llm_review,
     persist_staged_candidate,
     restorable_execution_workflow,
     reschedule_outbox_message,
     risk_decisions,
+    rule_hypotheses,
     rotate_confirmation_capabilities,
     signals,
+    verified_initial_risk_context,
+)
+from app.llm.models import (
+    DailyReviewDetail,
+    LLMReview,
+    LLMReviewRequest,
+    ProviderMetadata,
+    ReviewContext,
+    RuleHypothesis,
 )
 from app.grpc_gen import broker_pb2, execution_pb2
 from app.persistence import repository
@@ -295,6 +312,7 @@ def engine() -> Engine:
         cur.execute("ATTACH DATABASE ':memory:' AS audit")
         cur.execute("ATTACH DATABASE ':memory:' AS events")
         cur.execute("ATTACH DATABASE ':memory:' AS risk")
+        cur.execute("ATTACH DATABASE ':memory:' AS review")
         cur.close()
 
     metadata.create_all(eng)
@@ -387,6 +405,151 @@ def test_execution_persistence_is_atomic_idempotent_and_encrypts_token(
     assert order_row["status"] == "AWAITING_CONFIRMATION"
     assert order_row["state_version"] == 1
     assert outbox_topics == {"candidate.staged", "risk.decision_recorded", "order.staged"}
+
+
+def _llm_request() -> LLMReviewRequest:
+    return LLMReviewRequest.model_validate(
+        json.loads(
+            (_ROOT / "packages/contracts/fixtures/llm_review_request.sample.json").read_text()
+        )
+    )
+
+
+def _llm_review() -> LLMReview:
+    return LLMReview.model_validate(
+        json.loads((_ROOT / "packages/contracts/fixtures/llm_review.completed.json").read_text())
+    )
+
+
+def test_llm_review_persistence_is_atomic_idempotent_and_audited(engine: Engine) -> None:
+    request = _llm_request()
+    review = _llm_review()
+    assert persist_llm_review(engine, request, review) is True
+    assert persist_llm_review(engine, request, review) is False
+
+    with engine.connect() as conn:
+        stored = conn.execute(select(llm_reviews)).mappings().one()
+        audit = (
+            conn.execute(select(audit_events).where(audit_events.c.entity_id == review.review_id))
+            .mappings()
+            .one()
+        )
+        outbox = (
+            conn.execute(
+                select(outbox_events).where(outbox_events.c.aggregate_id == review.review_id)
+            )
+            .mappings()
+            .one()
+        )
+    assert stored["review_status"] == "COMPLETED"
+    assert stored["input_hash"] == review.provider.input_hash
+    assert audit["payload"]["input_summary"]["prompt_version"] == "phase4-review-v3"
+    assert outbox["topic"] == "llm.review_recorded"
+    assert get_llm_review(engine, review.review_id) == review
+    assert get_llm_review_by_request_id(engine, review.request_id) == review
+
+
+def test_pre_execution_review_reads_authoritative_initial_risk(
+    engine: Engine, confirmation_cipher: ConfirmationCipher
+) -> None:
+    plan, staged = _staged_models()
+    assert persist_staged_candidate(engine, plan, staged, confirmation_cipher)
+    authoritative = verified_initial_risk_context(engine, plan.plan_id, plan.plan_hash)
+    assert authoritative == (plan, staged.initial_risk_decision)
+    assert verified_initial_risk_context(engine, plan.plan_id, "f" * 64) is None
+
+
+def test_post_market_review_creates_daily_review_and_research_only_queue(engine: Engine) -> None:
+    request = LLMReviewRequest(
+        schema_version="1.0",
+        request_id="post_market_request_001",
+        correlation_id="session_2026-07-20",
+        causation_id=None,
+        session_id="session_2026-07-20",
+        occurred_at_utc="2026-07-20T20:01:00Z",
+        received_at_utc="2026-07-20T20:01:01Z",
+        source="application-service",
+        source_sequence=99,
+        rule_version="rules_p3_1.0.0",
+        stage="POST_MARKET",
+        trading_date="2026-07-20",
+        plan_id=None,
+        plan_hash=None,
+        context=ReviewContext(
+            session_metrics={"trades": 1, "realized_pnl": "-10.00"},
+            deterministic_summary="One fully audited paper trade.",
+        ),
+        source_refs=[],
+    )
+    hypothesis = RuleHypothesis(
+        title="Test a narrower entry window",
+        rationale="One audited observation suggests a research question.",
+        validation_plan="Run cost-aware walk-forward and out-of-sample replay.",
+        evidence_ids=[],
+        status="RESEARCH_ONLY",
+        activation_allowed=False,
+    )
+    review = LLMReview(
+        schema_version="1.0",
+        review_id="post_market_review_001",
+        request_id=request.request_id,
+        correlation_id=request.correlation_id,
+        causation_id=None,
+        session_id=request.session_id,
+        occurred_at_utc=request.occurred_at_utc,
+        received_at_utc="2026-07-20T20:01:03Z",
+        source="llm-intelligence-layer",
+        source_sequence=request.source_sequence,
+        rule_version=request.rule_version,
+        stage="POST_MARKET",
+        trading_date=request.trading_date,
+        plan_id=None,
+        plan_hash=None,
+        review_status="COMPLETED",
+        summary="The loss respected the deterministic stop.",
+        decision_support="Review only.",
+        sop_alignment="Aligned",
+        risk_notes=[],
+        invalidations=[],
+        recommended_action="Review Only",
+        confidence=0.6,
+        rule_references=[],
+        evidence_citations=[],
+        daily_review=DailyReviewDetail(
+            best_trade=None,
+            worst_trade="One stopped paper trade.",
+            good_losses=["The stop was respected."],
+            bad_losses=[],
+            sop_violations=[],
+            loss_attribution=[],
+            one_change_tomorrow="Do not change production rules from one sample.",
+        ),
+        rule_hypotheses=[hypothesis],
+        unavailable_reason_code=None,
+        provider=ProviderMetadata(
+            provider="deepseek-openai",
+            model="deepseek-v4-flash",
+            provider_request_id="provider-post-1",
+            prompt_version="phase4-review-v3",
+            input_hash="d" * 64,
+            latency_ms=50,
+            attempts=1,
+            cache_hit=False,
+            input_tokens=500,
+            output_tokens=200,
+            estimated_cost_usd="0.000126",
+        ),
+        source_refs=[],
+    )
+    assert persist_llm_review(engine, request, review)
+    assert latest_daily_review(engine, date(2026, 7, 20)) == review
+    hypotheses = list_rule_hypotheses(engine)
+    assert len(hypotheses) == 1
+    assert hypotheses[0].status == "PENDING_RESEARCH"
+    assert hypotheses[0].activation_allowed is False
+    with engine.connect() as conn:
+        assert conn.execute(select(daily_reviews)).mappings().one()["review_id"] == review.review_id
+        assert conn.execute(select(rule_hypotheses)).mappings().one()["activation_allowed"] is False
 
 
 def test_outbox_is_transactional_leased_and_at_least_once(engine: Engine) -> None:

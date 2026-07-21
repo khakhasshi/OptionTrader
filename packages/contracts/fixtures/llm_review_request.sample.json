@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "request_id": "llm_request_demo_001",
+  "correlation_id": "plan_demo_001",
+  "causation_id": "risk_plan_demo_001",
+  "session_id": "session_2026-07-20",
+  "occurred_at_utc": "2026-07-20T14:30:01Z",
+  "received_at_utc": "2026-07-20T14:30:02Z",
+  "source": "application-service",
+  "source_sequence": 1,
+  "rule_version": "rules_p3_1.0.0",
+  "stage": "PRE_EXECUTION",
+  "trading_date": "2026-07-20",
+  "plan_id": "plan_demo_001",
+  "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "context": {
+    "market_snapshot": null,
+    "option_snapshot": null,
+    "regime_state": { "regime": "Trend" },
+    "vol_state": { "iv_hv_state": "IV Fair" },
+    "risk_state": null,
+    "data_health": { "status": "HEALTHY" },
+    "broker_health": { "status": "HEALTHY", "reconciled": true },
+    "active_playbook": { "strategy": "LongGamma" },
+    "candidate_trade_plan": { "plan_id": "plan_demo_001", "manual_confirmation_required": true },
+    "initial_risk_decision": { "decision": "APPROVED", "decision_id": "risk_plan_demo_001" },
+    "event_context": null,
+    "recent_signals": [],
+    "recent_trades": [],
+    "session_metrics": null,
+    "deterministic_summary": "Initial Risk Check 已通过；等待人工确认与 Rust Final Risk Check。"
+  },
+  "source_refs": [{
+    "source_id": "plan_demo_001",
+    "source_type": "candidate_trade_plan",
+    "source": "application-service",
+    "occurred_at_utc": "2026-07-20T14:30:00Z",
+    "raw_ref": "postgresql://trading/candidate_trade_plans/plan_demo_001",
+    "confidence": 1.0
+  }]
+}

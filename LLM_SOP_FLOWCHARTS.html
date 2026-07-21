@@ -538,7 +538,11 @@ flowchart LR
         <pre><code>{
   "schema_version": "1.0",
   "review_id": "llm_review_20260720_094501",
+  "request_id": "llm_request_20260720_094501",
+  "session_id": "session_20260720",
+  "stage": "PRE_EXECUTION",
   "plan_id": "plan_20260720_094501",
+  "plan_hash": "64-char-lowercase-sha256",
   "review_status": "COMPLETED | UNAVAILABLE | INVALID",
   "summary": "当前市场状态解释",
   "decision_support": "支持或反对当前候选交易的理由",
@@ -552,13 +556,20 @@ flowchart LR
     "失效条件 2"
   ],
   "recommended_action": "Proceed | Wait | Cancel | Reduce Risk | Review Only",
-  "confidence": 0.0
+  "confidence": 0.0,
+  "evidence_citations": [],
+  "daily_review": null,
+  "rule_hypotheses": [],
+  "unavailable_reason_code": null,
+  "provider": {},
+  "source_refs": []
 }</code></pre>
       </div>
+      <p>完整字段和阶段互斥约束以 <code>packages/contracts/jsonschema/llm_review.json</code> 为准；任何无效结果必须降级为 Review Only，研究假设不得直接激活。</p>
     </section>
 
     <footer>
-      文档版本：v0.3。风险声明：本文档用于系统设计和研究，不构成投资建议。QQQ 日内期期权尤其是 0DTE 期权具有高 Gamma、
+      文档版本：v0.4。风险声明：本文档用于系统设计和研究，不构成投资建议。QQQ 日内期权尤其是 0DTE 期权具有高 Gamma、
       高 Theta 和高滑点风险。LLM 输出只能作为辅助解释，不应作为独立交易依据。
     </footer>
   </main>

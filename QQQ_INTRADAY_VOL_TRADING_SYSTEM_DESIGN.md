@@ -628,9 +628,13 @@ LLM 输出必须结构化：
 
 ```json
 {
-  "schema_version": "1.2",
+  "schema_version": "1.0",
   "review_id": "llm_review_20260720_094501",
+  "request_id": "llm_request_20260720_094501",
+  "session_id": "session_20260720",
+  "stage": "PRE_EXECUTION",
   "plan_id": "plan_20260720_094501",
+  "plan_hash": "64-char-lowercase-sha256",
   "review_status": "COMPLETED | UNAVAILABLE | INVALID",
   "summary": "当前市场状态解释",
   "decision_support": "支持或反对当前候选交易的理由",
@@ -644,9 +648,20 @@ LLM 输出必须结构化：
     "失效条件 2"
   ],
   "recommended_action": "Proceed | Wait | Cancel | Reduce Risk | Review Only",
-  "confidence": 0.0
+  "confidence": 0.0,
+  "evidence_citations": [],
+  "daily_review": null,
+  "rule_hypotheses": [],
+  "unavailable_reason_code": null,
+  "provider": {},
+  "source_refs": []
 }
 ```
+
+完整权威字段与阶段互斥约束以 `packages/contracts/jsonschema/llm_review.json` 为准。
+`POST_MARKET` 才允许 `daily_review`；研究假设只能来自 `POST_MARKET` 或
+`RULE_HYPOTHESIS`，且 `activation_allowed=false`。缺失配置、超时、限流、预算耗尽或
+任何 Schema/来源/阶段错误都必须返回 `Review Only`、`confidence=0`。
 
 LLM 置信度约束：
 
@@ -654,7 +669,7 @@ LLM 置信度约束：
 confidence 只能影响提醒优先级，不能单独触发交易。
 只有 Python Strategy Engine + Rust Initial Risk Check 同时通过时，候选订单才允许进入人工确认。
 人工确认后仍必须通过 Rust Final Risk Check 才能提交 Broker。
-LLM 若输出 Cancel，应取消或等待；若输出 Reduce Risk，Python 必须创建新 plan_id 与 plan hash，并重新执行 Initial Risk Check。
+LLM 若输出 Cancel/Reduce Risk，只形成审阅建议，不得调用 Broker 撤单或修改原计划；操作者或确定性编排采纳 Reduce Risk 时必须创建新 plan_id 与 plan hash，并重新执行 Initial Risk Check。
 LLM 若超时、不可用或输出不符合 Schema，记录为 Review Unavailable；核心规则流程继续，且不得阻塞减仓和平仓。
 ```
 

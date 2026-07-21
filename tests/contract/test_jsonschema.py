@@ -162,6 +162,90 @@ def test_phase3_execution_fixtures_validate(schema_name, fixture_name):
     assert list(validator.iter_errors(fixture)) == []
 
 
+@pytest.mark.parametrize(
+    ("schema_name", "fixture_name"),
+    [
+        ("llm_review_request.json", "llm_review_request.sample.json"),
+        ("llm_review.json", "llm_review.completed.json"),
+        ("llm_review.json", "llm_review.unavailable.json"),
+    ],
+)
+def test_phase4_llm_fixtures_validate(schema_name, fixture_name):
+    reg, res = _registry()
+    fixture = json.load(open(os.path.join(FIXTURE_DIR, fixture_name)))
+    validator = Draft202012Validator(res[schema_name].contents, registry=reg)
+    assert list(validator.iter_errors(fixture)) == []
+
+
+def test_non_completed_llm_review_is_forced_inert():
+    reg, res = _registry()
+    fixture = json.load(open(os.path.join(FIXTURE_DIR, "llm_review.unavailable.json")))
+    fixture["recommended_action"] = "Proceed"
+    fixture["confidence"] = 0.9
+    validator = Draft202012Validator(res["llm_review.json"].contents, registry=reg)
+    assert len(list(validator.iter_errors(fixture))) >= 2
+
+
+def test_llm_review_rejects_negative_estimated_cost():
+    reg, res = _registry()
+    fixture = json.load(open(os.path.join(FIXTURE_DIR, "llm_review.completed.json")))
+    fixture["provider"]["estimated_cost_usd"] = "-0.01"
+    validator = Draft202012Validator(res["llm_review.json"].contents, registry=reg)
+    assert list(validator.iter_errors(fixture))
+
+
+def test_pre_execution_llm_request_requires_plan_identity():
+    reg, res = _registry()
+    fixture = json.load(open(os.path.join(FIXTURE_DIR, "llm_review_request.sample.json")))
+    fixture["plan_id"] = None
+    fixture["plan_hash"] = None
+    validator = Draft202012Validator(res["llm_review_request.json"].contents, registry=reg)
+    assert len(list(validator.iter_errors(fixture))) >= 2
+
+
+@pytest.mark.parametrize("invalid_field", ["daily_review", "rule_hypotheses"])
+def test_non_post_market_review_rejects_generated_artifacts(invalid_field):
+    reg, res = _registry()
+    fixture = json.load(open(os.path.join(FIXTURE_DIR, "llm_review.completed.json")))
+    fixture["stage"] = "PRE_MARKET"
+    fixture["plan_id"] = None
+    fixture["plan_hash"] = None
+    fixture["recommended_action"] = "Review Only"
+    if invalid_field == "daily_review":
+        fixture["daily_review"] = {
+            "best_trade": None,
+            "worst_trade": None,
+            "good_losses": [],
+            "bad_losses": [],
+            "sop_violations": [],
+            "loss_attribution": [],
+            "one_change_tomorrow": "Keep deterministic controls unchanged.",
+        }
+    else:
+        fixture["rule_hypotheses"] = [
+            {
+                "title": "research only",
+                "rationale": "fixture",
+                "validation_plan": "walk-forward",
+                "evidence_ids": [],
+                "status": "RESEARCH_ONLY",
+                "activation_allowed": False,
+            }
+        ]
+    validator = Draft202012Validator(res["llm_review.json"].contents, registry=reg)
+    assert list(validator.iter_errors(fixture))
+
+
+def test_proceed_is_restricted_to_pre_execution_review():
+    reg, res = _registry()
+    fixture = json.load(open(os.path.join(FIXTURE_DIR, "llm_review.completed.json")))
+    fixture["stage"] = "INTRADAY"
+    fixture["plan_id"] = None
+    fixture["plan_hash"] = None
+    validator = Draft202012Validator(res["llm_review.json"].contents, registry=reg)
+    assert list(validator.iter_errors(fixture))
+
+
 def test_candidate_requires_manual_confirmation_and_snapshot_proof():
     reg, res = _registry()
     fixture = json.load(open(os.path.join(FIXTURE_DIR, "candidate_trade_plan.sample.json")))

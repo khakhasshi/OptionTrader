@@ -31,13 +31,16 @@ from app.persistence.tables import (
     broker_snapshots,
     candidate_trade_plans,
     confirmation_capabilities,
+    daily_reviews,
     event_contexts,
     fills,
+    llm_reviews,
     order_events,
     orders,
     outbox_events,
     position_snapshots,
     risk_decisions,
+    rule_hypotheses,
     signals,
 )
 from app.grpc_gen import broker_pb2
@@ -45,7 +48,13 @@ from app.events import EventContext
 from app.regime import RegimeState
 from app.strategy import StrategyDecision
 from app.vol import VolState
-from app.trading.models import CandidateTradePlan, ExecutionOrder, StageCandidateResult
+from app.llm.models import LLMReview, LLMReviewRequest, RuleHypothesisRecord
+from app.trading.models import (
+    CandidateTradePlan,
+    ExecutionOrder,
+    RiskDecision,
+    StageCandidateResult,
+)
 from app.trading.capability import ConfirmationCipher
 
 
@@ -1301,12 +1310,312 @@ def restorable_execution_workflow(
     return restored
 
 
+def verified_initial_risk_context(
+    engine: Engine, plan_id: str, plan_hash: str
+) -> tuple[CandidateTradePlan, RiskDecision] | None:
+    """Return immutable authoritative inputs only when Initial Risk approved.
+
+    The caller-supplied LLM context is never trusted for this gate. Both payloads
+    are read from the Phase 3 transactional stage record and revalidated against
+    the strict execution contracts before they may be sent to a provider.
+    """
+    query = (
+        select(
+            candidate_trade_plans.c.payload.label("plan_payload"),
+            risk_decisions.c.payload.label("risk_payload"),
+        )
+        .join(risk_decisions, risk_decisions.c.plan_id == candidate_trade_plans.c.plan_id)
+        .where(
+            candidate_trade_plans.c.plan_id == plan_id,
+            candidate_trade_plans.c.plan_hash == plan_hash,
+            risk_decisions.c.decision == "APPROVED",
+        )
+        .order_by(risk_decisions.c.id.desc())
+        .limit(1)
+    )
+    with engine.connect() as conn:
+        row = conn.execute(query).mappings().one_or_none()
+    if row is None:
+        return None
+    plan = CandidateTradePlan.model_validate(row["plan_payload"])
+    decision = RiskDecision.model_validate(row["risk_payload"])
+    if (
+        plan.plan_id != plan_id
+        or plan.plan_hash != plan_hash
+        or decision.plan_id != plan_id
+        or decision.plan_hash != plan_hash
+        or decision.decision != "APPROVED"
+    ):
+        raise ValueError("durable Initial Risk context is inconsistent")
+    return plan, decision
+
+
+def assert_review_store_available(engine: Engine) -> None:
+    """Prove the review table is reachable before spending provider budget."""
+    with engine.connect() as conn:
+        conn.execute(select(llm_reviews.c.review_id).limit(1)).first()
+
+
+def persist_llm_review(engine: Engine, request: LLMReviewRequest, review: LLMReview) -> bool:
+    """Persist one advisory review, audit event and research artifacts atomically."""
+    if (
+        review.request_id != request.request_id
+        or review.session_id != request.session_id
+        or review.stage != request.stage
+        or review.plan_id != request.plan_id
+        or review.plan_hash != request.plan_hash
+        or review.rule_version != request.rule_version
+    ):
+        raise ValueError("LLM review does not match its request")
+    payload = review.model_dump(mode="json")
+    occurred = _parse_utc_z(review.occurred_at_utc)
+    received = _parse_utc_z(review.received_at_utc)
+    created = _now_utc()
+    trading_day = date.fromisoformat(review.trading_date) if review.trading_date else None
+    row = {
+        "review_id": review.review_id,
+        "plan_id": review.plan_id,
+        "session_id": review.session_id,
+        "occurred_at_utc": occurred,
+        "verdict": review.sop_alignment,
+        "model": review.provider.model,
+        "payload": payload,
+        "created_at_utc": created,
+        "request_id": review.request_id,
+        "correlation_id": review.correlation_id,
+        "causation_id": review.causation_id,
+        "review_kind": review.stage,
+        "review_status": review.review_status,
+        "trading_date": trading_day,
+        "plan_hash": review.plan_hash,
+        "input_hash": review.provider.input_hash,
+        "provider": review.provider.provider,
+        "prompt_version": review.provider.prompt_version,
+        "schema_version": review.schema_version,
+        "received_at_utc": received,
+        "rule_version": review.rule_version,
+        "unavailable_reason_code": review.unavailable_reason_code,
+        "latency_ms": review.provider.latency_ms,
+        "attempts": review.provider.attempts,
+        "cache_hit": review.provider.cache_hit,
+        "input_tokens": review.provider.input_tokens,
+        "output_tokens": review.provider.output_tokens,
+        "estimated_cost_usd": Decimal(review.provider.estimated_cost_usd),
+    }
+    audit_event_id = f"audit_{review.review_id}"
+    input_summary = {
+        "input_hash": review.provider.input_hash,
+        "stage": review.stage,
+        "context_sections": sorted(
+            key
+            for key, value in request.context.model_dump(mode="json").items()
+            if value not in (None, [], {})
+        ),
+        "source_ids": [source.source_id for source in request.source_refs],
+        "prompt_version": review.provider.prompt_version,
+    }
+    with engine.begin() as conn:
+        if conn.dialect.name == "postgresql":
+            inserted = (
+                conn.execute(
+                    postgresql_insert(llm_reviews)
+                    .values(**row)
+                    .on_conflict_do_nothing()
+                    .returning(llm_reviews.c.review_id)
+                ).scalar_one_or_none()
+                is not None
+            )
+        elif conn.dialect.name == "sqlite":
+            inserted = (
+                conn.execute(
+                    sqlite_insert(llm_reviews).values(**row).on_conflict_do_nothing()
+                ).rowcount
+                == 1
+            )
+        else:
+            existing = conn.execute(
+                select(llm_reviews.c.payload).where(
+                    (llm_reviews.c.review_id == review.review_id)
+                    | (llm_reviews.c.request_id == review.request_id)
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                if existing != payload:
+                    raise ValueError("LLM request identity already has different review payload")
+                return False
+            conn.execute(insert(llm_reviews).values(**row))
+            inserted = True
+        if not inserted:
+            existing = conn.execute(
+                select(llm_reviews.c.payload).where(
+                    (llm_reviews.c.review_id == review.review_id)
+                    | (llm_reviews.c.request_id == review.request_id)
+                )
+            ).scalar_one_or_none()
+            if existing != payload:
+                raise ValueError("LLM request identity already has different review payload")
+            return False
+
+        conn.execute(
+            audit_events.insert().values(
+                event_id=audit_event_id,
+                session_id=review.session_id,
+                occurred_at_utc=occurred,
+                actor="llm-intelligence-layer",
+                action="LLM_REVIEW_RECORDED",
+                entity_type="LLMReview",
+                entity_id=review.review_id,
+                from_status=None,
+                to_status=review.review_status,
+                payload={"review": payload, "input_summary": input_summary},
+                created_at_utc=created,
+            )
+        )
+        _write_outbox(
+            conn,
+            source_event_id=audit_event_id,
+            topic="llm.review_recorded",
+            aggregate_type="LLMReview",
+            aggregate_id=review.review_id,
+            occurred_at_utc=occurred,
+            payload={
+                "review_id": review.review_id,
+                "session_id": review.session_id,
+                "stage": review.stage,
+                "review_status": review.review_status,
+            },
+            created_at_utc=created,
+        )
+        if review.stage == "POST_MARKET" and review.review_status == "COMPLETED":
+            if trading_day is None or review.daily_review is None:
+                raise ValueError("completed post-market review has no daily review")
+            conn.execute(
+                daily_reviews.insert().values(
+                    trading_date=trading_day,
+                    session_id=review.session_id,
+                    generated_at_utc=received,
+                    payload=payload,
+                    created_at_utc=created,
+                    review_id=review.review_id,
+                    status=review.review_status,
+                )
+            )
+        for index, hypothesis in enumerate(review.rule_hypotheses):
+            hypothesis_payload = hypothesis.model_dump(mode="json")
+            identity = sha256(
+                json_dumps_stable(
+                    {
+                        "review_id": review.review_id,
+                        "index": index,
+                        "title": hypothesis.title,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                rule_hypotheses.insert().values(
+                    hypothesis_id=f"hyp_{identity[:32]}",
+                    review_id=review.review_id,
+                    session_id=review.session_id,
+                    trading_date=trading_day,
+                    status="PENDING_RESEARCH",
+                    activation_allowed=False,
+                    payload=hypothesis_payload,
+                    created_at_utc=created,
+                )
+            )
+    return True
+
+
+def get_llm_review(engine: Engine, review_id: str) -> LLMReview | None:
+    with engine.connect() as conn:
+        payload = conn.execute(
+            select(llm_reviews.c.payload).where(llm_reviews.c.review_id == review_id)
+        ).scalar_one_or_none()
+    return LLMReview.model_validate(payload) if payload is not None else None
+
+
+def get_llm_review_by_request_id(engine: Engine, request_id: str) -> LLMReview | None:
+    with engine.connect() as conn:
+        payload = conn.execute(
+            select(llm_reviews.c.payload).where(llm_reviews.c.request_id == request_id)
+        ).scalar_one_or_none()
+    return LLMReview.model_validate(payload) if payload is not None else None
+
+
+def list_llm_reviews(
+    engine: Engine,
+    *,
+    session_id: str | None = None,
+    stage: str | None = None,
+    limit: int = 50,
+) -> list[LLMReview]:
+    if not 1 <= limit <= 200:
+        raise ValueError("LLM review list limit is invalid")
+    query = select(llm_reviews.c.payload)
+    if session_id is not None:
+        query = query.where(llm_reviews.c.session_id == session_id)
+    if stage is not None:
+        query = query.where(llm_reviews.c.review_kind == stage)
+    query = query.order_by(llm_reviews.c.occurred_at_utc.desc()).limit(limit)
+    with engine.connect() as conn:
+        payloads = conn.execute(query).scalars().all()
+    return [LLMReview.model_validate(payload) for payload in payloads]
+
+
+def latest_daily_review(engine: Engine, trading_date: date | None = None) -> LLMReview | None:
+    query = select(daily_reviews.c.payload)
+    if trading_date is not None:
+        query = query.where(daily_reviews.c.trading_date == trading_date)
+    query = query.order_by(daily_reviews.c.trading_date.desc()).limit(1)
+    with engine.connect() as conn:
+        payload = conn.execute(query).scalar_one_or_none()
+    return LLMReview.model_validate(payload) if payload is not None else None
+
+
+def list_rule_hypotheses(engine: Engine, *, limit: int = 50) -> list[RuleHypothesisRecord]:
+    if not 1 <= limit <= 200:
+        raise ValueError("rule hypothesis list limit is invalid")
+    query = select(rule_hypotheses).order_by(rule_hypotheses.c.created_at_utc.desc()).limit(limit)
+    with engine.connect() as conn:
+        rows = conn.execute(query).mappings().all()
+    return [
+        RuleHypothesisRecord.model_validate(
+            {
+                "hypothesis_id": str(row["hypothesis_id"]),
+                "review_id": str(row["review_id"]),
+                "session_id": row["session_id"],
+                "trading_date": row["trading_date"].isoformat() if row["trading_date"] else None,
+                "status": str(row["status"]),
+                "activation_allowed": bool(row["activation_allowed"]),
+                "payload": row["payload"],
+            }
+        )
+        for row in rows
+    ]
+
+
+def _parse_utc_z(value: str) -> datetime:
+    if not value.endswith("Z"):
+        raise ValueError("UTC timestamp must end in Z")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError("timestamp must be UTC")
+    return parsed
+
+
 __all__ = [
     "OutboxMessage",
+    "assert_review_store_available",
     "claim_outbox_batch",
     "claim_confirmation_intent",
     "mark_outbox_published",
+    "get_llm_review",
+    "get_llm_review_by_request_id",
+    "latest_daily_review",
+    "list_llm_reviews",
+    "list_rule_hypotheses",
     "persist_event_context",
+    "persist_llm_review",
     "persist_order_projection",
     "persist_signal",
     "persist_staged_candidate",
@@ -1316,4 +1625,5 @@ __all__ = [
     "latest_order_projection",
     "latest_execution_ticket",
     "staged_plan_projection",
+    "verified_initial_risk_context",
 ]

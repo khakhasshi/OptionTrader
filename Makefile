@@ -3,13 +3,14 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-web setup-api setup-core dev dev-web dev-api dev-core dev-thetadata-sdk dev-ibkr-sidecar dev-core-theta-sdk \
-        health build-core test test-contracts test-web test-api test-core test-integration \
+        health build-core test test-contracts test-web test-api test-core test-integration test-llm-eval test-llm-live test-llm-live-eval \
         lint lint-web lint-api lint-core \
         contracts gen-py-grpc events-context migrate migrate-down up down clean
 
 WEB_DIR  := apps/web
 API_DIR  := services/application-api
 CORE_DIR := services/trading-core
+API_ENV_ARG := $(if $(wildcard .env),--env-file ../../.env,)
 
 help: ## 列出所有可用命令
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -38,7 +39,7 @@ dev-web: ## 启动 React 驾驶舱
 	npm --workspace $(WEB_DIR) run dev
 
 dev-api: gen-py-grpc ## 启动 Python FastAPI
-	cd $(API_DIR) && uv run uvicorn app.main:app --reload --port 8000
+	cd $(API_DIR) && uv run $(API_ENV_ARG) uvicorn app.main:app --reload --port 8000
 
 dev-core: ## 启动 Rust trading-core (HTTP :8080 + gRPC :50051)
 	cd $(CORE_DIR) && cargo run
@@ -79,6 +80,15 @@ test-core: ## Rust 测试
 
 test-integration: gen-py-grpc build-core ## 强制执行当前 Rust 二进制→Python 的跨语言 smoke
 	cd $(API_DIR) && OPTIONTRADER_REQUIRE_INTEGRATION=1 uv run pytest tests/test_integration_smoke.py -q
+
+test-llm-eval: ## 运行离线 LLM 对抗评测与指标测试
+	cd $(API_DIR) && uv run pytest tests/test_llm_evaluation.py -q
+
+test-llm-live: ## 使用根目录 .env 显式执行合成数据 Provider smoke
+	cd $(API_DIR) && OPTIONTRADER_RUN_LLM_LIVE_SMOKE=true uv run pytest tests/test_llm_live.py -q
+
+test-llm-live-eval: ## 使用根目录 .env 显式执行 Phase 4 真实模型评测（会产生 API 调用）
+	cd $(API_DIR) && OPTIONTRADER_RUN_LLM_LIVE_EVAL=true uv run python -m app.llm.eval_cli
 
 lint: lint-web lint-api lint-core ## 三端 lint + format check
 

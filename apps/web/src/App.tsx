@@ -1,12 +1,15 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Activity, Gauge, LockKeyhole, Settings } from "lucide-react";
+import { Activity, BookOpenCheck, Gauge, LockKeyhole, Settings } from "lucide-react";
 import { Cockpit } from "./Cockpit";
+import { ReviewPage } from "./ReviewPage";
 import { SettingsPage } from "./SettingsPage";
 
-type Route = "cockpit" | "settings";
+type Route = "cockpit" | "review" | "settings";
 
 function routeFromHash(): Route {
-  return window.location.hash === "#/settings" ? "settings" : "cockpit";
+  if (window.location.hash === "#/settings") return "settings";
+  if (window.location.hash === "#/review") return "review";
+  return "cockpit";
 }
 
 export function App() {
@@ -33,6 +36,9 @@ export function App() {
           <NavItem href="#/cockpit" active={route === "cockpit"} icon={<Gauge size={18} />}>
             驾驶舱
           </NavItem>
+          <NavItem href="#/review" active={route === "review"} icon={<BookOpenCheck size={18} />}>
+            每日复盘
+          </NavItem>
           <NavItem href="#/settings" active={route === "settings"} icon={<Settings size={18} />}>
             设置
           </NavItem>
@@ -45,12 +51,15 @@ export function App() {
       </aside>
 
       <div className="app-workspace">
-        {route === "cockpit" ? <Cockpit /> : <SettingsPage />}
+        {route === "cockpit" ? <Cockpit /> : route === "review" ? <ReviewPage /> : <SettingsPage />}
       </div>
 
       <nav className="mobile-nav" aria-label="移动端导航">
         <NavItem href="#/cockpit" active={route === "cockpit"} icon={<Gauge size={19} />}>
           驾驶舱
+        </NavItem>
+        <NavItem href="#/review" active={route === "review"} icon={<BookOpenCheck size={19} />}>
+          复盘
         </NavItem>
         <NavItem href="#/settings" active={route === "settings"} icon={<Settings size={19} />}>
           设置

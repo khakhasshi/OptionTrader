@@ -65,4 +65,24 @@ describe("environment export", () => {
     expect(output).toContain("OPTIONTRADER_BROKER_EXECUTION_BACKEND=simulated-paper");
     expect(output).not.toContain("LIVE_TRADING_ENABLED=true");
   });
+
+  it("exports a complete enabled LLM provider without granting trading authority", () => {
+    const output = settingsToEnv({
+      ...INITIAL_SETTINGS,
+      llmEnabled: true,
+      llmApiKey: "draft-only-key",
+    });
+    expect(output).toContain("LLM_PROVIDER=deepseek-openai");
+    expect(output).toContain("LLM_BASE_URL=https://api.deepseek.com");
+    expect(output).toContain("LLM_MODEL=deepseek-v4-flash");
+    expect(output).not.toContain("LLM_TRADING_AUTHORITY");
+  });
+
+  it("rejects environment-line injection during export", () => {
+    expect(() => settingsToEnv({
+      ...INITIAL_SETTINGS,
+      llmEnabled: true,
+      llmApiKey: "draft-key\nLIVE_TRADING_ENABLED=true",
+    })).toThrow("unsafe environment value");
+  });
 });

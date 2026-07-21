@@ -17,7 +17,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from typing import Annotated, Literal
 
@@ -37,15 +37,33 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.llm.config import LLMSettings
+from app.llm.models import (
+    LLMReview,
+    LLMReviewRequest,
+    ReviewStage,
+    RuleHypothesisRecord,
+    SourceReference,
+)
+from app.llm.security import review_input_hash
+from app.llm.service import LLMReviewService
 from app.persistence import (
+    assert_review_store_available,
     claim_confirmation_intent,
+    get_llm_review,
+    get_llm_review_by_request_id,
+    latest_daily_review,
     latest_execution_ticket,
+    list_llm_reviews,
+    list_rule_hypotheses,
     persist_broker_reconciliation_failure,
+    persist_llm_review,
     persist_order_projection,
     persist_staged_candidate,
     restorable_execution_workflow,
     rotate_confirmation_capabilities,
     staged_plan_projection,
+    verified_initial_risk_context,
 )
 from app.realtime.projector import ProjectorConfig
 from app.realtime.session import current_event_context, get_hub, latest_frame
@@ -83,6 +101,16 @@ def _require_execution_engine() -> Engine:
     if not database_url:
         raise HTTPException(status_code=503, detail="execution_audit_unavailable")
     return _execution_engine(database_url)
+
+
+@lru_cache(maxsize=1)
+def _llm_settings() -> LLMSettings:
+    return LLMSettings.from_env()
+
+
+@lru_cache(maxsize=1)
+def _llm_review_service() -> LLMReviewService:
+    return LLMReviewService(_llm_settings())
 
 
 @lru_cache(maxsize=2)
@@ -227,6 +255,15 @@ class ExecutionTicket(BaseModel):
 
     plan: CandidateTradePlan
     order: ExecutionOrder
+
+
+class LLMServiceStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    configured: bool
+    provider: str
+    model: str
+    trading_authority: Literal["NONE"]
 
 
 def _check_utc(v: str) -> str:
@@ -435,6 +472,168 @@ def event_context() -> JSONResponse:
     """Current deterministic EventContext; unavailable inputs remain HTTP 200 but fail closed."""
     context = current_event_context()
     return JSONResponse(status_code=200, content=context.model_dump(mode="json"))
+
+
+@app.get("/api/v1/llm/status", response_model=LLMServiceStatus)
+def llm_service_status() -> LLMServiceStatus:
+    settings = LLMSettings.from_env()
+    return LLMServiceStatus(
+        configured=settings.configured,
+        provider=settings.provider,
+        model=settings.model,
+        trading_authority="NONE",
+    )
+
+
+@app.post("/api/v1/llm/reviews", response_model=LLMReview)
+async def create_llm_review(request: LLMReviewRequest) -> LLMReview:
+    """Generate and atomically audit one advisory review.
+
+    This route is deliberately separate from order confirmation. For execution
+    reviews it replaces caller-supplied plan/risk objects with PostgreSQL facts
+    produced by Phase 3 before making any provider request.
+    """
+    engine = _require_execution_engine()
+    try:
+        await asyncio.to_thread(assert_review_store_available, engine)
+        initial_risk_verified = False
+        if request.stage == "PRE_EXECUTION":
+            assert request.plan_id is not None and request.plan_hash is not None
+            authoritative = await asyncio.to_thread(
+                verified_initial_risk_context,
+                engine,
+                request.plan_id,
+                request.plan_hash,
+            )
+            if authoritative is None:
+                raise HTTPException(status_code=409, detail="initial_risk_approval_required")
+            plan, decision = authoritative
+            context = request.context.model_validate(
+                {
+                    **request.context.model_dump(mode="python"),
+                    "candidate_trade_plan": plan,
+                    "initial_risk_decision": decision,
+                }
+            )
+            source_refs = [
+                source
+                for source in request.source_refs
+                if source.source_id not in {plan.plan_id, decision.decision_id}
+            ]
+            source_refs.extend(
+                (
+                    SourceReference(
+                        source_id=plan.plan_id,
+                        source_type="candidate_trade_plan",
+                        source="postgresql-review-store",
+                        occurred_at_utc=plan.created_at_utc,
+                        raw_ref=f"review-store:candidate:{plan.plan_id}",
+                        confidence=1.0,
+                    ),
+                    SourceReference(
+                        source_id=decision.decision_id,
+                        source_type="risk_decision",
+                        source="rust-risk-gateway",
+                        occurred_at_utc=decision.occurred_at_utc,
+                        raw_ref=f"review-store:risk:{decision.decision_id}",
+                        confidence=1.0,
+                    ),
+                )
+            )
+            request = LLMReviewRequest.model_validate(
+                {
+                    **request.model_dump(mode="python"),
+                    "correlation_id": plan.plan_id,
+                    "causation_id": decision.decision_id,
+                    "context": context,
+                    "source_refs": source_refs,
+                }
+            )
+            initial_risk_verified = True
+        input_hash = review_input_hash(request, _llm_settings().max_input_chars)
+        existing = await asyncio.to_thread(
+            get_llm_review_by_request_id,
+            engine,
+            request.request_id,
+        )
+        if existing is not None:
+            if not _same_llm_review_request(existing, request, input_hash):
+                raise HTTPException(status_code=409, detail="llm_request_id_conflict")
+            return existing
+        review = await _llm_review_service().review(
+            request, initial_risk_verified=initial_risk_verified
+        )
+        await asyncio.to_thread(persist_llm_review, engine, request, review)
+        return review
+    except HTTPException:
+        raise
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="llm_review_audit_failed") from exc
+
+
+def _same_llm_review_request(
+    review: LLMReview,
+    request: LLMReviewRequest,
+    input_hash: str,
+) -> bool:
+    return (
+        review.request_id == request.request_id
+        and review.correlation_id == request.correlation_id
+        and review.causation_id == request.causation_id
+        and review.session_id == request.session_id
+        and review.occurred_at_utc == request.occurred_at_utc
+        and review.source_sequence == request.source_sequence
+        and review.rule_version == request.rule_version
+        and review.stage == request.stage
+        and review.trading_date == request.trading_date
+        and review.plan_id == request.plan_id
+        and review.plan_hash == request.plan_hash
+        and review.provider.input_hash == input_hash
+    )
+
+
+@app.get("/api/v1/llm/reviews", response_model=list[LLMReview])
+def read_llm_reviews(
+    session_id: str | None = None,
+    stage: ReviewStage | None = None,
+    limit: int = 50,
+) -> list[LLMReview]:
+    try:
+        return list_llm_reviews(
+            _require_execution_engine(), session_id=session_id, stage=stage, limit=limit
+        )
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="llm_review_read_failed") from exc
+
+
+@app.get("/api/v1/llm/reviews/{review_id}", response_model=LLMReview)
+def read_llm_review(review_id: str) -> LLMReview:
+    try:
+        review = get_llm_review(_require_execution_engine(), review_id)
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="llm_review_read_failed") from exc
+    if review is None:
+        raise HTTPException(status_code=404, detail="llm_review_not_found")
+    return review
+
+
+@app.get("/api/v1/llm/daily-reviews/latest", response_model=LLMReview)
+def read_latest_daily_review(trading_date: date | None = None) -> LLMReview:
+    try:
+        review = latest_daily_review(_require_execution_engine(), trading_date)
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="daily_review_read_failed") from exc
+    if review is None:
+        raise HTTPException(status_code=404, detail="daily_review_not_found")
+    return review
+
+
+@app.get("/api/v1/llm/rule-hypotheses", response_model=list[RuleHypothesisRecord])
+def read_rule_hypotheses(limit: int = 50) -> list[RuleHypothesisRecord]:
+    try:
+        return list_rule_hypotheses(_require_execution_engine(), limit=limit)
+    except (SQLAlchemyError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="rule_hypothesis_read_failed") from exc
 
 
 @app.post("/api/v1/trading/candidates/stage", response_model=StagedCandidateView)

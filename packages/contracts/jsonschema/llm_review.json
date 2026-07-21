@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/llm_review.json",
+  "title": "LLMReview",
+  "description": "Advisory, auditable LLM review. This contract carries no trading authority and can never replace Initial or Final Risk Check.",
+  "type": "object",
+  "$defs": {
+    "sourceReference": {
+      "type": "object",
+      "properties": {
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "source_type": {
+          "type": "string",
+          "enum": [
+            "market_snapshot", "option_snapshot", "event_context", "signal",
+            "trade", "candidate_trade_plan", "risk_decision", "broker_snapshot",
+            "session_metrics"
+          ]
+        },
+        "source": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "occurred_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+        "raw_ref": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "required": ["source_id", "source_type", "source", "occurred_at_utc", "raw_ref", "confidence"],
+      "additionalProperties": false
+    },
+    "evidenceCitation": {
+      "type": "object",
+      "properties": {
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "claim": { "type": "string", "minLength": 1, "maxLength": 500 }
+      },
+      "required": ["source_id", "claim"],
+      "additionalProperties": false
+    },
+    "lossAttribution": {
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "enum": ["DIRECTION", "IV", "THETA", "SLIPPAGE", "EXECUTION_ERROR", "OTHER"] },
+        "explanation": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "evidence_ids": {
+          "type": "array",
+          "maxItems": 10,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 160 }
+        }
+      },
+      "required": ["kind", "explanation", "evidence_ids"],
+      "additionalProperties": false
+    },
+    "dailyReviewDetail": {
+      "type": "object",
+      "properties": {
+        "best_trade": { "type": ["string", "null"], "maxLength": 500 },
+        "worst_trade": { "type": ["string", "null"], "maxLength": 500 },
+        "good_losses": { "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+        "bad_losses": { "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+        "sop_violations": { "type": "array", "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+        "loss_attribution": { "type": "array", "maxItems": 10, "items": { "$ref": "#/$defs/lossAttribution" } },
+        "one_change_tomorrow": { "type": "string", "minLength": 1, "maxLength": 500 }
+      },
+      "required": ["best_trade", "worst_trade", "good_losses", "bad_losses", "sop_violations", "loss_attribution", "one_change_tomorrow"],
+      "additionalProperties": false
+    },
+    "ruleHypothesis": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "rationale": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "validation_plan": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "evidence_ids": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 160 }
+        },
+        "status": { "type": "string", "const": "RESEARCH_ONLY" },
+        "activation_allowed": { "type": "boolean", "const": false }
+      },
+      "required": ["title", "rationale", "validation_plan", "evidence_ids", "status", "activation_allowed"],
+      "additionalProperties": false
+    },
+    "providerMetadata": {
+      "type": "object",
+      "properties": {
+        "provider": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "model": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "provider_request_id": { "type": ["string", "null"], "maxLength": 200 },
+        "prompt_version": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "input_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "latency_ms": { "type": "integer", "minimum": 0 },
+        "attempts": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "cache_hit": { "type": "boolean" },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "estimated_cost_usd": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$" }
+      },
+      "required": [
+        "provider", "model", "provider_request_id", "prompt_version", "input_hash",
+        "latency_ms", "attempts", "cache_hit", "input_tokens", "output_tokens",
+        "estimated_cost_usd"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "review_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "correlation_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "causation_id": { "type": ["string", "null"], "maxLength": 160 },
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "occurred_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "received_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "source": { "type": "string", "const": "llm-intelligence-layer" },
+    "source_sequence": { "type": "integer", "minimum": 0 },
+    "rule_version": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "stage": { "type": "string", "enum": ["POST_MARKET", "PRE_MARKET", "INTRADAY", "PRE_EXECUTION", "RULE_HYPOTHESIS"] },
+    "trading_date": { "type": ["string", "null"], "format": "date" },
+    "plan_id": { "type": ["string", "null"], "maxLength": 160 },
+    "plan_hash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+    "review_status": { "type": "string", "enum": ["COMPLETED", "UNAVAILABLE", "INVALID"] },
+    "summary": { "type": "string", "maxLength": 2000 },
+    "decision_support": { "type": "string", "maxLength": 2000 },
+    "sop_alignment": { "type": "string", "enum": ["Aligned", "Conflict", "Unknown"] },
+    "risk_notes": { "type": "array", "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+    "invalidations": { "type": "array", "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+    "recommended_action": { "type": "string", "enum": ["Proceed", "Wait", "Cancel", "Reduce Risk", "Review Only"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "rule_references": { "type": "array", "maxItems": 20, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 160 } },
+    "evidence_citations": { "type": "array", "maxItems": 30, "items": { "$ref": "#/$defs/evidenceCitation" } },
+    "daily_review": { "oneOf": [{ "$ref": "#/$defs/dailyReviewDetail" }, { "type": "null" }] },
+    "rule_hypotheses": { "type": "array", "maxItems": 5, "items": { "$ref": "#/$defs/ruleHypothesis" } },
+    "unavailable_reason_code": {
+      "type": ["string", "null"],
+      "enum": [null, "CONFIG_MISSING", "TIMEOUT", "RATE_LIMIT", "PROVIDER_ERROR", "INVALID_RESPONSE", "INPUT_REJECTED", "INITIAL_RISK_REQUIRED", "BUDGET_EXCEEDED"]
+    },
+    "provider": { "$ref": "#/$defs/providerMetadata" },
+    "source_refs": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/sourceReference" } }
+  },
+  "required": [
+    "schema_version", "review_id", "request_id", "correlation_id", "causation_id",
+    "session_id", "occurred_at_utc", "received_at_utc", "source", "source_sequence",
+    "rule_version", "stage", "trading_date", "plan_id", "plan_hash", "review_status",
+    "summary", "decision_support", "sop_alignment", "risk_notes", "invalidations",
+    "recommended_action", "confidence", "rule_references", "evidence_citations",
+    "daily_review", "rule_hypotheses", "unavailable_reason_code", "provider", "source_refs"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "review_status": { "const": "COMPLETED" } }, "required": ["review_status"] },
+      "then": { "properties": { "unavailable_reason_code": { "type": "null" } } },
+      "else": { "properties": { "unavailable_reason_code": { "type": "string" }, "recommended_action": { "const": "Review Only" }, "confidence": { "const": 0 } } }
+    },
+    {
+      "if": { "properties": { "stage": { "const": "POST_MARKET" }, "review_status": { "const": "COMPLETED" } }, "required": ["stage", "review_status"] },
+      "then": {
+        "properties": {
+          "trading_date": { "type": "string", "format": "date" },
+          "daily_review": { "$ref": "#/$defs/dailyReviewDetail" }
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "allOf": [
+            { "properties": { "stage": { "const": "POST_MARKET" } }, "required": ["stage"] },
+            { "properties": { "review_status": { "const": "COMPLETED" } }, "required": ["review_status"] }
+          ]
+        }
+      },
+      "then": { "properties": { "daily_review": { "type": "null" } } }
+    },
+    {
+      "if": {
+        "properties": { "review_status": { "enum": ["UNAVAILABLE", "INVALID"] } },
+        "required": ["review_status"]
+      },
+      "then": { "properties": { "rule_hypotheses": { "maxItems": 0 } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "review_status": { "const": "COMPLETED" },
+          "stage": { "const": "RULE_HYPOTHESIS" }
+        },
+        "required": ["review_status", "stage"]
+      },
+      "then": { "properties": { "rule_hypotheses": { "minItems": 1 } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "review_status": { "const": "COMPLETED" },
+          "stage": { "enum": ["PRE_MARKET", "INTRADAY", "PRE_EXECUTION"] }
+        },
+        "required": ["review_status", "stage"]
+      },
+      "then": { "properties": { "rule_hypotheses": { "maxItems": 0 } } }
+    },
+    {
+      "if": {
+        "properties": { "recommended_action": { "const": "Proceed" } },
+        "required": ["recommended_action"]
+      },
+      "then": { "properties": { "stage": { "const": "PRE_EXECUTION" } } }
+    },
+    {
+      "if": { "properties": { "stage": { "const": "PRE_EXECUTION" } }, "required": ["stage"] },
+      "then": { "properties": { "plan_id": { "type": "string", "minLength": 1 }, "plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" } } }
+    }
+  ]
+}

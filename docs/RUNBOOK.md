@@ -117,6 +117,28 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
     做 at-least-once 去重；成功 ack，失败退避，超过上限进入 dead letter。第一阶段不部署 NATS，
     不得把“已写 outbox”描述为“已发送到外部消息系统”。
 
+## Phase 4 LLM 辅助层
+
+1. LLM 配置只进入服务端环境。根目录 `.env` 必须被 Git 忽略且权限为 `600`；不得把 key
+   放进 `.env.example`、React localStorage、URL、日志、fixture 或评审输出。`make dev-api` 在
+   本地 `.env` 存在时通过 uv dotenv parser 注入；生产环境由 secret manager 注入。
+2. 启动后先检查 `GET /api/v1/llm/status`。配置缺失只表示审阅不可用，不得影响 DataHealth、
+   Rust 风控、撤单、保护性减仓或平仓。任何非 COMPLETED 结果必须是 `Review Only` 且
+   `confidence=0`。
+3. `POST /api/v1/llm/reviews` 只接受严格结构化上下文。PRE_EXECUTION 会忽略调用方携带的
+   Candidate/Initial Risk 内容并从 PostgreSQL 重读；计划、初始风控或 review schema 不可用时
+   不调用 Provider。LLM 的 Proceed/Cancel/Reduce Risk 均不会调用 Broker。
+4. 日常离线门禁运行 `make test-llm-eval`。显式真实调用使用 `make test-llm-live`；完整 5 case
+   合成评测使用 `make test-llm-live-eval`。后两者会产生外部 API 调用，只输出状态枚举、聚合
+   指标和固定验证代码，不输出模型正文或密钥。
+5. 合格基线要求：structured output=1、conflict recall=1、false positive=0、injection block=1、
+   unavailable inert=1，且 missed/contract/expectation mismatch case 均为空。任何模型或 prompt
+   版本变化都必须重跑；失败时保持 LLM 功能降级，不得放宽 Schema 取得绿灯。
+6. Daily Review 与规则研究队列是只读页面。研究假设永远不能直接激活；进入 shadow 前仍需
+   成本回测、walk-forward、样本外验证和人工 Gate Review。
+7. 当前 LLM cache、并发和每日预算按 API 进程计数。多 worker 会放大总配额，且相同请求在
+   并发窗口可能发生重复 Provider 调用；完成 PostgreSQL 共享配额/single-flight 前使用单 worker。
+
 ## Broker SDK 认证前启动
 
 Longbridge 原生 adapter 从 `LONGBRIDGE_APP_KEY`、`LONGBRIDGE_APP_SECRET`、

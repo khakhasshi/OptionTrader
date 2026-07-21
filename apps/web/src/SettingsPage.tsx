@@ -55,8 +55,13 @@ export interface OperatorSettings {
   maxDailyTrades: string;
   maxContracts: string;
   llmProvider: string;
+  llmBaseUrl: string;
   llmApiKey: string;
   llmModel: string;
+  llmTimeoutSeconds: string;
+  llmMaxOutputTokens: string;
+  llmDailyBudget: string;
+  llmEnabled: boolean;
 }
 
 export const INITIAL_SETTINGS: OperatorSettings = {
@@ -94,13 +99,21 @@ export const INITIAL_SETTINGS: OperatorSettings = {
   maxOpenRisk: "500",
   maxDailyTrades: "3",
   maxContracts: "2",
-  llmProvider: "",
+  llmProvider: "deepseek-openai",
+  llmBaseUrl: "https://api.deepseek.com",
   llmApiKey: "",
-  llmModel: "",
+  llmModel: "deepseek-v4-flash",
+  llmTimeoutSeconds: "8",
+  llmMaxOutputTokens: "1200",
+  llmDailyBudget: "1.00",
+  llmEnabled: false,
 };
 
 export function validateSettings(settings: OperatorSettings): string[] {
   const issues: string[] = [];
+  if (Object.values(settings).some((value) => typeof value === "string" && /[\0\r\n]/.test(value))) {
+    issues.push("环境变量值不能包含换行或 NUL 字符。");
+  }
   const externalBroker =
     settings.executionBackend === "ibkr-paper"
       ? "ibkr"
@@ -132,6 +145,18 @@ export function validateSettings(settings: OperatorSettings): string[] {
   if (settings.riskLimitsConfirmed && settings.ruleVersion.trim() === "UNCONFIRMED") {
     issues.push("确认风控限额前，必须填写已复核的规则版本。");
   }
+  if (settings.llmEnabled) {
+    if (!settings.llmProvider || !settings.llmBaseUrl || !settings.llmApiKey || !settings.llmModel) {
+      issues.push("启用 LLM 前必须填写服务商、Base URL、API 密钥和模型。");
+    }
+    if (!settings.llmBaseUrl.startsWith("https://")) issues.push("LLM Base URL 必须使用 HTTPS。");
+    const timeout = Number(settings.llmTimeoutSeconds);
+    const outputTokens = Number(settings.llmMaxOutputTokens);
+    const dailyBudget = Number(settings.llmDailyBudget);
+    if (!Number.isFinite(timeout) || timeout < 1 || timeout > 30) issues.push("LLM 超时必须在 1–30 秒之间。");
+    if (!Number.isInteger(outputTokens) || outputTokens < 128 || outputTokens > 4096) issues.push("LLM 最大输出必须是 128–4096 的整数。");
+    if (!Number.isFinite(dailyBudget) || dailyBudget < 0.01) issues.push("LLM 单日预算不得低于 0.01 美元。");
+  }
   for (const [label, value] of [
     ["行情流静默阈值", settings.streamSilenceSeconds],
     ["对账间隔", settings.reconciliationInterval],
@@ -140,6 +165,9 @@ export function validateSettings(settings: OperatorSettings): string[] {
     ["最大未平仓风险", settings.maxOpenRisk],
     ["单日最大交易次数", settings.maxDailyTrades],
     ["最大合约张数", settings.maxContracts],
+    ["LLM 超时", settings.llmTimeoutSeconds],
+    ["LLM 最大输出 Token", settings.llmMaxOutputTokens],
+    ["LLM 单日预算", settings.llmDailyBudget],
   ]) {
     if (!Number.isFinite(Number(value)) || Number(value) < 0) issues.push(`${label}必须是非负数。`);
   }
@@ -147,6 +175,9 @@ export function validateSettings(settings: OperatorSettings): string[] {
 }
 
 export function settingsToEnv(settings: OperatorSettings): string {
+  if (Object.values(settings).some((value) => typeof value === "string" && /[\0\r\n]/.test(value))) {
+    throw new Error("unsafe environment value");
+  }
   const bool = (value: boolean) => (value ? "true" : "false");
   return [
     `OPTIONTRADER_ENV=${settings.environment}`,
@@ -184,9 +215,13 @@ export function settingsToEnv(settings: OperatorSettings): string {
     `OPTIONTRADER_MAX_OPEN_RISK=${settings.maxOpenRisk}`,
     `OPTIONTRADER_MAX_DAILY_TRADES=${settings.maxDailyTrades}`,
     `OPTIONTRADER_MAX_CONTRACTS=${settings.maxContracts}`,
-    `LLM_PROVIDER=${settings.llmProvider}`,
-    `LLM_API_KEY=${settings.llmApiKey}`,
-    `LLM_MODEL=${settings.llmModel}`,
+    `LLM_PROVIDER=${settings.llmEnabled ? settings.llmProvider : ""}`,
+    `LLM_BASE_URL=${settings.llmEnabled ? settings.llmBaseUrl : ""}`,
+    `LLM_API_KEY=${settings.llmEnabled ? settings.llmApiKey : ""}`,
+    `LLM_MODEL=${settings.llmEnabled ? settings.llmModel : ""}`,
+    `LLM_TIMEOUT_SECONDS=${settings.llmTimeoutSeconds}`,
+    `LLM_MAX_OUTPUT_TOKENS=${settings.llmMaxOutputTokens}`,
+    `LLM_DAILY_MAX_ESTIMATED_USD=${settings.llmDailyBudget}`,
   ].join("\n");
 }
 
@@ -204,6 +239,11 @@ export function SettingsPage() {
   };
 
   const copyEnvironment = async () => {
+    if (issues.length > 0) {
+      setChecked(true);
+      setCopyState("failed");
+      return;
+    }
     try {
       await navigator.clipboard.writeText(settingsToEnv(settings));
       setCopyState("copied");
@@ -334,10 +374,17 @@ export function SettingsPage() {
             </div>
           </SettingsSection>
 
-          <SettingsSection icon={<Bot size={18} />} title="LLM 智能顾问" subtitle="Phase 4 预留，永不拥有执行权限">
+          <SettingsSection icon={<Bot size={18} />} title="LLM 智能顾问" subtitle="异步解释与复盘，永不拥有执行权限">
+            <ToggleField label="启用 LLM 审阅" detail="仅开放独立审阅 API" checked={settings.llmEnabled} onChange={(value) => update("llmEnabled", value)} />
             <TextField label="服务商" placeholder="服务商名称" value={settings.llmProvider} onChange={(value) => update("llmProvider", value)} />
+            <TextField label="Base URL" placeholder="https://api.example.com" value={settings.llmBaseUrl} onChange={(value) => update("llmBaseUrl", value)} />
             <SecretField label="LLM API 密钥" value={settings.llmApiKey} onChange={(value) => update("llmApiKey", value)} />
             <TextField label="模型" placeholder="模型标识" value={settings.llmModel} onChange={(value) => update("llmModel", value)} />
+            <div className="form-row-split">
+              <TextField label="超时" suffix="秒" value={settings.llmTimeoutSeconds} onChange={(value) => update("llmTimeoutSeconds", value)} />
+              <TextField label="最大输出" suffix="tokens" value={settings.llmMaxOutputTokens} onChange={(value) => update("llmMaxOutputTokens", value)} />
+            </div>
+            <TextField label="单日成本上限" prefix="$" value={settings.llmDailyBudget} onChange={(value) => update("llmDailyBudget", value)} />
             <ReadOnlyField label="权限边界" value="仅提供建议" />
           </SettingsSection>
         </div>

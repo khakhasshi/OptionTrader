@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://optiontrader/contracts/llm_review_request.json",
+  "title": "LLMReviewRequest",
+  "description": "Allowlisted structured input for an advisory LLM review. Free-form instructions and credentials are not accepted.",
+  "type": "object",
+  "$defs": {
+    "sourceReference": {
+      "$ref": "llm_review.json#/$defs/sourceReference"
+    },
+    "context": {
+      "type": "object",
+      "properties": {
+        "market_snapshot": { "type": ["object", "null"] },
+        "option_snapshot": { "type": ["object", "null"] },
+        "regime_state": { "type": ["object", "null"] },
+        "vol_state": { "type": ["object", "null"] },
+        "risk_state": { "type": ["object", "null"] },
+        "data_health": { "type": ["object", "null"] },
+        "broker_health": { "type": ["object", "null"] },
+        "active_playbook": { "type": ["object", "null"] },
+        "candidate_trade_plan": { "type": ["object", "null"] },
+        "initial_risk_decision": { "type": ["object", "null"] },
+        "event_context": { "type": ["object", "null"] },
+        "recent_signals": { "type": "array", "maxItems": 20, "items": { "type": "object" } },
+        "recent_trades": { "type": "array", "maxItems": 50, "items": { "type": "object" } },
+        "session_metrics": { "type": ["object", "null"] },
+        "deterministic_summary": { "type": ["string", "null"], "maxLength": 4000 }
+      },
+      "required": [
+        "market_snapshot", "option_snapshot", "regime_state", "vol_state", "risk_state",
+        "data_health", "broker_health", "active_playbook", "candidate_trade_plan",
+        "initial_risk_decision", "event_context", "recent_signals", "recent_trades",
+        "session_metrics", "deterministic_summary"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "correlation_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "causation_id": { "type": ["string", "null"], "maxLength": 160 },
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "occurred_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "received_at_utc": { "$ref": "common.json#/$defs/utcTimestamp" },
+    "source": { "type": "string", "const": "application-service" },
+    "source_sequence": { "type": "integer", "minimum": 0 },
+    "rule_version": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "stage": { "type": "string", "enum": ["POST_MARKET", "PRE_MARKET", "INTRADAY", "PRE_EXECUTION", "RULE_HYPOTHESIS"] },
+    "trading_date": { "type": ["string", "null"], "format": "date" },
+    "plan_id": { "type": ["string", "null"], "maxLength": 160 },
+    "plan_hash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+    "context": { "$ref": "#/$defs/context" },
+    "source_refs": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/sourceReference" } }
+  },
+  "required": [
+    "schema_version", "request_id", "correlation_id", "causation_id", "session_id",
+    "occurred_at_utc", "received_at_utc", "source", "source_sequence", "rule_version",
+    "stage", "trading_date", "plan_id", "plan_hash", "context", "source_refs"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "stage": { "const": "PRE_EXECUTION" } }, "required": ["stage"] },
+      "then": {
+        "properties": {
+          "plan_id": { "type": "string", "minLength": 1 },
+          "plan_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "context": {
+            "properties": {
+              "candidate_trade_plan": { "type": "object" },
+              "initial_risk_decision": { "type": "object" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "stage": { "const": "POST_MARKET" } }, "required": ["stage"] },
+      "then": { "properties": { "trading_date": { "type": "string", "format": "date" } } }
+    }
+  ]
+}
