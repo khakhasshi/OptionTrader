@@ -415,8 +415,10 @@ sequenceDiagram
         else Proceed / Review Unavailable
             API-->>Web: 展示计划、最大损失、TTL 和审核状态
             Trader->>Web: 人工确认
-            Web->>API: confirmation token + plan hash
-            API->>Risk: SubmitApprovedPlan
+            Web->>API: confirmed plan hash
+            API->>Audit: 锁行并 claim 加密 confirmation capability + 记录确认意图
+            Audit-->>API: capability ciphertext（API 内解密）
+            API->>Risk: SubmitApprovedPlan(token + plan hash)
             Risk->>Market: 获取最新 DataHealth 和 quote
             Market-->>Risk: 最新不可变快照
             Risk->>Broker: 查询账户、持仓、订单和 buying power
@@ -471,8 +473,9 @@ sequenceDiagram
             Risk-->>API: MandatoryClosePlan + 原因 + TTL
             API-->>Web: 高优先级退出确认
             Trader->>Web: 确认退出
-            Web->>API: confirmation token
-            API->>Risk: ClosePosition
+            Web->>API: confirmed close-plan hash
+            API->>Audit: claim 加密退出 capability + 记录确认意图
+            API->>Risk: ClosePosition(token + close-plan hash)
             Risk->>Risk: Final Risk Check for Close
             Risk->>Broker: 提交退出/减仓限价单
             Broker-->>Risk: OrderEvent / FillEvent

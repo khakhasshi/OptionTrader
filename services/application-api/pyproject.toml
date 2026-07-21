@@ -15,6 +15,7 @@ dependencies = [
     "pyarrow>=16.0",
     "grpcio>=1.66",
     "protobuf>=5.27",
+    "cryptography>=45.0",
     "thetadata>=1.0.9",
 ]
 

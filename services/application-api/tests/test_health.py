@@ -1,7 +1,8 @@
 from fastapi.testclient import TestClient
 import pytest
+from cryptography.fernet import Fernet
 
-from app.main import _validate_single_worker_configuration, app
+from app.main import _confirmation_cipher, app
 
 client = TestClient(app)
 
@@ -15,18 +16,13 @@ def test_health_ok() -> None:
     assert "environment" in body
 
 
-@pytest.mark.parametrize(
-    "environment",
-    [
-        {"OPTIONTRADER_API_WORKERS": "2"},
-        {"WEB_CONCURRENCY": "4"},
-        {"UVICORN_WORKERS": "many"},
-    ],
-)
-def test_execution_api_rejects_multi_worker_configuration(environment: dict[str, str]) -> None:
-    with pytest.raises(RuntimeError, match="required|integer"):
-        _validate_single_worker_configuration(environment)
+def test_confirmation_cipher_accepts_a_fernet_key() -> None:
+    key = Fernet.generate_key().decode("ascii")
+    cipher = _confirmation_cipher(key)
+    assert cipher.decrypt(cipher.encrypt("opaque-capability")) == "opaque-capability"
 
 
-def test_execution_api_accepts_explicit_single_worker() -> None:
-    _validate_single_worker_configuration({"OPTIONTRADER_API_WORKERS": "1", "WEB_CONCURRENCY": "1"})
+@pytest.mark.parametrize("key", ["", "not-a-fernet-key", "非 ASCII"])
+def test_confirmation_cipher_rejects_invalid_keys(key: str) -> None:
+    with pytest.raises(ValueError, match="key is invalid"):
+        _confirmation_cipher(key)

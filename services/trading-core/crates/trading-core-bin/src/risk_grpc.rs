@@ -598,6 +598,11 @@ fn proto_order_state(state: OrderState) -> ProtoOrderState {
 }
 
 fn order_proto(staged: &StagedOrder, now: DateTime<Utc>) -> ProtoOrder {
+    let updated_at = staged
+        .record
+        .events
+        .last()
+        .map_or(now, |event| event.occurred_at);
     ProtoOrder {
         schema_version: "1.0".into(),
         order_id: staged.record.order_id.clone(),
@@ -615,7 +620,7 @@ fn order_proto(staged: &StagedOrder, now: DateTime<Utc>) -> ProtoOrder {
             .record
             .expires_at
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        updated_at_utc: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        updated_at_utc: updated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         risk_reason_codes: staged.risk_reasons.clone(),
         state_version: staged.record.events.len() as u64,
     }
@@ -1081,7 +1086,10 @@ mod tests {
 
         let repeated = stage(&service, ProtoMode::Shadow).await;
         assert_eq!(repeated.confirmation_token, staged.confirmation_token);
-        assert_eq!(repeated.order.unwrap().order_id, order.order_id);
+        let repeated_order = repeated.order.unwrap();
+        assert_eq!(repeated_order.order_id, order.order_id);
+        assert_eq!(repeated_order.state_version, order.state_version);
+        assert_eq!(repeated_order.updated_at_utc, order.updated_at_utc);
 
         let denied = service
             .confirm_candidate(Request::new(ConfirmCandidateRequest {

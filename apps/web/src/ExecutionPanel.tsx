@@ -18,6 +18,7 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
   const [acknowledged, setAcknowledged] = useState(false);
   const [clock, setClock] = useState(Date.now());
   const requestGeneration = useRef(0);
+  const ticketAnchor = useRef<ExecutionTicket | null>(null);
 
   const refresh = useCallback(async () => {
     const generation = ++requestGeneration.current;
@@ -25,27 +26,28 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
       const response = await fetch(`/api/v1/trading/orders?session_id=${encodeURIComponent(sessionId)}`);
       if (generation !== requestGeneration.current) return;
       if (response.status === 404) {
-        setTicket(null);
-        setLoadState("EMPTY");
+        setLoadState(ticketAnchor.current ? "UNAVAILABLE" : "EMPTY");
         return;
       }
       if (!response.ok) throw new Error("unavailable");
       const parsed = parseExecutionTicket(await response.json());
       if (generation !== requestGeneration.current) return;
       if (!parsed) throw new Error("contract");
-      setTicket((current) =>
-        current && !isNewerExecutionOrder(current.order, parsed.order) ? current : parsed,
-      );
+      const current = ticketAnchor.current;
+      if (!current || isNewerExecutionOrder(current.order, parsed.order)) {
+        ticketAnchor.current = parsed;
+        setTicket(parsed);
+      }
       setLoadState("READY");
       setError(null);
     } catch {
       if (generation !== requestGeneration.current) return;
-      setTicket(null);
       setLoadState("UNAVAILABLE");
     }
   }, [sessionId]);
 
   useEffect(() => {
+    ticketAnchor.current = null;
     setTicket(null);
     setLoadState("LOADING");
     void refresh();
@@ -74,9 +76,12 @@ export function ExecutionPanel({ sessionId, canTrade }: { sessionId: string; can
 
   const updateOrder = (order: ExecutionOrder) => {
     requestGeneration.current += 1;
-    setTicket((current) =>
-      current && isNewerExecutionOrder(current.order, order) ? { ...current, order } : current,
-    );
+    const current = ticketAnchor.current;
+    if (current && isNewerExecutionOrder(current.order, order)) {
+      const next = { ...current, order };
+      ticketAnchor.current = next;
+      setTicket(next);
+    }
   };
 
   const confirm = async () => {

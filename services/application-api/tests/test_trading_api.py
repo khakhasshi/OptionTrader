@@ -78,18 +78,47 @@ def test_stage_fails_before_gateway_when_audit_database_is_unavailable(
     assert called is False
 
 
+def test_stage_fails_before_gateway_when_confirmation_store_key_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
+    monkeypatch.delenv("OPTIONTRADER_CONFIRMATION_FERNET_KEY", raising=False)
+    called = False
+
+    def forbidden(*_args: object, **_kwargs: object) -> StageCandidateResult:
+        nonlocal called
+        called = True
+        return _result()
+
+    monkeypatch.setattr(main, "grpc_stage_candidate", forbidden)
+    response = TestClient(main.app).post(
+        "/api/v1/trading/candidates/stage", json=_plan().model_dump(mode="json")
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "confirmation_store_unavailable"
+    assert called is False
+
+
 def test_stage_returns_challenge_but_persistence_never_receives_it_as_separate_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     result = _result()
     observed: dict[str, Any] = {}
+    cipher = object()
     monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
+    monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: cipher)
     monkeypatch.setattr(main, "staged_plan_projection", lambda *_args: None)
     monkeypatch.setattr(main, "grpc_stage_candidate", lambda *_args: result)
 
-    def persist(_engine: object, plan: CandidateTradePlan, staged: StageCandidateResult) -> bool:
+    def persist(
+        _engine: object,
+        plan: CandidateTradePlan,
+        staged: StageCandidateResult,
+        received_cipher: object,
+    ) -> bool:
         observed["plan"] = plan
         observed["staged"] = staged
+        observed["cipher"] = received_cipher
         return True
 
     monkeypatch.setattr(main, "persist_staged_candidate", persist)
@@ -98,8 +127,8 @@ def test_stage_returns_challenge_but_persistence_never_receives_it_as_separate_i
     )
     assert response.status_code == 200
     assert "confirmation_token" not in response.json()
-    assert main._CONFIRMATION_TOKENS["order_demo_001"] == "confirmation-secret"
     assert observed["plan"].plan_hash == _plan().plan_hash
+    assert observed["cipher"] is cipher
 
 
 def test_confirmation_intent_is_durable_before_gateway_call(
@@ -110,11 +139,11 @@ def test_confirmation_intent_is_durable_before_gateway_call(
     working = result.order.model_copy(update={"state": "WORKING", "broker_order_id": "paper-1"})
     calls: list[str] = []
     monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
-    main._CONFIRMATION_TOKENS["order_demo_001"] = "confirmation-secret"
+    monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: object())
 
-    def intent(*_args: object, **_kwargs: object) -> bool:
+    def intent(*_args: object, **_kwargs: object) -> str:
         calls.append("intent")
-        return True
+        return "confirmation-secret"
 
     def confirm(*_args: object, **_kwargs: object) -> ExecutionOrder:
         calls.append("gateway")
@@ -124,7 +153,7 @@ def test_confirmation_intent_is_durable_before_gateway_call(
         calls.append("projection")
         return True
 
-    monkeypatch.setattr(main, "persist_confirmation_intent", intent)
+    monkeypatch.setattr(main, "claim_confirmation_intent", intent)
     monkeypatch.setattr(main, "grpc_confirm_candidate", confirm)
     monkeypatch.setattr(main, "persist_order_projection", projection)
     response = TestClient(main.app).post(
@@ -143,9 +172,10 @@ def test_repeated_confirmation_returns_existing_terminal_projection(
     assert result.order is not None
     working = result.order.model_copy(update={"state": "WORKING", "broker_order_id": "paper-1"})
     monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
-    main._CONFIRMATION_TOKENS["order_demo_001"] = "confirmation-secret"
-    monkeypatch.setattr(main, "persist_confirmation_intent", lambda *_args: False)
+    monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: object())
+    monkeypatch.setattr(main, "claim_confirmation_intent", lambda *_args: None)
     monkeypatch.setattr(main, "grpc_get_order", lambda *_args: working)
+    monkeypatch.setattr(main, "persist_order_projection", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(
         main,
         "grpc_confirm_candidate",
@@ -170,6 +200,7 @@ def test_existing_durable_order_with_lost_gateway_state_requires_reconciliation(
             return grpc.StatusCode.NOT_FOUND
 
     monkeypatch.setattr(main, "_require_execution_engine", lambda: object())
+    monkeypatch.setattr(main, "_require_confirmation_cipher", lambda: object())
     monkeypatch.setattr(
         main,
         "staged_plan_projection",

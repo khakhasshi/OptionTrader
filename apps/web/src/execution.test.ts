@@ -27,6 +27,9 @@ describe("parseExecutionTicket", () => {
         },
       }),
     ).toBeNull();
+    expect(
+      parseExecutionTicket({ ...TICKET, order: { ...TICKET.order, total_quantity: 2 } }),
+    ).toBeNull();
   });
 
   it("rejects malformed decimal and non-Z timestamps", () => {
@@ -56,5 +59,14 @@ describe("parseExecutionTicket", () => {
         updated_at_utc: "2099-07-21T14:30:02Z",
       }),
     ).toBe(true);
+    expect(
+      isNewerExecutionOrder(current, {
+        ...current,
+        state: "PARTIAL_FILL",
+        state_version: 5,
+        filled_quantity: 0,
+        updated_at_utc: "2099-07-21T14:30:02Z",
+      }),
+    ).toBe(false);
   });
 });

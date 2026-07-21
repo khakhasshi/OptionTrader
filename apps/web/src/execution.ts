@@ -212,7 +212,8 @@ export function parseExecutionTicket(value: unknown): ExecutionTicket | null {
     plan.idempotency_key !== order.idempotency_key ||
     plan.session_id !== order.session_id ||
     plan.broker_id !== order.broker_id ||
-    plan.execution_mode !== order.execution_mode
+    plan.execution_mode !== order.execution_mode ||
+    plan.legs[0]?.quantity !== order.total_quantity
   )
     return null;
   return { plan, order };
@@ -226,7 +227,10 @@ export function isNewerExecutionOrder(current: ExecutionOrder, incoming: Executi
     return Date.parse(incoming.updated_at_utc) > Date.parse(current.updated_at_utc);
   }
   if (incoming.state_version !== current.state_version) {
-    return incoming.state_version > current.state_version;
+    return (
+      incoming.state_version > current.state_version &&
+      incoming.filled_quantity >= current.filled_quantity
+    );
   }
   return (
     incoming.state === current.state &&

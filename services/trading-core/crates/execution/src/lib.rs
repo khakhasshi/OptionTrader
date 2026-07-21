@@ -199,11 +199,11 @@ impl OrderRecord {
             || order.idempotency_key != self.idempotency_key
             || order.total_quantity != self.total_quantity
             || order.filled_quantity > order.total_quantity
+            || order.filled_quantity < self.filled_quantity
         {
             return Err(ExecutionError::DuplicateConflict);
         }
-        self.broker_order_id = Some(order.broker_order_id.clone());
-        self.filled_quantity = order.filled_quantity;
+        let previous_filled_quantity = self.filled_quantity;
         let (target, kind) = match order.status {
             BrokerOrderStatus::Working => (OrderState::Working, "BROKER_WORKING"),
             BrokerOrderStatus::PartialFill => (OrderState::PartialFill, "BROKER_PARTIAL_FILL"),
@@ -211,8 +211,19 @@ impl OrderRecord {
             BrokerOrderStatus::Cancelled => (OrderState::Cancelled, "BROKER_CANCELLED"),
             BrokerOrderStatus::Rejected => (OrderState::Rejected, "BROKER_REJECTED"),
         };
+        if self.state == target
+            && order.filled_quantity != previous_filled_quantity
+            && target != OrderState::PartialFill
+        {
+            return Err(ExecutionError::DuplicateConflict);
+        }
+        self.broker_order_id = Some(order.broker_order_id.clone());
+        self.filled_quantity = order.filled_quantity;
         if self.state == target {
-            return Ok(());
+            if order.filled_quantity == previous_filled_quantity {
+                return Ok(());
+            }
+            return self.transition(target, "BROKER_PARTIAL_FILL_PROGRESS", at);
         }
         self.transition(target, kind, at)
     }
@@ -417,6 +428,60 @@ mod tests {
         record.apply_broker_order(&cancelled, now()).unwrap();
         assert_eq!(record.state, OrderState::Cancelled);
         assert_eq!(record.filled_quantity, 1);
+    }
+
+    #[test]
+    fn repeated_partial_fill_progress_increments_version_and_never_regresses() {
+        let mut record = OrderRecord::proposed(
+            "order-progress".into(),
+            "plan-progress".into(),
+            "a".repeat(64),
+            "key-progress".into(),
+            now() + Duration::minutes(1),
+            3,
+        )
+        .unwrap();
+        record.initial_risk(true, now()).unwrap();
+        record
+            .confirm("confirm-progress".into(), &"a".repeat(64), now())
+            .unwrap();
+        record.begin_submit(now()).unwrap();
+        let partial = BrokerOrder {
+            broker_order_id: "broker-progress".into(),
+            idempotency_key: "key-progress".into(),
+            plan_hash: "a".repeat(64),
+            status: BrokerOrderStatus::PartialFill,
+            total_quantity: 3,
+            filled_quantity: 1,
+            limit_price: Decimal::ONE,
+            legs: vec![BrokerOrderLeg {
+                contract_id: "QQQ-20260721-C-500".into(),
+                side: OrderSide::Buy,
+                quantity: 3,
+            }],
+        };
+        record.apply_broker_order(&partial, now()).unwrap();
+        let first_version = record.events.len();
+
+        let progressed = BrokerOrder {
+            filled_quantity: 2,
+            ..partial.clone()
+        };
+        record
+            .apply_broker_order(&progressed, now() + Duration::seconds(1))
+            .unwrap();
+        assert_eq!(record.events.len(), first_version + 1);
+        assert_eq!(record.filled_quantity, 2);
+        assert_eq!(
+            record.events.last().unwrap().kind,
+            "BROKER_PARTIAL_FILL_PROGRESS"
+        );
+
+        assert_eq!(
+            record.apply_broker_order(&partial, now() + Duration::seconds(2)),
+            Err(ExecutionError::DuplicateConflict)
+        );
+        assert_eq!(record.filled_quantity, 2);
     }
 
     #[test]

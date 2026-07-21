@@ -67,20 +67,20 @@ Application API 仍保留同一个 `session_id` 的 `CockpitProjector`，新的
    `.env.example` 的占位数值解释为生产批准。
 2. `DATABASE_URL` 不可用时，Application API 必须在调用 Rust 前返回
    `execution_audit_unavailable`。不得临时绕过审计继续提交。
-3. Stage 返回的确认令牌只保存在 Application API 内存，不出现在 REST 响应、数据库或
-   日志。确认页面必须展示 plan hash、全部腿、最大损失、Broker、模式和到期时间，并由
-   操作者勾选精确计划确认。
+3. Stage 返回的确认令牌不出现在 REST、浏览器或日志；Application API 使用
+   `OPTIONTRADER_CONFIRMATION_FERNET_KEY` 加密后写入 PostgreSQL capability store。
+   密钥缺失或无效时必须在调用 Rust 前返回 `confirmation_store_unavailable`。确认页面
+   必须展示 plan hash、全部腿、最大损失、Broker、模式和到期时间，并由操作者勾选。
 4. 确认后 Rust 重新执行 Final Risk Check。市场、事件、账户、限额、规则版本、快照或
    TTL 任一变化都可否决，不得通过再次点击或修改前端状态覆盖。
 5. 当前 PAPER/MANUAL_CONFIRM 只进入内存 PaperBroker；真实 Longbridge/IBKR adapter
    未启用，`LIVE_TRADING_ENABLED=false` 必须保持不变。Broker sidecar 仅绑定本机。
-6. Trading Core 或 Application API 重启会丢失 workflow/确认能力。若 PostgreSQL 已有
-   非终态订单而 Rust 返回 NotFound，系统应返回 `execution_reconciliation_required` 或
-   `confirmation_reconciliation_required` 并保持 No Trade；当前版本不支持自动恢复，
-   禁止删除数据库行或重建同一计划来绕过。
+6. Trading Core 重启会丢失 workflow；Application API 重启后可读取共享密文 capability，
+   但 Rust 返回 NotFound 时仍应返回 `execution_reconciliation_required` 并保持 No Trade。
+   当前版本不支持自动恢复，禁止删除数据库行或重建同一计划来绕过。
 7. 订单进入 `RECONCILE_PENDING`、BrokerHealth 非 HEALTHY、账本不一致或 kill switch
    激活时，禁止新开仓；撤单/减仓恢复路径不得依赖 LLM。
-8. 当前 Application API 必须单 worker 运行。`OPTIONTRADER_API_WORKERS`、
-   `WEB_CONCURRENCY`、`UVICORN_WORKERS` 任一设置时都必须严格等于 `1`；不得用
-   `uvicorn --workers 2` 等命令绕过。需要横向扩展前，必须先引入经过评审的共享确认
-   capability store 或将确认能力完全收归 Rust。
+8. capability claim 使用 PostgreSQL 行锁，可跨 API worker 仲裁；CLI worker 参数不再是
+   确认安全边界。实时 SessionHub 仍是每进程实例，完整横向扩展尚未认证，paper soak 前
+   仍建议单 worker。若 Confirm 的 gRPC 已成功但投影写入失败，claim 不得自动释放；先调用
+   GetOrder 对账并回填投影，确认 Rust 已停留在非 `AWAITING_CONFIRMATION` 状态。

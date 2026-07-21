@@ -16,8 +16,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from functools import lru_cache
-from threading import RLock
-from typing import Annotated, Literal, Mapping
+from typing import Annotated, Literal
 
 import grpc
 import httpx
@@ -36,8 +35,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.persistence import (
+    claim_confirmation_intent,
     latest_execution_ticket,
-    persist_confirmation_intent,
     persist_order_projection,
     persist_staged_candidate,
     staged_plan_projection,
@@ -50,26 +49,11 @@ from app.trading.grpc_client import (
     get_order as grpc_get_order,
     stage_candidate as grpc_stage_candidate,
 )
+from app.trading.capability import ConfirmationCipher
 from app.trading.models import CandidateTradePlan, ExecutionOrder, RiskDecision
 
 __all__ = ["app", "httpx"]
 
-
-def _validate_single_worker_configuration(environment: Mapping[str, str]) -> None:
-    """Opaque confirmation capabilities are process-local by design."""
-    for name in ("OPTIONTRADER_API_WORKERS", "WEB_CONCURRENCY", "UVICORN_WORKERS"):
-        raw = environment.get(name)
-        if raw is None:
-            continue
-        try:
-            workers = int(raw)
-        except ValueError as exc:
-            raise RuntimeError(f"{name} must be the integer 1") from exc
-        if workers != 1:
-            raise RuntimeError(f"{name}=1 is required while confirmation tokens are process-local")
-
-
-_validate_single_worker_configuration(os.environ)
 
 app = FastAPI(title="OptionTrader Application API", version="0.0.0")
 
@@ -92,6 +76,21 @@ def _require_execution_engine() -> Engine:
     if not database_url:
         raise HTTPException(status_code=503, detail="execution_audit_unavailable")
     return _execution_engine(database_url)
+
+
+@lru_cache(maxsize=2)
+def _confirmation_cipher(key: str) -> ConfirmationCipher:
+    return ConfirmationCipher(key)
+
+
+def _require_confirmation_cipher() -> ConfirmationCipher:
+    key = os.getenv("OPTIONTRADER_CONFIRMATION_FERNET_KEY")
+    if not key:
+        raise HTTPException(status_code=503, detail="confirmation_store_unavailable")
+    try:
+        return _confirmation_cipher(key)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="confirmation_store_unavailable") from exc
 
 
 def _grpc_http_error(exc: grpc.RpcError) -> HTTPException:
@@ -122,10 +121,6 @@ class ExecutionTicket(BaseModel):
 
     plan: CandidateTradePlan
     order: ExecutionOrder
-
-
-_CONFIRMATION_TOKENS: dict[str, str] = {}
-_CONFIRMATION_TOKENS_LOCK = RLock()
 
 
 def _check_utc(v: str) -> str:
@@ -325,6 +320,7 @@ def event_context() -> JSONResponse:
 def stage_trading_candidate(plan: CandidateTradePlan) -> StagedCandidateView:
     """Run Rust Initial Risk, issue a hash-bound confirmation challenge, and audit it."""
     engine = _require_execution_engine()
+    cipher = _require_confirmation_cipher()
     try:
         existing = staged_plan_projection(engine, plan.plan_id)
         if existing is not None:
@@ -345,10 +341,7 @@ def stage_trading_candidate(plan: CandidateTradePlan) -> StagedCandidateView:
             ):
                 raise HTTPException(status_code=409, detail="execution_reconciliation_required")
         result = grpc_stage_candidate(plan, current_event_context())
-        persist_staged_candidate(engine, plan, result)
-        if result.order is not None:
-            with _CONFIRMATION_TOKENS_LOCK:
-                _CONFIRMATION_TOKENS[result.order.order_id] = result.confirmation_token
+        persist_staged_candidate(engine, plan, result, cipher)
         return StagedCandidateView(
             initial_risk_decision=result.initial_risk_decision,
             order=result.order,
@@ -363,18 +356,26 @@ def stage_trading_candidate(plan: CandidateTradePlan) -> StagedCandidateView:
 def confirm_trading_order(order_id: str, body: ConfirmOrderRequest) -> ExecutionOrder:
     """Audit intent, then ask Rust to rerun Final Risk and submit paper/shadow."""
     engine = _require_execution_engine()
+    cipher = _require_confirmation_cipher()
     try:
-        with _CONFIRMATION_TOKENS_LOCK:
-            confirmation_token = _CONFIRMATION_TOKENS.get(order_id)
+        confirmation_token = claim_confirmation_intent(
+            engine,
+            order_id,
+            body.plan_hash,
+            "local-operator",
+            cipher,
+        )
         if confirmation_token is None:
-            raise HTTPException(status_code=409, detail="confirmation_reconciliation_required")
-        recorded = persist_confirmation_intent(engine, order_id, body.plan_hash, "local-operator")
-        if not recorded:
             existing = grpc_get_order(order_id)
             if existing.state != "AWAITING_CONFIRMATION":
-                with _CONFIRMATION_TOKENS_LOCK:
-                    _CONFIRMATION_TOKENS.pop(order_id, None)
+                persist_order_projection(
+                    engine,
+                    existing,
+                    action="ORDER_RECONCILED",
+                    actor="rust-execution-gateway",
+                )
                 return existing
+            raise HTTPException(status_code=409, detail="confirmation_reconciliation_required")
         order = grpc_confirm_candidate(
             order_id,
             body.plan_hash,
@@ -387,9 +388,6 @@ def confirm_trading_order(order_id: str, body: ConfirmOrderRequest) -> Execution
             action="ORDER_CONFIRM_RESULT",
             actor="rust-execution-gateway",
         )
-        if order.state != "AWAITING_CONFIRMATION":
-            with _CONFIRMATION_TOKENS_LOCK:
-                _CONFIRMATION_TOKENS.pop(order_id, None)
         return order
     except grpc.RpcError as exc:
         raise _grpc_http_error(exc) from exc

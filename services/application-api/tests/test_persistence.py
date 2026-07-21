@@ -9,30 +9,33 @@ without a live Postgres.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+from threading import Event, current_thread
 from typing import Any, cast
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator
+from cryptography.fernet import Fernet
 import pytest
 from referencing import Registry, Resource
-from sqlalchemy import create_engine, event, select, text
+from sqlalchemy import create_engine, event, select, text, update
 from sqlalchemy.engine import Engine
 
 from app.persistence import (
     SignalContext,
     audit_events,
     candidate_trade_plans,
+    claim_confirmation_intent,
+    confirmation_capabilities,
     build_signal_contract,
     build_signal_rows,
     event_contexts,
     metadata,
     order_events,
     orders,
-    persist_confirmation_intent,
     persist_order_projection,
     persist_signal,
     persist_event_context,
@@ -40,6 +43,7 @@ from app.persistence import (
     risk_decisions,
     signals,
 )
+from app.persistence import repository
 from app.events import unavailable_event_context
 from app.regime import CHAOS, EVENT, NO_TRADE as REGIME_NO_TRADE, RANGE, TREND, RegimeState
 from app.strategy import (
@@ -56,9 +60,15 @@ from app.trading.models import (
     RiskDecision,
     StageCandidateResult,
 )
+from app.trading.capability import ConfirmationCipher
 
 UTC = timezone.utc
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture()
+def confirmation_cipher() -> ConfirmationCipher:
+    return ConfirmationCipher(Fernet.generate_key().decode("ascii"))
 
 
 def _signal_validator() -> Draft202012Validator:
@@ -333,15 +343,18 @@ def _staged_models() -> tuple[CandidateTradePlan, StageCandidateResult]:
     )
 
 
-def test_execution_persistence_is_atomic_idempotent_and_omits_token(engine: Engine) -> None:
+def test_execution_persistence_is_atomic_idempotent_and_encrypts_token(
+    engine: Engine, confirmation_cipher: ConfirmationCipher
+) -> None:
     plan, result = _staged_models()
-    assert persist_staged_candidate(engine, plan, result) is True
-    assert persist_staged_candidate(engine, plan, result) is False
+    assert persist_staged_candidate(engine, plan, result, confirmation_cipher) is True
+    assert persist_staged_candidate(engine, plan, result, confirmation_cipher) is False
 
     with engine.connect() as conn:
         plan_row = conn.execute(select(candidate_trade_plans)).mappings().one()
         risk_row = conn.execute(select(risk_decisions)).mappings().one()
         order_row = conn.execute(select(orders)).mappings().one()
+        capability_row = conn.execute(select(confirmation_capabilities)).mappings().one()
         event_row = conn.execute(select(order_events)).mappings().one()
         audit_rows = conn.execute(select(audit_events)).mappings().all()
     serialized = json.dumps(
@@ -353,15 +366,55 @@ def test_execution_persistence_is_atomic_idempotent_and_omits_token(engine: Engi
         ]
     )
     assert "never-persist-this" not in serialized
+    assert capability_row["token_ciphertext"] != "never-persist-this"
+    assert confirmation_cipher.decrypt(capability_row["token_ciphertext"]) == "never-persist-this"
     assert order_row["status"] == "AWAITING_CONFIRMATION"
+    assert order_row["state_version"] == 1
 
 
-def test_confirmation_intent_precedes_order_projection_and_is_idempotent(engine: Engine) -> None:
+def test_execution_persistence_rejects_combo_quantity_mismatch(
+    engine: Engine, confirmation_cipher: ConfirmationCipher
+) -> None:
     plan, result = _staged_models()
-    persist_staged_candidate(engine, plan, result)
-    assert persist_confirmation_intent(engine, "order_demo_001", plan.plan_hash, "local-operator")
-    assert not persist_confirmation_intent(
-        engine, "order_demo_001", plan.plan_hash, "local-operator"
+    assert result.order is not None
+    mismatched = result.model_copy(
+        update={"order": result.order.model_copy(update={"total_quantity": 2})}
+    )
+    with pytest.raises(ValueError, match="does not match candidate plan"):
+        persist_staged_candidate(engine, plan, mismatched, confirmation_cipher)
+
+
+def test_confirmation_intent_claim_is_shared_one_time_and_precedes_projection(
+    engine: Engine,
+    confirmation_cipher: ConfirmationCipher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        repository,
+        "_now_utc",
+        lambda: datetime(2026, 7, 20, 14, 30, 10, tzinfo=UTC),
+    )
+    plan, result = _staged_models()
+    persist_staged_candidate(engine, plan, result, confirmation_cipher)
+    assert (
+        claim_confirmation_intent(
+            engine,
+            "order_demo_001",
+            plan.plan_hash,
+            "local-operator",
+            confirmation_cipher,
+        )
+        == "never-persist-this"
+    )
+    assert (
+        claim_confirmation_intent(
+            engine,
+            "order_demo_001",
+            plan.plan_hash,
+            "local-operator",
+            confirmation_cipher,
+        )
+        is None
     )
     assert result.order is not None
     working = result.order.model_copy(
@@ -380,14 +433,17 @@ def test_confirmation_intent_precedes_order_projection_and_is_idempotent(engine:
     )
     with engine.connect() as conn:
         assert conn.execute(select(orders.c.status)).scalar_one() == "WORKING"
+        assert conn.execute(select(confirmation_capabilities)).first() is None
         actions = conn.execute(select(audit_events.c.action)).scalars().all()
     assert "CONFIRMATION_REQUESTED" in actions
     assert "ORDER_CONFIRMED" in actions
 
 
-def test_order_projection_rejects_stale_or_conflicting_versions(engine: Engine) -> None:
+def test_order_projection_rejects_stale_or_conflicting_versions(
+    engine: Engine, confirmation_cipher: ConfirmationCipher
+) -> None:
     plan, result = _staged_models()
-    persist_staged_candidate(engine, plan, result)
+    persist_staged_candidate(engine, plan, result, confirmation_cipher)
     assert result.order is not None
     working = result.order.model_copy(
         update={
@@ -432,6 +488,7 @@ def test_order_projection_rejects_stale_or_conflicting_versions(engine: Engine) 
         row = conn.execute(select(orders)).mappings().one()
     assert row["status"] == "PARTIAL_FILL"
     assert row["filled_quantity"] == 2
+    assert row["state_version"] == 6
     assert row["payload"]["state_version"] == 6
 
 
@@ -538,5 +595,200 @@ def test_postgresql_migration_and_concurrent_idempotency() -> None:
             conn.execute(
                 text("DELETE FROM trading.trading_sessions WHERE session_id=:id"),
                 {"id": session_id},
+            )
+
+
+@pytest.mark.skipif(not os.getenv("DATABASE_URL"), reason="DATABASE_URL is required")
+def test_postgresql_order_projection_cannot_regress_during_concurrent_write() -> None:
+    """A stale writer must re-read the row after the competing transaction commits."""
+    raw_url = os.environ["DATABASE_URL"]
+    pg_engine = create_engine(raw_url.replace("postgresql://", "postgresql+psycopg://", 1))
+    suffix = uuid4().hex
+    now = datetime.now(UTC).replace(microsecond=0)
+    created = now.isoformat().replace("+00:00", "Z")
+    expires = (now + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    plan_base, result_base = _staged_models()
+    assert result_base.order is not None
+    plan = plan_base.model_copy(
+        update={
+            "plan_id": f"plan-{suffix}",
+            "plan_hash": suffix * 2,
+            "idempotency_key": f"idem-{suffix}",
+            "session_id": f"session-{suffix}",
+            "signal_id": f"signal-{suffix}",
+            "created_at_utc": created,
+            "expires_at_utc": expires,
+        }
+    )
+    decision = result_base.initial_risk_decision.model_copy(
+        update={
+            "decision_id": f"decision-{suffix}",
+            "plan_id": plan.plan_id,
+            "plan_hash": plan.plan_hash,
+            "session_id": plan.session_id,
+            "occurred_at_utc": created,
+        }
+    )
+    staged_order = result_base.order.model_copy(
+        update={
+            "order_id": f"order-{suffix}",
+            "plan_id": plan.plan_id,
+            "plan_hash": plan.plan_hash,
+            "idempotency_key": plan.idempotency_key,
+            "session_id": plan.session_id,
+            "expires_at_utc": expires,
+            "updated_at_utc": created,
+        }
+    )
+    staged = StageCandidateResult(
+        initial_risk_decision=decision,
+        order=staged_order,
+        confirmation_token="concurrent-secret",
+    )
+    cipher = ConfirmationCipher(Fernet.generate_key().decode("ascii"))
+    try:
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO trading.trading_sessions "
+                    "(session_id, trading_date, status) VALUES (:id, CURRENT_DATE, 'PAPER')"
+                ),
+                {"id": plan.session_id},
+            )
+        persist_signal(
+            pg_engine,
+            SignalContext(plan.signal_id, plan.session_id, now, "rules-p3-test"),
+            _regime(),
+            _vol(),
+            _decision(),
+        )
+        assert persist_staged_candidate(pg_engine, plan, staged, cipher)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claims = list(
+                executor.map(
+                    lambda _: claim_confirmation_intent(
+                        pg_engine,
+                        staged_order.order_id,
+                        plan.plan_hash,
+                        "concurrent-operator",
+                        cipher,
+                    ),
+                    range(2),
+                )
+            )
+        assert claims.count("concurrent-secret") == 1
+        assert claims.count(None) == 1
+
+        stale = staged_order.model_copy(
+            update={
+                "state": "WORKING",
+                "state_version": 4,
+                "broker_order_id": "paper-stale",
+                "updated_at_utc": (now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        authoritative = stale.model_copy(
+            update={
+                "state": "PARTIAL_FILL",
+                "state_version": 5,
+                "filled_quantity": 1,
+                "broker_order_id": "paper-authoritative",
+                "updated_at_utc": (now + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        stale_select_started = Event()
+
+        def observe_stale_select(
+            _conn: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            if (
+                current_thread().name.startswith("stale-writer")
+                and "FOR UPDATE" in statement
+                and staged_order.order_id in str(_parameters)
+            ):
+                stale_select_started.set()
+
+        event.listen(pg_engine, "before_cursor_execute", observe_stale_select)
+        try:
+            with pg_engine.connect() as blocker:
+                transaction = blocker.begin()
+                blocker.execute(
+                    select(orders)
+                    .where(orders.c.order_id == staged_order.order_id)
+                    .with_for_update()
+                )
+                with ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="stale-writer"
+                ) as executor:
+                    future = executor.submit(
+                        persist_order_projection,
+                        pg_engine,
+                        stale,
+                        action="STALE_CONCURRENT_WRITE",
+                        actor="test",
+                    )
+                    assert stale_select_started.wait(timeout=2)
+                    blocker.execute(
+                        update(orders)
+                        .where(orders.c.order_id == staged_order.order_id)
+                        .values(
+                            status=authoritative.state,
+                            filled_quantity=authoritative.filled_quantity,
+                            state_version=authoritative.state_version,
+                            broker_order_id=authoritative.broker_order_id,
+                            payload=authoritative.model_dump(mode="json"),
+                            updated_at_utc=now + timedelta(seconds=2),
+                        )
+                    )
+                    transaction.commit()
+                    assert future.result(timeout=5) is False
+        finally:
+            event.remove(pg_engine, "before_cursor_execute", observe_stale_select)
+
+        with pg_engine.connect() as conn:
+            row = (
+                conn.execute(select(orders).where(orders.c.order_id == staged_order.order_id))
+                .mappings()
+                .one()
+            )
+        assert row["state_version"] == 5
+        assert row["filled_quantity"] == 1
+        assert row["payload"]["state"] == "PARTIAL_FILL"
+    finally:
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM audit.audit_events WHERE session_id=:session_id"),
+                {"session_id": plan.session_id},
+            )
+            conn.execute(
+                text("DELETE FROM trading.order_events WHERE order_id=:id"),
+                {"id": staged_order.order_id},
+            )
+            conn.execute(
+                text("DELETE FROM risk.confirmation_capabilities WHERE order_id=:id"),
+                {"id": staged_order.order_id},
+            )
+            conn.execute(
+                text("DELETE FROM risk.risk_decisions WHERE plan_id=:id"), {"id": plan.plan_id}
+            )
+            conn.execute(
+                text("DELETE FROM trading.orders WHERE order_id=:id"),
+                {"id": staged_order.order_id},
+            )
+            conn.execute(
+                text("DELETE FROM trading.candidate_trade_plans WHERE plan_id=:id"),
+                {"id": plan.plan_id},
+            )
+            conn.execute(
+                text("DELETE FROM trading.signals WHERE signal_id=:id"), {"id": plan.signal_id}
+            )
+            conn.execute(
+                text("DELETE FROM trading.trading_sessions WHERE session_id=:id"),
+                {"id": plan.session_id},
             )
         pg_engine.dispose()

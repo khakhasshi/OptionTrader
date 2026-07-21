@@ -206,6 +206,16 @@ def stage_candidate(
         if not raw.HasField("initial_risk_decision"):
             raise ValueError("Rust omitted initial risk decision")
         order = order_from_proto(raw.order) if raw.HasField("order") else None
+        if order is not None and (
+            order.plan_id != plan.plan_id
+            or order.plan_hash != plan.plan_hash
+            or order.idempotency_key != plan.idempotency_key
+            or order.session_id != plan.session_id
+            or order.broker_id != plan.broker_id
+            or order.execution_mode != plan.execution_mode
+            or order.total_quantity != plan.legs[0].quantity
+        ):
+            raise ValueError("Rust order does not match the staged candidate plan")
         return StageCandidateResult(
             initial_risk_decision=decision_from_proto(raw.initial_risk_decision),
             order=order,

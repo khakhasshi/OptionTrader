@@ -99,4 +99,36 @@ describe("ExecutionPanel", () => {
     expect(screen.getByText("WORKING")).toBeInTheDocument();
     expect(screen.queryByText("AWAITING_CONFIRMATION")).not.toBeInTheDocument();
   });
+
+  it("retains the monotonic anchor across an unavailable polling window", async () => {
+    const responses: Array<Response> = [
+      {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ...TICKET,
+          order: {
+            ...TICKET.order,
+            state: "WORKING",
+            state_version: 4,
+            broker_order_id: "paper-1",
+            updated_at_utc: "2099-07-21T14:30:04Z",
+          },
+        }),
+      } as Response,
+      { ok: false, status: 503, json: async () => ({}) } as Response,
+      { ok: true, status: 200, json: async () => TICKET } as Response,
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => responses.shift() ?? responses[2]) as typeof fetch);
+    render(<ExecutionPanel sessionId="live" canTrade />);
+    expect(await screen.findByText("WORKING")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh execution state" }));
+    expect(await screen.findByText("Execution audit unavailable")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh execution state" }));
+
+    expect(await screen.findByText("WORKING")).toBeInTheDocument();
+    expect(screen.queryByText("AWAITING_CONFIRMATION")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
+  });
 });

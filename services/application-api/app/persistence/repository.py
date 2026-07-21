@@ -15,7 +15,7 @@ from datetime import date, datetime, timezone
 from hashlib import sha256
 from typing import Any
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import delete, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
@@ -24,6 +24,7 @@ from app.persistence.serialize import SignalContext, build_signal_rows
 from app.persistence.tables import (
     audit_events,
     candidate_trade_plans,
+    confirmation_capabilities,
     event_contexts,
     order_events,
     orders,
@@ -35,6 +36,7 @@ from app.regime import RegimeState
 from app.strategy import StrategyDecision
 from app.vol import VolState
 from app.trading.models import CandidateTradePlan, ExecutionOrder, StageCandidateResult
+from app.trading.capability import ConfirmationCipher
 
 
 def _now_utc() -> datetime:
@@ -164,17 +166,25 @@ def persist_staged_candidate(
     engine: Engine,
     plan: CandidateTradePlan,
     result: StageCandidateResult,
+    cipher: ConfirmationCipher,
 ) -> bool:
     """Persist plan, initial Rust risk, optional order and audit atomically.
 
-    The opaque confirmation token is deliberately never serialized here.
+    The opaque confirmation token is encrypted into a short-lived shared store;
+    plaintext never enters PostgreSQL, REST, audit payloads or logs.
     Repeating an identical deterministic plan is an idempotent no-op.
     """
     decision = result.initial_risk_decision
     if decision.plan_id != plan.plan_id or decision.plan_hash != plan.plan_hash:
         raise ValueError("risk decision does not match candidate plan")
     if result.order is not None and (
-        result.order.plan_id != plan.plan_id or result.order.plan_hash != plan.plan_hash
+        result.order.plan_id != plan.plan_id
+        or result.order.plan_hash != plan.plan_hash
+        or result.order.idempotency_key != plan.idempotency_key
+        or result.order.session_id != plan.session_id
+        or result.order.broker_id != plan.broker_id
+        or result.order.execution_mode != plan.execution_mode
+        or result.order.total_quantity != plan.legs[0].quantity
     ):
         raise ValueError("execution order does not match candidate plan")
     occurred = datetime.fromisoformat(decision.occurred_at_utc.replace("Z", "+00:00"))
@@ -246,6 +256,7 @@ def persist_staged_candidate(
                     side="COMBO",
                     quantity=order.total_quantity,
                     filled_quantity=order.filled_quantity,
+                    state_version=order.state_version,
                     limit_price=plan.limit_price,
                     broker_order_id=order.broker_order_id,
                     payload=order.model_dump(mode="json"),
@@ -253,6 +264,18 @@ def persist_staged_candidate(
                     updated_at_utc=datetime.fromisoformat(
                         order.updated_at_utc.replace("Z", "+00:00")
                     ),
+                )
+            )
+            conn.execute(
+                confirmation_capabilities.insert().values(
+                    order_id=order.order_id,
+                    plan_hash=order.plan_hash,
+                    token_ciphertext=cipher.encrypt(result.confirmation_token),
+                    expires_at_utc=datetime.fromisoformat(
+                        order.expires_at_utc.replace("Z", "+00:00")
+                    ),
+                    claimed_at_utc=None,
+                    created_at_utc=created,
                 )
             )
             conn.execute(
@@ -269,30 +292,79 @@ def persist_staged_candidate(
     return True
 
 
-def persist_confirmation_intent(
+def claim_confirmation_intent(
     engine: Engine,
     order_id: str,
     plan_hash: str,
     actor: str,
-) -> bool:
-    """Durably record operator intent before crossing the Rust submit boundary."""
+    cipher: ConfirmationCipher,
+) -> str | None:
+    """Atomically claim a shared capability and audit operator intent.
+
+    A claim is deliberately not released after an uncertain gRPC outcome. The
+    caller must reconcile against Rust before another submission attempt.
+    """
     if not actor or not order_id or len(plan_hash) != 64:
         raise ValueError("confirmation intent fields are invalid")
     event_id = f"confirm_{order_id}_{plan_hash[:16]}"
     occurred = _now_utc()
     with engine.begin() as conn:
-        order = conn.execute(select(orders).where(orders.c.order_id == order_id)).mappings().one()
-        if order["status"] != "AWAITING_CONFIRMATION":
-            return False
+        row = (
+            conn.execute(
+                select(
+                    orders.c.status,
+                    orders.c.session_id,
+                    confirmation_capabilities.c.plan_hash,
+                    confirmation_capabilities.c.token_ciphertext,
+                    confirmation_capabilities.c.expires_at_utc,
+                    confirmation_capabilities.c.claimed_at_utc,
+                )
+                .join(
+                    confirmation_capabilities,
+                    confirmation_capabilities.c.order_id == orders.c.order_id,
+                )
+                .where(orders.c.order_id == order_id)
+                .with_for_update()
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None or row["status"] != "AWAITING_CONFIRMATION":
+            return None
+        if row["plan_hash"] != plan_hash:
+            raise ValueError("confirmation plan hash conflicts with staged capability")
+        expires_at = row["expires_at_utc"]
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= occurred:
+            conn.execute(
+                delete(confirmation_capabilities).where(
+                    confirmation_capabilities.c.order_id == order_id
+                )
+            )
+            return None
+        if row["claimed_at_utc"] is not None:
+            return None
         existing = conn.execute(
             select(audit_events.c.event_id).where(audit_events.c.event_id == event_id)
         ).first()
         if existing is not None:
-            return False
+            raise ValueError("confirmation intent exists without a claimed capability")
+        token = cipher.decrypt(str(row["token_ciphertext"]))
+        claimed = conn.execute(
+            update(confirmation_capabilities)
+            .where(
+                confirmation_capabilities.c.order_id == order_id,
+                confirmation_capabilities.c.claimed_at_utc.is_(None),
+            )
+            .values(claimed_at_utc=occurred)
+        )
+        if claimed.rowcount != 1:
+            return None
         conn.execute(
             audit_events.insert().values(
                 event_id=event_id,
-                session_id=order["session_id"],
+                session_id=row["session_id"],
                 occurred_at_utc=occurred,
                 actor=actor,
                 action="CONFIRMATION_REQUESTED",
@@ -304,7 +376,7 @@ def persist_confirmation_intent(
                 created_at_utc=occurred,
             )
         )
-    return True
+    return token
 
 
 def persist_order_projection(
@@ -320,7 +392,11 @@ def persist_order_projection(
     payload = order.model_dump(mode="json")
     with engine.begin() as conn:
         current = (
-            conn.execute(select(orders).where(orders.c.order_id == order.order_id)).mappings().one()
+            conn.execute(
+                select(orders).where(orders.c.order_id == order.order_id).with_for_update()
+            )
+            .mappings()
+            .one()
         )
         if (
             current["plan_id"] != order.plan_id
@@ -328,9 +404,21 @@ def persist_order_projection(
         ):
             raise ValueError("Rust order projection conflicts with persisted identity")
         current_order = ExecutionOrder.model_validate(current["payload"])
-        if order.state_version < current_order.state_version:
+        if (
+            current_order.plan_hash != order.plan_hash
+            or current_order.session_id != order.session_id
+            or current_order.broker_id != order.broker_id
+            or current_order.execution_mode != order.execution_mode
+            or current_order.total_quantity != order.total_quantity
+            or current_order.expires_at_utc != order.expires_at_utc
+        ):
+            raise ValueError("Rust order projection changed immutable order fields")
+        current_version = int(current["state_version"])
+        if current_order.state_version != current_version:
+            raise ValueError("order state_version column conflicts with payload")
+        if order.state_version < current_version:
             return False
-        if order.state_version == current_order.state_version:
+        if order.state_version == current_version:
             current_content = current_order.model_dump(mode="json", exclude={"updated_at_utc"})
             incoming_content = order.model_dump(mode="json", exclude={"updated_at_utc"})
             if current_content != incoming_content:
@@ -339,22 +427,34 @@ def persist_order_projection(
         if order.filled_quantity < current_order.filled_quantity:
             raise ValueError("Rust order projection reduced filled quantity")
         from_status = str(current["status"])
-        conn.execute(
+        updated = conn.execute(
             update(orders)
-            .where(orders.c.order_id == order.order_id)
+            .where(
+                orders.c.order_id == order.order_id,
+                orders.c.state_version == current_version,
+            )
             .values(
                 status=order.state,
                 filled_quantity=order.filled_quantity,
+                state_version=order.state_version,
                 broker_order_id=order.broker_order_id,
                 payload=payload,
                 updated_at_utc=occurred,
             )
         )
+        if updated.rowcount != 1:
+            raise ValueError("concurrent order projection update lost version arbitration")
         conn.execute(
             update(candidate_trade_plans)
             .where(candidate_trade_plans.c.plan_id == order.plan_id)
             .values(status=order.state)
         )
+        if order.state != "AWAITING_CONFIRMATION":
+            conn.execute(
+                delete(confirmation_capabilities).where(
+                    confirmation_capabilities.c.order_id == order.order_id
+                )
+            )
         conn.execute(
             order_events.insert().values(
                 order_id=order.order_id,
@@ -440,7 +540,7 @@ def staged_plan_projection(
 
 
 __all__ = [
-    "persist_confirmation_intent",
+    "claim_confirmation_intent",
     "persist_event_context",
     "persist_order_projection",
     "persist_signal",

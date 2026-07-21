@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     Column,
     Date,
     DateTime,
@@ -110,13 +111,27 @@ orders = Table(
     Column("side", Text, nullable=False),
     Column("quantity", Numeric, nullable=False),
     Column("filled_quantity", Numeric, nullable=False),
+    Column("state_version", BigInteger, nullable=False),
     Column("limit_price", Numeric),
     Column("broker_order_id", Text, unique=True),
     Column("payload", _JSON),
     Column("created_at_utc", DateTime(timezone=True)),
     Column("updated_at_utc", DateTime(timezone=True)),
     UniqueConstraint("idempotency_key"),
+    CheckConstraint("state_version > 0", name="ck_order_state_version_positive"),
     schema="trading",
+)
+
+confirmation_capabilities = Table(
+    "confirmation_capabilities",
+    metadata,
+    Column("order_id", Text, primary_key=True),
+    Column("plan_hash", Text, nullable=False),
+    Column("token_ciphertext", Text, nullable=False),
+    Column("expires_at_utc", DateTime(timezone=True), nullable=False),
+    Column("claimed_at_utc", DateTime(timezone=True)),
+    Column("created_at_utc", DateTime(timezone=True), nullable=False),
+    schema="risk",
 )
 
 order_events = Table(
@@ -150,6 +165,7 @@ risk_decisions = Table(
 __all__ = [
     "audit_events",
     "candidate_trade_plans",
+    "confirmation_capabilities",
     "event_contexts",
     "metadata",
     "order_events",
