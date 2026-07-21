@@ -222,7 +222,7 @@ impl MarketService for MarketServiceImpl {
         request: Request<StreamRequest>,
     ) -> Result<Response<Self::StreamMarketSnapshotsStream>, Status> {
         let feed = Arc::clone(&self.feed);
-        let cursor_rx = self.cursor_tx.subscribe();
+        let mut cursor_rx = self.cursor_tx.subscribe();
         let n = feed.ticks.len();
         // Resume/backfill: sequence_number is 1-based (record i has seq i+1), so a
         // client that last consumed seq S resumes at index S. resume=0 (fresh or
@@ -443,6 +443,7 @@ mod tests {
             .stream_market_snapshots(Request::new(StreamRequest {
                 session_id: "a".into(),
                 speedup: 0.0,
+                resume_after_sequence: 0,
             }))
             .await
             .unwrap();
