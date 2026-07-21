@@ -148,3 +148,42 @@ def test_disconnected_frame_is_schema_valid() -> None:
     frame = proj.disconnected_frame("2026-07-20T13:45:00Z", "stream ended")
     assert list(_validator().iter_errors(frame)) == []
     assert frame["new_position_allowed"] is False
+
+
+def test_sequence_gap_blocks_until_backfilled() -> None:
+    """Review P0: seq 1 -> (disconnect) -> seq 4 must NOT unlock trading; only
+    after 2 and 3 backfill (contiguous) does HEALTHY 4 become tradable."""
+    proj = CockpitProjector(config=_config())
+    validator = _validator()
+
+    f1 = proj.apply(_tick(570, 500.0, 1))
+    assert f1["connection"] == "LIVE"
+    assert f1["new_position_allowed"] is True
+
+    # A HEALTHY snapshot at seq 4 while 2,3 are missing -> reconciling, blocked.
+    f4 = proj.apply(_tick(573, 500.3, 4))
+    assert f4["new_position_allowed"] is False
+    assert f4["connection"] == "STALE"
+    assert any("sequence discontinuity" in flag for flag in f4["risk_flags"])
+    assert list(validator.iter_errors(f4)) == []
+
+    # Backfill 2 and 3 (contiguous): still blocked at 2, blocked at 3...
+    f2 = proj.apply(_tick(571, 500.1, 2))
+    assert f2["new_position_allowed"] is True and f2["connection"] == "LIVE"
+    f3 = proj.apply(_tick(572, 500.2, 3))
+    assert f3["new_position_allowed"] is True
+
+    # ...now the previously-skipped 4 arrives again in order -> tradable.
+    f4b = proj.apply(_tick(573, 500.3, 4))
+    assert f4b["connection"] == "LIVE"
+    assert f4b["new_position_allowed"] is True
+
+
+def test_first_record_after_restart_midsession_blocks() -> None:
+    """A fresh projector whose first record is seq > 1 (app restarted
+    mid-session) must block until backfilled to session open."""
+    proj = CockpitProjector(config=_config())
+    frame = proj.apply(_tick(575, 500.5, 6))  # first-ever record is seq 6
+    assert frame["new_position_allowed"] is False
+    assert frame["connection"] == "STALE"
+    assert any("expected 1" in flag for flag in frame["risk_flags"])

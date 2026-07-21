@@ -81,7 +81,9 @@ class _Controllable:
     def end(self, reason: str = "stream ended") -> None:
         self.queue.put_nowait(("end", reason))
 
-    async def __call__(self, _session_id: str) -> AsyncIterator[tuple[str, Any]]:
+    async def __call__(
+        self, _session_id: str, _resume_after_sequence: int = 0
+    ) -> AsyncIterator[tuple[str, Any]]:
         while True:
             kind, payload = await self.queue.get()
             yield (kind, payload)
@@ -209,7 +211,7 @@ def test_latest_frame_cached_for_recovery() -> None:
 
 
 def test_upstream_error_publishes_disconnected_frame() -> None:
-    async def bad_source(_sid: str) -> AsyncIterator[tuple[str, Any]]:
+    async def bad_source(_sid: str, _resume: int = 0) -> AsyncIterator[tuple[str, Any]]:
         raise RuntimeError("boom")
         yield  # pragma: no cover
 
@@ -231,18 +233,26 @@ def test_hub_reconnects_after_upstream_end_with_higher_seq() -> None:
     keep its projector, and resume LIVE at a strictly higher seq."""
 
     class _FlakySource:
-        """First upstream attempt ends immediately; second yields live ticks."""
+        """First upstream attempt ends immediately; second resumes and yields
+        contiguous live ticks starting right after the resume point, exactly as
+        the real Rust backfill would (so the continuity guard stays satisfied)."""
 
         def __init__(self) -> None:
             self.calls = 0
+            self.resumes: list[int] = []
 
-        async def __call__(self, _sid: str) -> AsyncIterator[tuple[str, Any]]:
+        async def __call__(
+            self, _sid: str, resume_after_sequence: int = 0
+        ) -> AsyncIterator[tuple[str, Any]]:
             self.calls += 1
+            self.resumes.append(resume_after_sequence)
             if self.calls == 1:
                 yield ("end", "first attempt failed")
                 return
-            for i in range(3):
-                yield ("tick", _tick(573 + i, 10 + i))
+            # Resume backfills from resume_after_sequence + 1, contiguous.
+            start = resume_after_sequence + 1
+            for seq in range(start, start + 3):
+                yield ("tick", _tick(570 + seq - 1, seq))
             # keep the stream open so the hub doesn't loop again mid-assert
             await asyncio.sleep(1.0)
 

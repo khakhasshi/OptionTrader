@@ -47,6 +47,11 @@ class CockpitProjector:
     config: ProjectorConfig
     _bars: list[dict[str, Any]] = field(default_factory=list)
     _seq: int = 0
+    # Last CONTIGUOUSLY-consumed MarketSnapshot.sequence_number (0 = none yet).
+    # The next accepted record must be exactly this + 1; anything else is a gap,
+    # reorder, or duplicate and forces RECONCILING (fail closed) until backfill
+    # restores continuity.
+    _last_market_seq: int = 0
 
     def _connection(self, data_health: str) -> str:
         if data_health == "STALE":
@@ -98,6 +103,27 @@ class CockpitProjector:
         data_health = str(snapshot.get("data_health", "DISCONNECTED"))
         connection = self._connection(data_health)
 
+        # Sequence-continuity guard (fail closed on gap/reorder/dup). Even a
+        # HEALTHY snapshot must NOT unlock trading if records were skipped — the
+        # engines would run on incomplete bar history. The next accepted record
+        # must be exactly _last_market_seq + 1; a fresh projector expects seq 1,
+        # so a first record with seq > 1 (e.g. after an app restart mid-session)
+        # also blocks until backfilled to session open.
+        market_seq = snapshot.get("sequence_number")
+        expected = self._last_market_seq + 1
+        if not isinstance(market_seq, int) or market_seq != expected:
+            frame = self._base_frame(server_time)
+            frame["connection"] = "STALE"  # data exists but is not trustworthy
+            frame["snapshot"] = snapshot
+            frame["risk_flags"] = [
+                f"sequence discontinuity: expected {expected}, got {market_seq}; "
+                "reconciling — new positions blocked until missing records backfill"
+            ]
+            # Do NOT advance _last_market_seq and do NOT append the bar: a later
+            # backfilled record carrying `expected` will pass this guard and the
+            # session history stays gap-free.
+            return frame
+
         try:
             self._append_bar(bar)
             frame_bars = self._frame()
@@ -121,6 +147,9 @@ class CockpitProjector:
             frame["snapshot"] = snapshot
             frame["risk_flags"] = [f"projection error: {exc}"]
             return frame
+
+        # Record accepted and contiguous: advance the consumed-sequence marker.
+        self._last_market_seq = market_seq
 
         allowed = data_health == "HEALTHY" and connection == "LIVE"
         risk_flags = list(decision.risk_notes)

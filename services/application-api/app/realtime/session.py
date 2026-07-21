@@ -34,8 +34,11 @@ from app.realtime.projector import CockpitProjector, ProjectorConfig
 
 # An upstream event: ("tick", tick_dict) or ("end", reason).
 UpstreamEvent = tuple[str, Any]
-# Async source of upstream events for a session id (injectable for tests).
-AsyncTickSource = Callable[[str], AsyncIterator[UpstreamEvent]]
+# Async source of upstream events for (session_id, resume_after_sequence). The
+# resume value is the last contiguously-consumed MarketSnapshot.sequence_number;
+# the source must replay every record with a higher sequence so a reconnect
+# backfills the gap instead of skipping it (Phase 2 review P0).
+AsyncTickSource = Callable[[str, int], AsyncIterator[UpstreamEvent]]
 
 # session_id -> latest frame, for REST recovery on reconnect.
 _LATEST: dict[str, dict[str, Any]] = {}
@@ -63,14 +66,15 @@ def _rpc_code(exc: grpc.RpcError) -> str:
     return "UNKNOWN"
 
 
-async def _grpc_source(session_id: str) -> AsyncIterator[UpstreamEvent]:
-    """Bridge the blocking gRPC tick iterator into async upstream events."""
+async def _grpc_source(session_id: str, resume_after_sequence: int) -> AsyncIterator[UpstreamEvent]:
+    """Bridge the blocking gRPC tick iterator into async upstream events,
+    resuming after the given sequence so a reconnect backfills missed records."""
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[UpstreamEvent] = asyncio.Queue()
 
     def pump() -> None:
         try:
-            for tick in stream_ticks(session_id):
+            for tick in stream_ticks(session_id, resume_after_sequence=resume_after_sequence):
                 loop.call_soon_threadsafe(queue.put_nowait, ("tick", tick))
             loop.call_soon_threadsafe(queue.put_nowait, ("end", "stream ended"))
         except grpc.RpcError as exc:
@@ -100,6 +104,9 @@ class SessionHub:
         self._latest: dict[str, Any] | None = None
         self._stopped = False
         self._task: asyncio.Task[None] | None = None
+        # Last contiguously-consumed MarketSnapshot.sequence_number, so a
+        # reconnect resumes the upstream after it and backfills the gap.
+        self._last_market_seq = 0
         # Upstream reconnect backoff (seconds). Bounded so a permanently-dead
         # upstream doesn't hot-loop; short base keeps recovery snappy.
         self._backoff_base = 0.05
@@ -121,11 +128,17 @@ class SessionHub:
         while not self._stopped:
             ended_reason = "stream ended"
             try:
-                async for kind, payload in self._source(self._config.session_id):
+                # Resume after the last contiguously-consumed record so the
+                # upstream backfills any gap opened while we were disconnected.
+                async for kind, payload in self._source(
+                    self._config.session_id, self._last_market_seq
+                ):
                     if self._stopped:
                         return
                     if kind == "tick":
-                        self._publish(self._projector.apply(payload))
+                        frame = self._projector.apply(payload)
+                        self._track_market_seq(frame)
+                        self._publish(frame)
                         backoff = self._backoff_base  # healthy data resets backoff
                     else:
                         ended_reason = str(payload)
@@ -144,6 +157,16 @@ class SessionHub:
             except asyncio.CancelledError:
                 return
             backoff = min(backoff * 2, self._backoff_max)
+
+    def _track_market_seq(self, frame: dict[str, Any]) -> None:
+        """Remember the last accepted market sequence so a reconnect resumes
+        after it. Only LIVE frames carry a snapshot the projector accepted; a
+        STALE reconciling frame (gap) must NOT advance the resume point."""
+        snap = frame.get("snapshot")
+        if frame.get("connection") == "LIVE" and isinstance(snap, dict):
+            seq = snap.get("sequence_number")
+            if isinstance(seq, int) and seq > self._last_market_seq:
+                self._last_market_seq = seq
 
     def stop(self) -> None:
         """Stop the hub: end its upstream loop and release its subscribers."""

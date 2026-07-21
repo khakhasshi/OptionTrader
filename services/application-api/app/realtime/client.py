@@ -89,15 +89,23 @@ def tick_to_dict(tick: market_pb2.MarketTick) -> dict[str, Any]:
     }
 
 
-def stream_ticks(session_id: str, target: str | None = None) -> Iterator[dict[str, Any]]:
+def stream_ticks(
+    session_id: str, target: str | None = None, resume_after_sequence: int = 0
+) -> Iterator[dict[str, Any]]:
     """Yield ticks (as dicts) from the Rust stream for one session.
+
+    ``resume_after_sequence`` requests gap-free reconnect: the server replays
+    every record with a higher MarketSnapshot.sequence_number, so a reconnecting
+    client backfills what it missed rather than skipping it. 0 = from session open.
 
     Raises ``grpc.RpcError`` on transport failure — callers fail closed by
     emitting a disconnected frame.
     """
     channel = grpc.insecure_channel(target or TRADING_CORE_GRPC)
     stub = market_pb2_grpc.MarketServiceStub(channel)
-    request = market_pb2.StreamRequest(session_id=session_id, speedup=0.0)
+    request = market_pb2.StreamRequest(
+        session_id=session_id, speedup=0.0, resume_after_sequence=resume_after_sequence
+    )
     try:
         for tick in stub.StreamMarketSnapshots(request):
             yield tick_to_dict(tick)

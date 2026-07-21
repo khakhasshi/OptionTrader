@@ -83,7 +83,11 @@ def _tick(minute_et: int, seq: int, health: str = "HEALTHY") -> dict[str, Any]:
 
 
 def _install_fake_stream(monkeypatch: Any, ticks: list[dict[str, Any]]) -> None:
-    monkeypatch.setattr(session, "stream_ticks", lambda sid, target=None: iter(list(ticks)))
+    # Signature mirrors the real stream_ticks (session_id, target, resume_after_sequence).
+    def fake(sid: str, target: Any = None, resume_after_sequence: int = 0) -> Any:
+        return iter(list(ticks))
+
+    monkeypatch.setattr(session, "stream_ticks", fake)
 
 
 def test_websocket_pushes_frames_and_closes(monkeypatch: Any) -> None:
