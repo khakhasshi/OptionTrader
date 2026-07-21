@@ -57,7 +57,13 @@ DataHealth 权威唯一在 Rust Market Core。
    session buffer 回放缺失记录。Rust 对落后订阅者标记 `BACKFILL`；Python 仍按序
    追加 bar 并重建引擎，但强制 CockpitState 为 STALE/No Trade。只有追平后新产生
    的 `LIVE` 记录，且 DataHealth=HEALTHY，才可恢复新开仓许可。Projector 另以
-   MarketSnapshot.sequence_number 连续性守卫防御 gap/reorder/duplicate。
+   MarketSnapshot.sequence_number 连续性守卫防御 gap/reorder/duplicate，并独立校验
+   high-watermark 合法、单调且已经越过恢复目标；目标记录本身仍禁止新开仓，避免
+   单独信任上游 `LIVE` 标签。
+
+10. **跨语言 smoke 是根门禁的一部分**：`make test-integration` 先构建当前
+    `trading-core` 二进制，再以 `OPTIONTRADER_REQUIRE_INTEGRATION=1` 执行真实
+    Rust→gRPC→Python smoke；`make test` 必须包含该目标，不允许因二进制缺失而跳过。
 
 ## 影响
 

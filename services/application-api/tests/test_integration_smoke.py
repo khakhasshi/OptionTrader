@@ -5,10 +5,10 @@ the real trading-core binary (single-producer gRPC MarketService over a replay
 fixture), drives the actual Python gRPC client through a real SessionHub, and
 asserts the emitted CockpitState frames.
 
-It SKIPS (does not fail) when the trading-core binary is absent, so the api-only
-CI job stays green; to run it, build core first:
-    make setup-core && (cd services/trading-core && cargo build --bin trading-core)
-    make test-api   # this test then executes
+It SKIPS (does not fail) when invoked as part of an API-only pytest run without
+the trading-core binary. The repository gate always builds the current binary
+and forbids the skip path:
+    make test-integration
 """
 
 from __future__ import annotations

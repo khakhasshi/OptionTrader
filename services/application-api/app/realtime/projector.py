@@ -54,8 +54,11 @@ class CockpitProjector:
     _last_market_seq: int = 0
     # Highest sequence observed across a discontinuity. Even after the missing
     # records begin arriving, frames stay fail-closed until this target is
-    # reached contiguously.
+    # reached contiguously and a subsequent record crosses it.
     _reconcile_until_seq: int | None = None
+    # Producer high-watermark is a second, independent proof of the live edge.
+    # It must never regress within a session.
+    _last_high_watermark: int = 0
 
     @property
     def last_market_sequence(self) -> int:
@@ -113,6 +116,7 @@ class CockpitProjector:
         connection = self._connection(data_health)
         delivery_phase = tick.get("delivery_phase", "UNSPECIFIED")
         high_watermark = tick.get("high_watermark_sequence")
+        market_seq = snapshot.get("sequence_number")
 
         if delivery_phase not in {"BACKFILL", "LIVE"}:
             frame = self._base_frame(server_time)
@@ -123,17 +127,43 @@ class CockpitProjector:
             ]
             return frame
 
+        if (
+            not isinstance(market_seq, int)
+            or isinstance(market_seq, bool)
+            or market_seq <= 0
+            or not isinstance(high_watermark, int)
+            or isinstance(high_watermark, bool)
+            or high_watermark <= 0
+            or high_watermark < market_seq
+            or high_watermark < self._last_high_watermark
+        ):
+            frame = self._base_frame(server_time)
+            frame["connection"] = "DISCONNECTED"
+            frame["snapshot"] = snapshot
+            frame["risk_flags"] = [
+                "invalid transport sequence metadata: "
+                f"market_seq={market_seq}, high_watermark={high_watermark}, "
+                f"previous_high_watermark={self._last_high_watermark}; "
+                "new positions blocked"
+            ]
+            return frame
+
+        self._last_high_watermark = high_watermark
+        if high_watermark > market_seq:
+            self._reconcile_until_seq = max(self._reconcile_until_seq or 0, high_watermark)
+
         # Sequence-continuity guard (fail closed on gap/reorder/dup). Even a
         # HEALTHY snapshot must NOT unlock trading if records were skipped — the
         # engines would run on incomplete bar history. The next accepted record
         # must be exactly _last_market_seq + 1; a fresh projector expects seq 1,
         # so a first record with seq > 1 (e.g. after an app restart mid-session)
         # also blocks until backfilled to session open.
-        market_seq = snapshot.get("sequence_number")
         expected = self._last_market_seq + 1
-        if not isinstance(market_seq, int) or market_seq != expected:
-            if isinstance(market_seq, int) and market_seq > expected:
-                self._reconcile_until_seq = max(self._reconcile_until_seq or 0, market_seq)
+        if market_seq != expected:
+            if market_seq > expected:
+                self._reconcile_until_seq = max(
+                    self._reconcile_until_seq or 0, market_seq, high_watermark
+                )
             frame = self._base_frame(server_time)
             frame["connection"] = "STALE"  # data exists but is not trustworthy
             frame["snapshot"] = snapshot
@@ -173,12 +203,14 @@ class CockpitProjector:
         # Record accepted and contiguous: advance the consumed-sequence marker.
         self._last_market_seq = market_seq
 
-        gap_reconciling = (
-            self._reconcile_until_seq is not None and market_seq < self._reconcile_until_seq
-        )
+        reconcile_target = self._reconcile_until_seq
+        # The target record itself is still part of reconstruction. Unlock only
+        # on a subsequent record beyond the target, and only if transport also
+        # labels that record LIVE.
+        gap_reconciling = reconcile_target is not None and market_seq <= reconcile_target
         transport_reconciling = delivery_phase == "BACKFILL"
         reconciling = gap_reconciling or transport_reconciling
-        if self._reconcile_until_seq is not None and market_seq >= self._reconcile_until_seq:
+        if reconcile_target is not None and market_seq > reconcile_target:
             self._reconcile_until_seq = None
 
         if reconciling:
@@ -193,7 +225,7 @@ class CockpitProjector:
             )
         if gap_reconciling:
             risk_flags.append(
-                f"sequence reconciliation in progress through {self._reconcile_until_seq}; "
+                f"sequence reconciliation in progress through {reconcile_target}; "
                 "new positions blocked"
             )
         if not allowed:

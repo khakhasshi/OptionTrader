@@ -96,7 +96,7 @@ make up / make down  # docker compose 本地依赖（PostgreSQL 等）
 - **D1**：JS 用 npm workspaces，Python 用 uv（本机无 pnpm/yarn/poetry）。
 - **D2**：monorepo 目录结构遵循 DEVELOPMENT_PLAN.md 第 4 节。
 - **D3**：Phase 0 先落骨架 + 契约 + 迁移基础 + 端到端 smoke（fixture 快照从 Rust→Python→React）；不在 Phase 0 接实盘。
-- **D4**：Phase 2 实时传输——Python↔Rust 用 gRPC（`market.proto` 的 `MarketService`，server streaming 返回 `stream MarketTick{snapshot,bar,delivery_phase,high_watermark_sequence}` + `GetDataHealth`）；React↔Python 用 WebSocket 增量推送 + REST 快照恢复。快照/DataHealth 权威在 Rust；流带原始每分钟 bar 以保证实时引擎输出与离线回放逐位一致。重连通过 `resume_after_sequence` 回补，BACKFILL 只重建状态且强制 No Trade，追平后新产生的 LIVE 帧才可恢复许可。数据源=回放时钟驱动 + 可插拔实时适配器（`SnapshotSource`）。生成代码不入仓（Rust build.rs / Python 脚本）。详见 `docs/adr/0001-phase2-realtime-transport.md`。
+- **D4**：Phase 2 实时传输——Python↔Rust 用 gRPC（`market.proto` 的 `MarketService`，server streaming 返回 `stream MarketTick{snapshot,bar,delivery_phase,high_watermark_sequence}` + `GetDataHealth`）；React↔Python 用 WebSocket 增量推送 + REST 快照恢复。快照/DataHealth 权威在 Rust；流带原始每分钟 bar 以保证实时引擎输出与离线回放逐位一致。重连通过 `resume_after_sequence` 回补，BACKFILL 只重建状态且强制 No Trade；Projector 独立校验 sequence/high-watermark，恢复目标帧本身仍闭锁，只有越过目标后新产生的 LIVE 帧才可恢复许可。数据源=回放时钟驱动 + 可插拔实时适配器（`SnapshotSource`）。生成代码不入仓（Rust build.rs / Python 脚本）；`make test` 强制构建当前 Rust 二进制并执行跨语言 smoke。详见 `docs/adr/0001-phase2-realtime-transport.md`。
 - 后续决策追加于此并同步 ADR。
 
 ## 10. 暂不实现（第一阶段）

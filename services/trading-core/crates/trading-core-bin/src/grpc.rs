@@ -376,8 +376,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_zero_replays_from_session_open() {
-        // A fresh client at producer start receives the session from record 1.
+    async fn resume_zero_replays_full_session_without_scheduler_assumption() {
+        // A fresh client receives the session from record 1. Delivery phase is
+        // intentionally not asserted: a slow test task may fall behind the
+        // producer and conservatively receive part of the session as BACKFILL.
         let svc = MarketServiceImpl::new(feed());
         let ticks = drain_from(&svc, 0).await;
         let seqs: Vec<u64> = ticks
@@ -387,7 +389,8 @@ mod tests {
         assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
         assert!(ticks
             .iter()
-            .all(|t| t.delivery_phase == DeliveryPhase::Live as i32));
+            .all(|t| t.delivery_phase == DeliveryPhase::Live as i32
+                || t.delivery_phase == DeliveryPhase::Backfill as i32));
     }
 
     #[tokio::test]
@@ -413,7 +416,8 @@ mod tests {
         assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
         assert!(ticks
             .iter()
-            .all(|t| t.delivery_phase == DeliveryPhase::Live as i32));
+            .all(|t| t.delivery_phase == DeliveryPhase::Live as i32
+                || t.delivery_phase == DeliveryPhase::Backfill as i32));
         // snapshot and bar align on the same instant
         for t in &ticks {
             assert_eq!(

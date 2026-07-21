@@ -3,7 +3,8 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help setup setup-web setup-api setup-core dev dev-web dev-api dev-core \
-        health test test-contracts test-web test-api test-core lint lint-web lint-api lint-core \
+        health build-core test test-contracts test-web test-api test-core test-integration \
+        lint lint-web lint-api lint-core \
         contracts gen-py-grpc migrate migrate-down up down clean
 
 WEB_DIR  := apps/web
@@ -47,7 +48,10 @@ health: ## 检查三个服务 health endpoint
 	@curl -sf http://localhost:8080/health && echo " <- trading-core HTTP OK" || echo "trading-core HTTP DOWN"
 	@echo "trading-core gRPC: localhost:50051 (StreamMarketSnapshots / GetDataHealth)"
 
-test: test-contracts test-web test-api test-core ## 运行契约 + 三端单元测试
+build-core: ## 构建当前 Rust trading-core 二进制（供跨语言 smoke 使用）
+	cd $(CORE_DIR) && cargo build --bin trading-core
+
+test: test-contracts test-web test-api test-core test-integration ## 运行契约 + 三端测试 + 强制跨语言 smoke
 
 test-contracts: ## 校验 JSON Schema 契约与 fixtures
 	cd $(API_DIR) && uv run --with jsonschema pytest ../../tests/contract -q
@@ -57,11 +61,14 @@ test-web: ## 前端测试 (vitest 单元测试 + typecheck + build)
 	npm --workspace $(WEB_DIR) run lint
 	npm --workspace $(WEB_DIR) run build
 
-test-api: gen-py-grpc ## Python 测试
-	cd $(API_DIR) && uv run pytest
+test-api: gen-py-grpc ## Python 测试（跨语言 smoke 由 test-integration 单独执行）
+	cd $(API_DIR) && uv run pytest --ignore=tests/test_integration_smoke.py
 
 test-core: ## Rust 测试
 	cd $(CORE_DIR) && cargo test
+
+test-integration: gen-py-grpc build-core ## 强制执行当前 Rust 二进制→Python 的跨语言 smoke
+	cd $(API_DIR) && OPTIONTRADER_REQUIRE_INTEGRATION=1 uv run pytest tests/test_integration_smoke.py -q
 
 lint: lint-web lint-api lint-core ## 三端 lint + format check
 

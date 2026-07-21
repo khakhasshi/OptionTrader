@@ -161,7 +161,7 @@ def test_disconnected_frame_is_schema_valid() -> None:
 
 def test_sequence_gap_blocks_until_backfilled() -> None:
     """Review P0: seq 1 -> (disconnect) -> seq 4 must NOT unlock trading; only
-    after 2 and 3 backfill (contiguous) does HEALTHY 4 become tradable."""
+    after 2-4 backfill and a subsequent LIVE 5 may trading resume."""
     proj = CockpitProjector(config=_config())
     validator = _validator()
 
@@ -190,6 +190,54 @@ def test_sequence_gap_blocks_until_backfilled() -> None:
     f5 = proj.apply(_tick(574, 500.4, 5, delivery_phase="LIVE", high_watermark=5))
     assert f5["connection"] == "LIVE"
     assert f5["new_position_allowed"] is True
+
+
+def test_gap_target_stays_blocked_when_backfill_is_mislabeled_live() -> None:
+    """Defense in depth: never trust LIVE alone to unlock the gap target."""
+    proj = CockpitProjector(config=_config())
+
+    assert proj.apply(_tick(570, 500.0, 1))["new_position_allowed"] is True
+    assert proj.apply(_tick(573, 500.3, 4, high_watermark=4))["new_position_allowed"] is False
+
+    for seq in (2, 3, 4):
+        frame = proj.apply(_tick(569 + seq, 500.0 + seq * 0.1, seq, high_watermark=4))
+        assert frame["connection"] == "STALE"
+        assert frame["new_position_allowed"] is False
+
+    live = proj.apply(_tick(574, 500.5, 5, high_watermark=5))
+    assert live["connection"] == "LIVE"
+    assert live["new_position_allowed"] is True
+
+
+def test_high_watermark_independently_blocks_false_live_edge() -> None:
+    """LIVE before the producer watermark is not proof of real-time readiness."""
+    proj = CockpitProjector(config=_config())
+
+    for seq in (1, 2, 3):
+        frame = proj.apply(_tick(569 + seq, 500.0 + seq * 0.1, seq, high_watermark=3))
+        assert frame["connection"] == "STALE"
+        assert frame["new_position_allowed"] is False
+
+    live = proj.apply(_tick(573, 500.4, 4, high_watermark=4))
+    assert live["connection"] == "LIVE"
+    assert live["new_position_allowed"] is True
+
+
+def test_invalid_or_regressing_high_watermark_fails_closed() -> None:
+    proj = CockpitProjector(config=_config())
+    assert proj.apply(_tick(570, 500.0, 1, high_watermark=3))["new_position_allowed"] is False
+
+    invalid = _tick(571, 500.1, 2, high_watermark=2)
+    frame = proj.apply(invalid)
+    assert frame["connection"] == "DISCONNECTED"
+    assert frame["new_position_allowed"] is False
+    assert any("invalid transport sequence metadata" in flag for flag in frame["risk_flags"])
+
+    missing = _tick(571, 500.1, 2, high_watermark=3)
+    missing.pop("high_watermark_sequence")
+    frame = proj.apply(missing)
+    assert frame["connection"] == "DISCONNECTED"
+    assert frame["new_position_allowed"] is False
 
 
 def test_first_record_after_restart_midsession_blocks() -> None:

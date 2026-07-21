@@ -86,6 +86,4 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: make setup-api
-      - run: cargo build --bin trading-core
-        working-directory: services/trading-core
-      - run: cd services/application-api && uv run pytest tests/test_integration_smoke.py -q
+      - run: make test-integration
